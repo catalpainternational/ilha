@@ -1,0 +1,181 @@
+# ilha Project Configuration Template
+# This file serves as a comprehensive template with all possible settings
+# Uncomment and modify settings as needed for your project
+# 
+# When running `ilha setup`, if .ilha/config.yml does not exist,
+# this template will be copied and automatically configured based on your
+# docker-compose.yml file.
+
+# ============================================================================
+# Project Identification
+# ============================================================================
+
+# Project name (used in container names, volumes, and domains)
+# Default: directory name
+# Automatically set during setup based on project directory name
+# project_name: myproject
+
+# ============================================================================
+# Network Configuration
+# ============================================================================
+
+# Docker network name for Caddy proxy
+# Default: ilha_caddy_proxy
+# This network is shared across all worktrees for routing
+# caddy_network: ilha_caddy_proxy
+
+# ============================================================================
+# Directory Configuration
+# ============================================================================
+
+# Directory where worktrees are stored
+# Default: worktrees
+# Worktrees will be created in {project_root}/{worktree_dir}/{branch_name}/
+# worktree_dir: worktrees
+
+# ============================================================================
+# Service Configuration
+# ============================================================================
+
+# Service configuration
+# Automatically detected from docker-compose.yml during setup
+# Each service can have a container_name_template
+# The ${COMPOSE_PROJECT_NAME} variable is automatically set per worktree
+# Format: {project_name}-{branch_name}
+services:
+  # Example web service
+  # web:
+  #   container_name_template: ${COMPOSE_PROJECT_NAME}-web
+  
+  # Example database service
+  # db:
+  #   container_name_template: ${COMPOSE_PROJECT_NAME}-db
+  
+  # Example Redis service
+  # redis:
+  #   container_name_template: ${COMPOSE_PROJECT_NAME}-redis
+  
+  # Add more services as needed:
+  # api:
+  #   container_name_template: ${COMPOSE_PROJECT_NAME}-api
+  # worker:
+  #   container_name_template: ${COMPOSE_PROJECT_NAME}-worker
+
+# ============================================================================
+# Volume Configuration
+# ============================================================================
+
+# Volume names (automatically detected from docker-compose.yml)
+# These will be prefixed with {project_name}-{branch_name}_ for each worktree
+# Example: myproject-feature-auth_postgres_data
+volumes:
+  # Example PostgreSQL volume
+  # - postgres_data
+  
+  # Example Redis volume
+  # - redis_data
+  
+  # Example media files volume
+  # - media_files
+  
+  # Add more volumes as needed:
+  # - sqlite_data
+  # - static_files
+  # - uploads
+
+# ============================================================================
+# Default Environment Variables
+# ============================================================================
+
+# Default environment variables for all worktrees
+# These can be overridden in worktree-specific env.ilha files
+# These values are used as defaults when creating new worktrees
+environment:
+  # Debug mode (True for development, False for production)
+  # DEBUG: "True"
+  
+  # Allowed hosts for Django/Flask applications
+  # Automatically includes localhost, 127.0.0.1, worktree domain, *.localhost, and web
+  # ALLOWED_HOSTS: "localhost,127.0.0.1,*.localhost,web"
+  
+  # Add more default environment variables:
+  # POSTGRES_USER: "user"
+  # POSTGRES_PASSWORD: "password"
+  # POSTGRES_DB: "database"
+  # DJANGO_SECRET_KEY: "django-insecure-secret-key"
+  # SITE_DOMAIN: "localhost:8000"
+  # CADDY_EMAIL: "admin@example.com"
+
+# ============================================================================
+# Deployment Configuration (Optional)
+# ============================================================================
+
+# Deployment configuration
+# Used by 'ilha droplet push' command
+# These settings provide defaults for deployment operations
+# deployment:
+  # Default server for push operations
+  # Format: username@hostname:/path/to/packages
+  # Example: user@server.example.com:/var/ilha/packages
+  # default_server: user@server.example.com:/var/ilha/packages
+  
+  # Default domain for HTTPS deployments
+  # Used when --domain flag is not provided to push command
+  # Example: myapp.example.com
+  # default_domain: myapp.example.com
+  
+  # Default IP for HTTP-only deployments
+  # Used when --ip flag is not provided to push command
+  # Note: IP-only deployments are HTTP-only (no TLS)
+  # Example: 203.0.113.10
+  # default_ip: 203.0.113.10
+  
+  # SSH key path for deployment
+  # Used for SCP operations during push
+  # Example: ~/.ssh/deploy_key
+  # ssh_key: ~/.ssh/deploy_key
+
+# ============================================================================
+# DNS Configuration (Optional)
+# ============================================================================
+
+# DNS configuration
+# Used for automatic DNS management during deployment
+# Currently supports Digital Ocean DNS API
+# dns:
+  # DNS provider (currently only 'digitalocean' is supported)
+  # provider: digitalocean
+  
+  # API token for DNS provider
+  # Can use environment variable: ${DIGITALOCEAN_API_TOKEN}
+  # Priority: CLI flag > shell environment > .env file > this config file
+  # api_token: ${DIGITALOCEAN_API_TOKEN}
+  
+  # Default domain for DNS operations
+  # Used when creating subdomains during deployment
+  # Example: example.com
+  # default_domain: example.com
+
+# ============================================================================
+# VPC Configuration (Optional)
+# ============================================================================
+
+# VPC configuration for secure private networking
+# Used when deploying with --central-server and DigitalOcean VPC
+# vpc:
+  # Automatically bind ports for VPC-accessible services (db, redis)
+  # When enabled, services with 'expose' ports will get port bindings
+  # Default: false (opt-in)
+  # auto_bind_ports: true
+  
+  # Bind services to private IP instead of 0.0.0.0 (recommended for security)
+  # When enabled and private IP is available, services bind to private IP only
+  # This prevents public internet exposure while allowing VPC access
+  # Default: true (for security)
+  # bind_to_private_ip: true
+  
+  # Automatically configure UFW firewall rules for VPC access
+  # When enabled, automatically allows VPC network (10.0.0.0/8) access to Redis/DB ports
+  # Default: false (opt-in, requires UFW to be installed on server)
+  # auto_configure_firewall: false
+

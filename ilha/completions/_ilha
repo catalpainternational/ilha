@@ -1,0 +1,351 @@
+#compdef ilha
+# Zsh completion script for ilha CLI
+# This script provides tab completion for ilha commands and subcommands
+# Uses state-based completion to prevent file completion fallback
+
+_ilha() {
+    local ret=1
+    local -a context state state_descr line
+    typeset -A opt_args
+
+    # Main commands with descriptions
+    local -a commands
+    commands=(
+        'start:Start global Caddy container'
+        'stop:Stop global Caddy container'
+        'create:Create worktree in worktrees directory'
+        'delete:Delete worktree and branch completely'
+        'remove:Remove worktree and containers/volumes but keep git branch'
+        'remove-all:Remove all worktrees and containers/volumes but keep git branches'
+        'delete-all:Delete all worktrees, containers, and volumes'
+        'list:List active worktrees'
+        'prune:Remove prunable worktree references'
+        'volumes:Volume management commands'
+        'setup:Initialize ilha for this project'
+        'help:Show help information'
+        'completion:Shell completion management'
+        '-D:Alias for delete command'
+        '-r:Alias for remove command'
+    )
+    
+    # Worktree actions (new pattern)
+    local -a worktree_actions
+    worktree_actions=(
+        'up:Start worktree environment for specified branch'
+        'down:Stop worktree environment for specified branch'
+    )
+    
+    # Docker compose passthrough commands
+    local -a compose_commands
+    compose_commands=(
+        'exec:Execute a command in a running container'
+        'logs:View output from containers'
+        'ps:List containers'
+        'run:Run a one-off command'
+        'build:Build or rebuild services'
+        'pull:Pull service images'
+        'push:Push service images'
+        'restart:Restart services'
+        'start:Start services'
+        'stop:Stop services'
+        'config:Validate and view the Compose file'
+        'images:List images used by the created containers'
+        'port:Print the public port for a port binding'
+        'top:Display the running processes'
+        'events:Receive real time events from containers'
+        'kill:Force stop service containers'
+        'pause:Pause services'
+        'unpause:Unpause services'
+        'scale:Set number of containers for a service'
+    )
+
+    # Volume subcommands
+    local -a volume_subcommands
+    volume_subcommands=(
+        'list:List all worktree volumes'
+        'size:Show volume sizes'
+        'backup:Backup worktree volumes'
+        'restore:Restore worktree volumes from backup'
+        'clean:Clean up worktree volumes'
+    )
+
+    # Completion subcommands
+    local -a completion_subcommands
+    completion_subcommands=(
+        'install:Install shell completion'
+        'uninstall:Remove shell completion'
+        'status:Show completion installation status'
+    )
+
+    # Shell options
+    local -a shells
+    shells=(bash zsh)
+
+    # Use _arguments for the entire command structure
+    _arguments -C \
+        '1: :->cmds' \
+        '*::arg:->args' \
+    && ret=0
+
+    case "$state" in
+        cmds)
+            # First argument: complete with main commands OR worktree names
+            local -a all_options
+            all_options=("${commands[@]}")
+            # Add worktree names to completion
+            local worktrees_output
+            worktrees_output="$(ilha _completion worktrees 2>/dev/null)"
+            if [[ -n "$worktrees_output" ]]; then
+                local -a worktree_names
+                worktree_names=("${(@f)worktrees_output}")
+                all_options+=("${worktree_names[@]}")
+            fi
+            _describe -t commands 'ilha commands or worktrees' all_options && ret=0
+            ;;
+        args)
+            # Subsequent arguments: depends on the command
+            case $words[1] in
+                create)
+                    # For create, complete with git branches
+                    _ilha_git_branches && ret=0
+                    ;;
+                up|down)
+                    # For up/down commands, complete with worktrees and flags
+                    if [[ "${words[1]}" == "up" ]]; then
+                        _arguments \
+                            '1: :_ilha_worktrees' \
+                            '-d[Run in detached mode]' \
+                            '--detach[Run in detached mode]' \
+                        && ret=0
+                    else
+                        _ilha_worktrees && ret=0
+                    fi
+                    ;;
+                delete|-D)
+                    # For delete, complete with worktrees and flags
+                    _arguments \
+                        '1: :_ilha_worktrees' \
+                        '--force[Force removal even with unmerged changes]' \
+                    && ret=0
+                    ;;
+                remove|-r)
+                    # For remove, complete with worktrees and flags
+                    _arguments \
+                        '1: :_ilha_worktrees' \
+                        '--force[Force removal even with unmerged changes]' \
+                    && ret=0
+                    ;;
+                delete-all)
+                    # For delete-all, only flags
+                    _arguments \
+                        '--force[Force removal even with unmerged changes]' \
+                    && ret=0
+                    ;;
+                remove-all)
+                    # For remove-all, only flags
+                    _arguments \
+                        '--force[Force removal even with unmerged changes]' \
+                    && ret=0
+                    ;;
+                volumes)
+                    # For volumes, handle subcommands
+                    _arguments -C \
+                        '1: :->volume_cmds' \
+                        '*::arg:->volume_args' \
+                    && ret=0
+
+                    case "$state" in
+                        volume_cmds)
+                            _describe -t volume-commands 'volume commands' volume_subcommands && ret=0
+                            ;;
+                        volume_args)
+                            case $words[2] in
+                                backup|clean)
+                                    # For backup/clean, complete with worktree names
+                                    _ilha_worktrees && ret=0
+                                    ;;
+                                restore)
+                                    # For restore, complete with backup files
+                                    _arguments \
+                                        '1: :_ilha_worktrees' \
+                                        '2:backup file:_files -g "*.tar"' \
+                                    && ret=0
+                                    ;;
+                                list|size)
+                                    # No additional arguments
+                                    ret=0
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                completion)
+                    # For completion, handle subcommands
+                    _arguments -C \
+                        '1: :->completion_cmds' \
+                        '*::arg:->completion_args' \
+                    && ret=0
+
+                    case "$state" in
+                        completion_cmds)
+                            _describe -t completion-commands 'completion commands' completion_subcommands && ret=0
+                            ;;
+                        completion_args)
+                            case $words[2] in
+                                install)
+                                    # For install, complete with shell options
+                                    _describe -t shells 'shells' shells && ret=0
+                                    ;;
+                                uninstall|status)
+                                    # No additional arguments
+                                    ret=0
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+                setup)
+                    # For setup, complete with flags
+                    _arguments \
+                        '--project-name[Project name (default: directory name)]:project name:' \
+                    && ret=0
+                    ;;
+                start|stop|list|prune|help)
+                    # These commands take no arguments
+                    ret=0
+                    ;;
+                *)
+                    # Check if first word is a worktree name (not a command)
+                    local is_command=false
+                    for cmd in "${commands[@]}"; do
+                        if [[ "$cmd" == "$words[1]:*" ]]; then
+                            is_command=true
+                            break
+                        fi
+                    done
+                    
+                    if [[ "$is_command" == false ]]; then
+                        # This is a worktree name, complete with up/down or docker compose commands
+                        if [[ $#words -eq 2 ]]; then
+                            # Second position: up/down or docker compose commands
+                            local -a all_worktree_options
+                            all_worktree_options=("${worktree_actions[@]}")
+                            all_worktree_options+=("${compose_commands[@]}")
+                            _describe -t worktree-actions 'worktree actions or docker compose commands' all_worktree_options && ret=0
+                        elif [[ $#words -eq 3 && "$words[2]" == "up" ]]; then
+                            # Third position after worktree_name up
+                            _arguments \
+                                '-d[Run in detached mode]' \
+                                '--detach[Run in detached mode]' \
+                            && ret=0
+                        elif [[ $#words -ge 3 && "$words[2]" == "exec" ]]; then
+                            # After worktree_name exec, complete with service names
+                            _ilha_services && ret=0
+                        elif [[ $#words -ge 3 && "$words[2]" == "logs" ]]; then
+                            # After worktree_name logs, complete with service names and flags
+                            _arguments \
+                                '1: :_ilha_services' \
+                                '-f[Follow log output]' \
+                                '--follow[Follow log output]' \
+                                '--tail[Number of lines to show from the end of logs]:number:' \
+                                '--since[Show logs since timestamp]:timestamp:' \
+                                '--until[Show logs before timestamp]:timestamp:' \
+                            && ret=0
+                        elif [[ $#words -ge 3 && "$words[2]" == "run" ]]; then
+                            # After worktree_name run, complete with service names and flags
+                            _arguments \
+                                '1: :_ilha_services' \
+                                '--rm[Remove container after run]' \
+                                '--no-deps[Don\'t start linked services]' \
+                                '--entrypoint[Override the entrypoint of the image]:command:' \
+                            && ret=0
+                        else
+                            # For other docker compose commands, just pass through
+                            ret=0
+                        fi
+                    else
+                        # Unknown command - don't complete anything
+                        ret=0
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+
+    return ret
+}
+
+# Helper function to get worktree names
+_ilha_worktrees() {
+    local -a worktrees
+    local worktree_output
+
+    # Get worktrees from ilha command
+    worktree_output="$(ilha _completion worktrees 2>/dev/null)"
+    
+    if [[ -n "$worktree_output" ]]; then
+        # Split output into array
+        worktrees=("${(@f)worktree_output}")
+        
+        if [[ ${#worktrees[@]} -gt 0 ]]; then
+            # Provide completions
+            _describe -t worktrees 'worktrees' worktrees
+            return 0
+        fi
+    fi
+    
+    # No worktrees found - return success to prevent file completion
+    return 0
+}
+
+# Helper function to get git branches
+_ilha_git_branches() {
+    local -a branches
+    local branch_output
+
+    # Get git branches from ilha command
+    branch_output="$(ilha _completion git 2>/dev/null)"
+    
+    if [[ -n "$branch_output" ]]; then
+        # Split output into array
+        branches=("${(@f)branch_output}")
+        
+        if [[ ${#branches[@]} -gt 0 ]]; then
+            # Provide completions
+            _describe -t branches 'git branches' branches
+            return 0
+        fi
+    fi
+    
+    # No branches found - return success to prevent file completion
+    return 0
+}
+
+# Helper function to get service names
+_ilha_services() {
+    local -a services
+    local service_output
+
+    # Get service names from ilha command
+    service_output="$(ilha _completion services 2>/dev/null)"
+    
+    if [[ -n "$service_output" ]]; then
+        # Split output into array
+        services=("${(@f)service_output}")
+        
+        if [[ ${#services[@]} -gt 0 ]]; then
+            # Provide completions
+            _describe -t services 'services' services
+            return 0
+        fi
+    fi
+    
+    # Fallback to common service names
+    local -a common_services
+    common_services=(web db redis postgres mysql nginx apache)
+    _describe -t services 'services' common_services
+    return 0
+}
+
+# Register the completion function
+_ilha "$@"

@@ -1,0 +1,174 @@
+"""
+Click CLI framework for ilha CLI.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import List, Sequence
+
+import click
+
+from ilha.cli.constants import ALIAS_FLAGS, COMPOSE_PASSTHROUGH_COMMANDS, RESERVED_COMMANDS
+from ilha.cli.helpers import verbose_callback
+from ilha.cli_commands import register_all_commands
+from ilha.commands.completion import CompletionManager
+from ilha.commands.worktree import WorktreeManager
+from ilha.utils.completion_helper import get_completion_for_context
+from ilha.utils.logging import error_exit, log_error
+from ilha.utils.validation import (
+    check_prerequisites,
+    check_prerequisites_no_git,
+    check_setup_or_prompt,
+)
+
+
+class ilhaCLI(click.Group):
+    """Custom Click group to support ilha command ergonomics."""
+
+    def parse_args(self, ctx: click.Context, args: List[str]):  # type: ignore[override]
+        if not args:
+            return super().parse_args(ctx, args)
+
+        alias = ALIAS_FLAGS.get(args[0])
+        if alias:
+            args = [alias] + args[1:]
+
+        elif len(args) >= 2 and args[1] in {"up", "down"} and args[0] not in RESERVED_COMMANDS:
+            worktree_name = args[0]
+            command = args[1]
+            remaining_args = args[2:] if len(args) > 2 else []
+            new_args = [command, worktree_name] + remaining_args
+            return super().parse_args(ctx, new_args)
+
+        elif len(args) >= 2 and args[0] not in RESERVED_COMMANDS:
+            if args[1] in COMPOSE_PASSTHROUGH_COMMANDS or args[1].startswith("-"):
+                worktree_name = args[0]
+                compose_args = args[1:]
+                ctx.meta["compose"] = {
+                    "worktree_name": worktree_name,
+                    "compose_args": compose_args,
+                }
+                new_args = ["compose", worktree_name] + compose_args
+                return super().parse_args(ctx, new_args)
+
+        elif args[0] in {"up", "down"}:
+            error_exit(
+                f"Error: The command pattern has changed. Use 'ilha <worktree_name> {args[0]}' "
+                f"instead of 'ilha {args[0]} <worktree_name>'"
+            )
+
+        return super().parse_args(ctx, args)
+
+
+def _build_cli() -> click.Group:
+    cli = ilhaCLI(
+        help="""ilha: Git Worktrees for Isolated Development Environments
+
+Create isolated development environments using Git worktrees with Docker Compose.
+Each worktree gets its own database, Redis, media storage, and unique URL.
+
+Usage:
+    ilha <worktree_name> up|down
+
+    ilha <command> [options]
+
+Examples:
+    ilha create feature-auth
+    ilha feature-auth up
+    ilha feature-auth down
+    ilha remove feature-auth
+    ilha list
+"""
+    )
+    cli = click.version_option(version="0.9.4", prog_name="ilha")(cli)
+    cli = click.option(
+        "--verbose",
+        "-v",
+        is_flag=True,
+        default=False,
+        help="Enable verbose output (show INFO and WARNING messages)",
+        callback=verbose_callback,
+        expose_value=False,
+        is_eager=True,
+    )(cli)
+
+    register_all_commands(cli)
+    return cli
+
+
+cli = _build_cli()
+
+
+def _resolve_command(path: Sequence[str]):
+    command = cli
+    for name in path:
+        commands = getattr(command, "commands", None)
+        if not commands:
+            return None
+        command = commands.get(name)
+        if command is None:
+            return None
+    return getattr(command, "callback", None)
+
+
+def _invoke_command(path: Sequence[str], *args, **kwargs):
+    callback = _resolve_command(path)
+    if callback is None:
+        raise AttributeError(f"Command {' '.join(path)} is not available")
+    return callback(*args, **kwargs)
+
+
+def up(*args, **kwargs):
+    """Backwards-compatible helper for tests relying on ilha.cli.up."""
+    return _invoke_command(["up"], *args, **kwargs)
+
+
+def _completion(*args, **kwargs):
+    """Backwards-compatible helper exposing the hidden completion command."""
+    return _invoke_command(["_completion"], *args, **kwargs)
+
+
+def completion_install(*args, **kwargs):
+    """Backwards-compatible helper for completion install command."""
+    return _invoke_command(["completion", "install"], *args, **kwargs)
+
+
+def completion_uninstall(*args, **kwargs):
+    """Backwards-compatible helper for completion uninstall command."""
+    return _invoke_command(["completion", "uninstall"], *args, **kwargs)
+
+
+def completion_status(*args, **kwargs):
+    """Backwards-compatible helper for completion status command."""
+    return _invoke_command(["completion", "status"], *args, **kwargs)
+
+
+def main():
+    """Main entry point for the CLI."""
+    try:
+        cli()
+    except KeyboardInterrupt:
+        log_error("Operation cancelled by user")
+        sys.exit(1)
+    except Exception as exc:
+        log_error(f"Unexpected error: {exc}")
+        sys.exit(1)
+
+
+__all__ = [
+    "cli",
+    "main",
+    "up",
+    "_completion",
+    "completion_install",
+    "completion_uninstall",
+    "completion_status",
+    "CompletionManager",
+    "WorktreeManager",
+    "get_completion_for_context",
+    "check_prerequisites",
+    "check_prerequisites_no_git",
+    "check_setup_or_prompt",
+]
+

@@ -1,0 +1,48 @@
+# Global Caddy Proxy for ilha
+# This file defines only the global Caddy proxy container
+# Used by: ilha start/stop commands
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: ilha_caddy_proxy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "2019:2019"  # Caddy admin API
+    environment:
+      CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.com}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - {CADDYFILE_PATH}:/etc/caddy/Caddyfile
+    networks:
+      - ilha_caddy_proxy
+
+  caddy-monitor:
+    image: python:3.11-slim
+    container_name: caddy_monitor
+    environment:
+      USE_STAGING_CERTIFICATES: ${USE_STAGING_CERTIFICATES:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - {MONITOR_SCRIPT_PATH}:/app/monitor.py
+    command: ["sh", "-c", "pip install --no-cache-dir docker requests && python /app/monitor.py"]
+    depends_on:
+      - caddy
+    networks:
+      - ilha_caddy_proxy
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+    name: ilha_caddy_data
+    external: true
+  caddy_config:
+    name: ilha_caddy_config
+    external: true
+
+networks:
+  ilha_caddy_proxy:
+    external: true

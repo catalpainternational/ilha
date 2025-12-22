@@ -1,0 +1,51 @@
+networks:
+  app_network:
+    driver: bridge
+services:
+  db:
+    container_name: myproject-db
+    environment:
+      POSTGRES_DB: myproject
+      POSTGRES_PASSWORD: pass
+      POSTGRES_USER: user
+    image: postgres:13
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+  elasticsearch:
+    container_name: myproject-elasticsearch
+    environment:
+      discovery.type: single-node
+    image: elasticsearch:7.14.0
+    volumes:
+    - elasticsearch_data:/usr/share/elasticsearch/data
+  nginx:
+    container_name: myproject-nginx
+    depends_on:
+    - web
+    image: nginx:alpine
+    ports:
+    - 80:80
+    volumes:
+    - ./nginx.conf:/etc/nginx/nginx.conf
+  redis:
+    container_name: myproject-redis
+    image: redis:alpine
+  web:
+    build: .
+    container_name: myproject-web
+    depends_on:
+    - db
+    - redis
+    - elasticsearch
+    environment:
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      DATABASE_URL: postgres://user:pass@db:5432/myproject
+      DEBUG: 'True'
+    ports:
+    - 8000:8000
+    volumes:
+    - ./:/app
+version: '3.8'
+volumes:
+  elasticsearch_data: {}
+  postgres_data: {}

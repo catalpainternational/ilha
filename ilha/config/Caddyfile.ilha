@@ -1,0 +1,25 @@
+# Global Caddyfile for ilha
+# This file provides dynamic routing for worktree environments using Docker integration
+
+{
+    # Basic configuration
+    # auto_https is controlled by dynamic config script for domain-based deployments
+    # HTTPS is enabled by default in Caddy v2, dynamic config handles TLS automation
+    auto_https off
+    servers {
+        protocols h1 h2
+    }
+    # Enable admin API for dynamic configuration
+    admin 0.0.0.0:2019
+}
+
+# Default route for unknown domains
+:80 {
+    respond "ilha Global Caddy Proxy Ready - No worktree found for this domain" 200
+    
+    log {
+        output stdout
+        format console
+    }
+}
+
