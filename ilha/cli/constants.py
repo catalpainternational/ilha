@@ -16,6 +16,7 @@ RESERVED_COMMANDS = {
     "prune",
     "volumes",
     "setup",
+    "server-import",
     "help",
     "completion",
     "packages",

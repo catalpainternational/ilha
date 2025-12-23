@@ -244,7 +244,8 @@ class PushManager:
     
     def _run_remote_import(self, username: str, server: str, remote_file: str, 
                            branch_name: str, domain: Optional[str], ip: Optional[str],
-                           build: bool = False, debug: bool = False) -> bool:
+                           build: bool = False, debug: bool = False,
+                           use_staging_certificates: bool = False) -> bool:
         """Run remote import using ilha server-import command.
         
         Args:
@@ -255,6 +256,8 @@ class PushManager:
             domain: Optional domain for Caddy routing
             ip: Optional IP for HTTP-only routing
             build: Whether to rebuild Docker images
+            debug: Whether to enable debug mode
+            use_staging_certificates: Whether to use staging certificates
             
         Returns:
             True if successful, False otherwise
@@ -277,6 +280,12 @@ class PushManager:
             
             if build:
                 cmd_parts.append("--build")
+                
+            if debug:
+                cmd_parts.append("--debug")
+                
+            if use_staging_certificates:
+                cmd_parts.append("--use-staging-certificates")
             
             # Build SSH command - properly escape arguments for bash -lc
             # bash -lc expects a single quoted string, so we need to escape
@@ -672,6 +681,7 @@ class PushManager:
                     ip,
                     build=build,
                     debug=debug,
+                    use_staging_certificates=use_staging_certificates,
                 )
                 log_info("Remote import process completed")
                 

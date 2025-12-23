@@ -15,9 +15,6 @@ WEB_SERVICE_NAMES = ['web', 'app', 'frontend', 'api', 'backend']
 # Default port for web services
 DEFAULT_WEB_PORT = 8000
 
-# Legacy network names that should be replaced with ilha_caddy_proxy
-LEGACY_NETWORK_NAMES = ['dockertree_caddy_proxy', 'caddy_proxy']
-
 
 def _detect_service_port(service_config: Dict[str, Any]) -> int:
     """
@@ -71,62 +68,6 @@ def _detect_service_port(service_config: Dict[str, Any]) -> int:
     
     # Default fallback
     return DEFAULT_WEB_PORT
-
-
-def cleanup_legacy_networks(compose_data: Dict[str, Any]) -> bool:
-    """
-    Clean up legacy network names in all services.
-    
-    Replaces legacy network names (dockertree_caddy_proxy, caddy_proxy) with ilha_caddy_proxy.
-    This ensures backward compatibility with older compose files.
-    
-    Args:
-        compose_data: Docker Compose data structure (dict with 'services' key)
-    
-    Returns:
-        True if any changes were made, False otherwise
-    """
-    if not compose_data or 'services' not in compose_data:
-        return False
-    
-    updated = False
-    
-    for service_name, service_config in compose_data['services'].items():
-        if 'networks' not in service_config:
-            continue
-        
-        networks = service_config['networks']
-        
-        # Handle list format: ['default', 'dockertree_caddy_proxy']
-        if isinstance(networks, list):
-            for i, network in enumerate(networks):
-                if network in LEGACY_NETWORK_NAMES:
-                    networks[i] = 'ilha_caddy_proxy'
-                    updated = True
-                    log_info(f"Replaced legacy network '{network}' with 'ilha_caddy_proxy' in service '{service_name}'")
-        
-        # Handle dict format: {'default': None, 'dockertree_caddy_proxy': None}
-        elif isinstance(networks, dict):
-            for legacy_network in LEGACY_NETWORK_NAMES:
-                if legacy_network in networks:
-                    # Preserve the value (usually None or a dict)
-                    network_value = networks.pop(legacy_network)
-                    # Only add ilha_caddy_proxy if it doesn't already exist
-                    if 'ilha_caddy_proxy' not in networks:
-                        networks['ilha_caddy_proxy'] = network_value
-                    updated = True
-                    log_info(f"Replaced legacy network '{legacy_network}' with 'ilha_caddy_proxy' in service '{service_name}'")
-    
-    # Also clean up top-level networks declaration
-    if 'networks' in compose_data:
-        for legacy_network in LEGACY_NETWORK_NAMES:
-            if legacy_network in compose_data['networks']:
-                # Remove legacy network definition
-                compose_data['networks'].pop(legacy_network)
-                updated = True
-                log_info(f"Removed legacy network definition '{legacy_network}' from top-level networks")
-    
-    return updated
 
 
 def _has_caddy_labels(service_config: Dict[str, Any]) -> bool:
@@ -188,10 +129,7 @@ def ensure_caddy_labels_and_network(
     if not compose_data or 'services' not in compose_data:
         return False
     
-    # First, clean up legacy network names in all services
-    cleanup_updated = cleanup_legacy_networks(compose_data)
-    
-    updated = cleanup_updated
+    updated = False
     
     for service_name, service_config in compose_data['services'].items():
         # Configure web services OR services that already have Caddy labels
@@ -300,13 +238,8 @@ def ensure_caddy_labels_and_network(
             log_info(f"Added networks to {service_name}: default + ilha_caddy_proxy")
         elif isinstance(service_config['networks'], list):
             # Convert list to dict format, preserving all existing networks
-            # Replace legacy network names during conversion
             networks_dict = {}
             for network in service_config['networks']:
-                # Replace legacy network names
-                if network in LEGACY_NETWORK_NAMES:
-                    network = 'ilha_caddy_proxy'
-                    updated = True
                 networks_dict[network] = None
             # Ensure default network is included for database access
             if 'default' not in networks_dict:
