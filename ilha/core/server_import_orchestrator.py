@@ -199,7 +199,7 @@ class ServerImportOrchestrator:
         empty_volumes = 0
         need_restore = False
         
-        volume_types = ["postgres_data", "redis_data", "media_files"]
+        volume_types = ["postgres_data", "redis_data", "media_files", "sqlite_data"]
         
         for vol_type in volume_types:
             if project_name:
@@ -438,9 +438,6 @@ class ServerImportOrchestrator:
             # Standalone mode: use docker compose directly
             worktree_path = project_root / "worktrees" / branch_name
             compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-            
-            if not compose_file.exists():
-                compose_file = worktree_path / "docker-compose.yml"
             
             if not compose_file.exists():
                 log_error(f"Docker Compose file not found: {compose_file}")

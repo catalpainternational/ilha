@@ -262,7 +262,7 @@ class DockerManager:
         For PostgreSQL volumes, this method will stop the original database container
         before copying to ensure data consistency, then restart it after copying.
         
-        Note: Only creates postgres, redis, and media volumes. Caddy volumes 
+        Note: Creates postgres, redis, media, and sqlite volumes. Caddy volumes 
         are shared globally across all worktrees and should not be copied.
         
         Uses centralized volume naming functions for consistency and DRY principles.
@@ -319,7 +319,7 @@ class DockerManager:
     def remove_volumes(self, branch_name: str) -> bool:
         """Remove worktree-specific volumes.
         
-        Note: Only removes postgres, redis, and media volumes. Caddy volumes 
+        Note: Removes postgres, redis, media, and sqlite volumes. Caddy volumes 
         are shared globally across all worktrees and should never be deleted 
         during worktree removal.
         """
@@ -463,13 +463,11 @@ class DockerManager:
             log_error(f"Could not find worktree path for '{branch_name}'")
             return []
         
-        # Find docker-compose.yml file
-        compose_file = worktree_path / "docker-compose.yml"
-        if not compose_file.exists():
-            compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        # Find docker-compose.worktree.yml file
+        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
         
         if not compose_file.exists():
-            log_error(f"No docker-compose.yml found for worktree '{branch_name}'")
+            log_error(f"No docker-compose.worktree.yml found for worktree '{branch_name}'")
             return []
         
         # Load compose file
@@ -477,7 +475,7 @@ class DockerManager:
             with open(compose_file) as f:
                 compose_data = yaml.safe_load(f) or {}
         except Exception as e:
-            log_error(f"Failed to parse docker-compose.yml for worktree '{branch_name}': {e}")
+            log_error(f"Failed to parse docker-compose.worktree.yml for worktree '{branch_name}': {e}")
             return []
         
         # Get service definition

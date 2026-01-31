@@ -76,32 +76,9 @@ def validate_docker_compose() -> bool:
 
 def validate_worktree_directory(worktree_path: Path, project_root: Optional[Path] = None) -> bool:
     """Validate that we're in a valid worktree directory."""
-    from .file_utils import find_compose_files
-    
-    # Check for any compose file in worktree directory (this is created by git worktree)
-    worktree_compose_files = find_compose_files(worktree_path)
-    if worktree_compose_files:
-        return True
-
-    # Check for compose worktree file in worktree's ilha directory
-    compose_worktree_path = worktree_path / "ilha" / "config" / "docker-compose.worktree.yml"
-    if compose_worktree_path.exists():
-        return True
-
-    # Check for compose worktree file in ilha directory (correct parent)
-    if project_root is None:
-        from ..config.settings import get_project_root
-        project_root = get_project_root()
-    ilha_path = project_root / "ilha" / "config" / "docker-compose.worktree.yml"
-    if ilha_path.exists():
-        return True
-
-    # Check for compose files in project root directory
-    project_compose_files = find_compose_files(project_root)
-    if project_compose_files:
-        return True
-
-    return False
+    # Check for compose worktree file in worktree's .ilha directory
+    compose_worktree_path = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+    return compose_worktree_path.exists()
 
 
 def validate_compose_override_exists(branch_name: str, project_root: Optional[Path] = None) -> bool:

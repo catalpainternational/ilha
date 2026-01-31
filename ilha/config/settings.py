@@ -28,6 +28,7 @@ COMPOSE_WORKTREE = f"{COMPOSE_OVERRIDE_DIR}/config/docker-compose.worktree.yml"
 POSTGRES_VOLUME_SUFFIX = "postgres_data"
 REDIS_VOLUME_SUFFIX = "redis_data"
 MEDIA_VOLUME_SUFFIX = "media_files"
+SQLITE_VOLUME_SUFFIX = "sqlite_data"
 CADDY_DATA_VOLUME_SUFFIX = "caddy_data"
 CADDY_CONFIG_VOLUME_SUFFIX = "caddy_config"
 
@@ -376,6 +377,7 @@ def get_volume_names(branch_name: str) -> dict[str, str]:
         "postgres": get_volume_name(branch_name, POSTGRES_VOLUME_SUFFIX),
         "redis": get_volume_name(branch_name, REDIS_VOLUME_SUFFIX),
         "media": get_volume_name(branch_name, MEDIA_VOLUME_SUFFIX),
+        "sqlite": get_volume_name(branch_name, SQLITE_VOLUME_SUFFIX),
     }
 
 def get_source_volume_name(volume_type: str) -> str:
@@ -405,11 +407,13 @@ def get_source_volume_names() -> dict[str, str]:
         {
             "postgres": "{original_project_name}_postgres_data",
             "redis": "{original_project_name}_redis_data",
-            "media": "{original_project_name}_media_files"
+            "media": "{original_project_name}_media_files",
+            "sqlite": "{original_project_name}_sqlite_data"
         }
     """
     return {
         "postgres": get_source_volume_name(POSTGRES_VOLUME_SUFFIX),
         "redis": get_source_volume_name(REDIS_VOLUME_SUFFIX),
         "media": get_source_volume_name(MEDIA_VOLUME_SUFFIX),
+        "sqlite": get_source_volume_name(SQLITE_VOLUME_SUFFIX),
     }

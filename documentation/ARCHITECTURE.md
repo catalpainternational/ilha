@@ -104,9 +104,9 @@ User runs: ilha setup
     ↓
 1. Create .ilha/ directory structure
     ↓
-2. Detect existing docker-compose.yml
+2. Detect existing docker-compose.yml (in project root)
     ↓
-3. Transform compose file → docker-compose.worktree.yml
+3. Transform compose file → .ilha/docker-compose.worktree.yml
     ↓
 4. Generate config.yml with detected services
     ↓
@@ -120,6 +120,8 @@ Ready for worktree creation
     ↓
 7. Detect Django settings and validate env-driven keys (optional monkey patch)
 ```
+
+**Note**: The base `docker-compose.yml` is only read during setup. After setup, all runtime operations exclusively use `worktrees/{branch}/.ilha/docker-compose.worktree.yml`. There is no fallback to the base compose file.
 
 ### Configuration Files
 
@@ -148,6 +150,8 @@ environment:
 - Ports converted to `expose` for internal networking (extracts container port only)
 - Caddy labels added for web services (web, app, frontend, api)
 - Web services automatically connected to both `default` network (for database/redis access) and `ilha_caddy_proxy` network (for Caddy routing)
+
+**Critical Design**: ilha **always** uses `worktrees/{branch}/.ilha/docker-compose.worktree.yml` for all runtime operations. There is no fallback or backward compatibility - ilha will never look for or use other compose files (such as `docker-compose.yml` in the project root or worktree directory) during runtime. This ensures consistent behavior and eliminates ambiguity about which compose file is being used.
 
 ### Dynamic Configuration Loading
 ### Django Compatibility Validation
@@ -397,7 +401,7 @@ This eliminates duplicated `try/except` blocks and guarantees uniform output for
 
 **Key Functions**:
 - `ensure_caddy_labels_and_network()` - Ensure Caddy labels and network are configured for web services
-- `update_allowed_hosts_in_compose()` - Update ALLOWED_HOSTS in docker-compose.yml environment section
+- `update_allowed_hosts_in_compose()` - Update ALLOWED_HOSTS in docker-compose.worktree.yml environment section
 
 **Key Features**:
 - **Label Update Behavior**: When `domain` or `ip` is provided (production deployment), existing `caddy.proxy` labels are **replaced** with the production domain/IP
@@ -448,6 +452,8 @@ config/settings.py (Central Configuration)
 - **`docker-compose.global-caddy.yml`** - Global Caddy proxy
 - **`.ilha/docker-compose.worktree.yml`** - Generated worktree environments (created by setup)
 - **`Caddyfile.ilha`** - Caddy configuration
+
+**Compose File Usage**: ilha **always** uses `worktrees/{branch}/.ilha/docker-compose.worktree.yml` for all runtime operations. The base `docker-compose.yml` in the project root is only read during `ilha setup` to generate the worktree compose file. After setup, ilha never looks for or uses other compose files - there is no fallback or backward compatibility. This ensures consistent behavior and eliminates ambiguity about which compose file is being used.
 
 #### Environment Files
 - **`.env`** - Base environment variables (secrets, project config - never edited by ilha)

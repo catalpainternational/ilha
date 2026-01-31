@@ -320,24 +320,45 @@ if _hdr:
     SECURE_PROXY_SSL_HEADER = tuple(_hdr.split(",", 1))
 ```
 
-### SQLite persistence (recommended pattern)
+### SQLite Persistence (Automatic)
 
-When using SQLite in Docker, store the database file on a named Docker volume so ilha export/import captures it (just like Postgres/Redis volumes):
+ilha automatically configures SQLite persistence when you run `ilha setup`:
 
-- In Django settings, point SQLite to a path under a data mount, e.g. `/data/db.sqlite3` (or use an env var like `SQLITE_PATH=/data/db.sqlite3`).
-- In your compose, mount a named volume for the web service:
+**Automatic Configuration:**
+- ✅ Creates `sqlite_data` Docker volume
+- ✅ Mounts volume at `/data` in web containers
+- ✅ Copies SQLite databases between worktrees
+- ✅ Includes SQLite in export/import packages
 
-```yaml
-services:
-  web:
-    volumes:
-      - sqlite_data:/data
+**Django Configuration:**
+Set your database path to use the volume:
 
-volumes:
-  sqlite_data: {}
+```python
+# settings.py
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.getenv('SQLITE_PATH', '/data/db.sqlite3'),  # Use volume path
+    }
+}
 ```
 
-ilha will back up and restore `sqlite_data` with other volumes, preserving DB state across export/import. If you keep the DB at `/app/db.sqlite3` (bind-mounted source tree), it is not part of any Docker volume snapshot and will not be included.
+**Migration:**
+If your database is currently in the source tree (e.g., `db/db.sqlite3`), migrate it:
+
+```bash
+# Copy to Docker volume
+docker compose cp db/db.sqlite3 web:/data/db.sqlite3
+
+# Or use ilha setup --monkey-patch to auto-configure
+ilha setup --monkey-patch
+```
+
+**Why This Matters:**
+- 📁 Each worktree gets its own isolated database
+- 📦 Databases are included in ilha packages
+- 🔄 Database state persists across container rebuilds
+- ❌ Without volume: all worktrees share the same database file
 
 ### Project Setup
 
@@ -348,6 +369,14 @@ When you run `ilha setup`, it creates a `.ilha/` directory with:
 - `Caddyfile.ilha` - Caddy configuration
 - `README.md` - User guide optimized for coding agents
 - `worktrees/` - Worktree directories
+
+#### Docker Compose File Usage
+
+**Important**: ilha always uses `worktrees/{branch}/.ilha/docker-compose.worktree.yml` for all runtime operations. ilha never looks for or uses other compose files (such as `docker-compose.yml` in the project root or worktree directory) during runtime operations.
+
+- **Setup Phase**: During `ilha setup`, the base `docker-compose.yml` in the project root is read and transformed into `.ilha/docker-compose.worktree.yml`
+- **Runtime Phase**: All commands (`up`, `down`, `exec`, `logs`, etc.) exclusively use `worktrees/{branch}/.ilha/docker-compose.worktree.yml`
+- **No Fallback**: There is no backward compatibility or fallback logic - ilha will only use the worktree compose file
 
 ### Droplet Configuration
 

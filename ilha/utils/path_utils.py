@@ -12,22 +12,16 @@ from ..config.settings import get_project_root, get_worktree_paths, get_worktree
 
 
 def get_compose_override_path(worktree_path: Optional[Path] = None) -> Optional[Path]:
-    """Get the correct path to the compose worktree file."""
+    """Get the path to the compose worktree file.
+    
+    Always returns worktrees/{branch}/.ilha/docker-compose.worktree.yml
+    """
     if worktree_path is None:
         worktree_path = Path.cwd()
 
-    # Check for compose worktree file in worktree's .ilha directory first
+    # Always use worktree's .ilha directory
     compose_path = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-    if compose_path.exists():
-        return compose_path
-
-    # Fallback: check project root .ilha directory
-    project_root = get_project_root()
-    ilha_path = project_root / ".ilha" / "docker-compose.worktree.yml"
-    if ilha_path.exists():
-        return ilha_path
-
-    return None
+    return compose_path if compose_path.exists() else None
 
 
 def get_worktree_branch_name(worktree_path: Optional[Path] = None) -> Optional[str]:

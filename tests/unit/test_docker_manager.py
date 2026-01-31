@@ -108,7 +108,7 @@ class TestDockerManager:
     def test_create_worktree_volumes_success(self, mock_copy_volume, mock_get_volume_names, docker_manager):
         """Test successful worktree volume creation.
         
-        Note: Only postgres, redis, and media volumes are created.
+        Note: Creates postgres, redis, media, and sqlite volumes.
         Caddy volumes are shared globally and not per-worktree.
         """
         branch_name = "test-branch"
@@ -118,6 +118,7 @@ class TestDockerManager:
             "postgres": "test-branch_postgres_data",
             "redis": "test-branch_redis_data",
             "media": "test-branch_media_files",
+            "sqlite": "test-branch_sqlite_data",
         }
         mock_copy_volume.return_value = True
         
@@ -125,7 +126,7 @@ class TestDockerManager:
         
         assert result == True
         mock_get_volume_names.assert_called_once_with(branch_name)
-        assert mock_copy_volume.call_count == 3  # One for each volume type (postgres, redis, media)
+        assert mock_copy_volume.call_count == 4  # One for each volume type (postgres, redis, media, sqlite)
     
     @patch('ilha.core.docker_manager.get_volume_names')
     @patch.object(DockerManager, 'copy_volume')
@@ -138,15 +139,16 @@ class TestDockerManager:
             "postgres": "test-branch_postgres_data",
             "redis": "test-branch_redis_data",
             "media": "test-branch_media_files",
+            "sqlite": "test-branch_sqlite_data",
         }
-        # First two succeed, third fails
-        mock_copy_volume.side_effect = [True, True, False]
+        # First three succeed, fourth fails
+        mock_copy_volume.side_effect = [True, True, True, False]
         
         result = docker_manager.create_worktree_volumes(branch_name, project_name)
         
         assert result == False
         mock_get_volume_names.assert_called_once_with(branch_name)
-        assert mock_copy_volume.call_count == 3
+        assert mock_copy_volume.call_count == 4
     
     @patch('ilha.core.docker_manager.get_volume_names')
     @patch('ilha.core.docker_manager.validate_volume_exists')
@@ -154,7 +156,7 @@ class TestDockerManager:
     def test_remove_volumes_success(self, mock_run, mock_validate, mock_get_volume_names, docker_manager):
         """Test successful volume removal.
         
-        Note: Only removes postgres, redis, and media volumes.
+        Note: Removes postgres, redis, media, and sqlite volumes.
         Caddy volumes are shared globally and not removed per-worktree.
         """
         branch_name = "test-branch"
@@ -163,6 +165,7 @@ class TestDockerManager:
             "postgres": "test-branch_postgres_data",
             "redis": "test-branch_redis_data",
             "media": "test-branch_media_files",
+            "sqlite": "test-branch_sqlite_data",
         }
         mock_validate.return_value = True
         mock_run.return_value = Mock(returncode=0)
@@ -171,8 +174,8 @@ class TestDockerManager:
         
         assert result == True
         mock_get_volume_names.assert_called_once_with(branch_name)
-        assert mock_validate.call_count == 3
-        assert mock_run.call_count == 3
+        assert mock_validate.call_count == 4
+        assert mock_run.call_count == 4
     
     @patch('ilha.core.docker_manager.get_volume_names')
     @patch('ilha.core.docker_manager.validate_volume_exists')

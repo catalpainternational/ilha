@@ -250,6 +250,7 @@ class SetupManager:
         """If this looks like a Django project, validate env-driven settings and guide user.
 
         Checks for: ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST, SECURE_PROXY_SSL_HEADER.
+        Also checks SQLite configuration for Docker volume persistence.
         Optionally monkey-patches settings.py to read these from env vars.
         """
         project_root = self.project_root
@@ -260,23 +261,28 @@ class SetupManager:
         if not settings_path:
             return
 
+        # Existing proxy checks
         missing = self._find_missing_env_config(settings_path)
         if not missing:
             log_success("✓ Django settings appear to read required values from environment variables")
-            return
+        else:
+            log_warning("Django settings are not fully environment-driven for reverse proxy/Caddy:")
+            for item in missing:
+                log_warning(f"  - {item}")
 
-        log_warning("Django settings are not fully environment-driven for reverse proxy/Caddy:")
-        for item in missing:
-            log_warning(f"  - {item}")
+            self._print_django_guidance()
 
-        self._print_django_guidance()
-
-        if monkey_patch:
-            ok = self._monkey_patch_settings(settings_path)
-            if ok:
-                log_success(f"Applied monkey patch to: {settings_path}")
-            else:
-                log_warning("Monkey patch failed; please update settings manually using the guidance above.")
+            if monkey_patch:
+                ok = self._monkey_patch_settings(settings_path)
+                if ok:
+                    log_success(f"Applied monkey patch to: {settings_path}")
+                else:
+                    log_warning("Monkey patch failed; please update settings manually using the guidance above.")
+        
+        # NEW: SQLite configuration check
+        sqlite_config = self._detect_sqlite_configuration(settings_path)
+        if sqlite_config["is_sqlite"]:
+            self._check_sqlite_persistence(sqlite_config, settings_path, monkey_patch)
 
     def _locate_django_settings(self, root: Path) -> Optional[Path]:
         """Heuristically find Django settings.py."""
@@ -342,6 +348,136 @@ if _hdr:
             return True
         except Exception as e:
             log_warning(f"Failed to patch settings.py: {e}")
+            return False
+    
+    def _detect_sqlite_configuration(self, settings_path: Path) -> dict:
+        """Detect SQLite database configuration in Django settings.
+        
+        Returns:
+            dict with keys:
+            - is_sqlite: bool - True if SQLite is detected
+            - db_path: str - Database file path from settings (if found)
+            - on_volume: bool - True if path appears to be on /data volume
+            - needs_migration: bool - True if db is in source tree (bad)
+        """
+        try:
+            with open(settings_path, 'r') as f:
+                content = f.read()
+            
+            # Look for DATABASES configuration
+            # Pattern 1: sqlite3 with ENGINE field
+            sqlite_pattern = r"['\"]ENGINE['\"]:\s*['\"].*sqlite3['\"]"
+            if not re.search(sqlite_pattern, content, re.IGNORECASE):
+                return {"is_sqlite": False}
+            
+            # Pattern 2: Extract NAME field
+            # Matches: 'NAME': 'path' or 'NAME': Path('path') or "NAME": os.path.join(...)
+            name_patterns = [
+                r"['\"]NAME['\"]:\s*['\"]([^'\"]+)['\"]",  # Simple string
+                r"['\"]NAME['\"]:\s*Path\(['\"]([^'\"]+)['\"]",  # Path object
+                r"['\"]NAME['\"]:\s*BASE_DIR\s*/\s*['\"]([^'\"]+)['\"]",  # BASE_DIR / 'path'
+            ]
+            
+            db_path = None
+            for pattern in name_patterns:
+                match = re.search(pattern, content)
+                if match:
+                    db_path = match.group(1)
+                    break
+            
+            # Check if path is on volume mount
+            on_volume = False
+            needs_migration = True
+            
+            if db_path:
+                # Volume-mounted path patterns: /data/*, /var/lib/*, /db/*
+                if db_path.startswith(('/data/', '/var/lib/', '/db/')):
+                    on_volume = True
+                    needs_migration = False
+                # Relative paths or paths in BASE_DIR are bind-mounted (bad)
+                elif db_path.startswith(('db/', 'database/', './', '../')) or 'BASE_DIR' in content:
+                    on_volume = False
+                    needs_migration = True
+            
+            return {
+                "is_sqlite": True,
+                "db_path": db_path,
+                "on_volume": on_volume,
+                "needs_migration": needs_migration
+            }
+        
+        except Exception as e:
+            log_warning(f"Failed to analyze SQLite configuration: {e}")
+            return {"is_sqlite": False}
+    
+    def _check_sqlite_persistence(self, config: dict, settings_path: Path, monkey_patch: bool) -> None:
+        """Check and guide SQLite persistence configuration."""
+        if config["on_volume"]:
+            log_success(f"✓ SQLite database is configured on Docker volume: {config['db_path']}")
+            return
+        
+        if config["needs_migration"]:
+            log_warning("\n" + "="*70)
+            log_warning("SQLite Database Configuration Issue")
+            log_warning("="*70)
+            log_warning(f"Database path: {config.get('db_path', 'not detected')}")
+            log_warning("")
+            log_warning("⚠️  Your SQLite database is in the source code directory (bind mount).")
+            log_warning("   This will cause problems with ilha worktrees:")
+            log_warning("   • Database won't be copied to new worktrees")
+            log_warning("   • Won't be included in ilha export/import packages")
+            log_warning("   • All worktrees will share the same database file")
+            log_warning("")
+            log_warning("✅ Recommended Fix:")
+            log_warning("   1. Store SQLite on a Docker volume (ilha already created sqlite_data volume)")
+            log_warning("   2. Update Django settings:")
+            log_warning("")
+            log_warning("      # In settings.py")
+            log_warning("      DATABASES = {")
+            log_warning("          'default': {")
+            log_warning("              'ENGINE': 'django.db.backends.sqlite3',")
+            log_warning("              'NAME': os.getenv('SQLITE_PATH', '/data/db.sqlite3'),")
+            log_warning("          }")
+            log_warning("      }")
+            log_warning("")
+            log_warning("   3. docker-compose.yml mounts sqlite_data to /data automatically")
+            log_warning("   4. Migrate your existing database:")
+            log_warning("      cp db/db.sqlite3 /path/to/volume/db.sqlite3")
+            log_warning("="*70 + "\n")
+            
+            if monkey_patch:
+                log_info("Attempting to fix SQLite configuration...")
+                self._monkey_patch_sqlite_settings(settings_path)
+    
+    def _monkey_patch_sqlite_settings(self, settings_path: Path) -> bool:
+        """Monkey-patch settings.py to use environment-driven SQLite path on volume."""
+        try:
+            with open(settings_path, 'r') as f:
+                content = f.read()
+            
+            # Check if already has environment-driven SQLite config
+            if "os.getenv('SQLITE_PATH'" in content or 'os.environ.get("SQLITE_PATH"' in content:
+                log_info("SQLite configuration already uses environment variables")
+                return True
+            
+            patch = '''
+
+# ilha: SQLite persistence on Docker volume
+import os
+from pathlib import Path
+if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
+    DATABASES['default']['NAME'] = os.getenv('SQLITE_PATH', '/data/db.sqlite3')
+'''
+            
+            with open(settings_path, 'a') as f:
+                f.write(patch)
+            
+            log_success("Applied SQLite volume configuration to settings.py")
+            log_info("Set SQLITE_PATH=/data/db.sqlite3 in .env to use Docker volume")
+            return True
+        
+        except Exception as e:
+            log_warning(f"Failed to patch SQLite settings: {e}")
             return False
     
     def _create_ilha_directory(self) -> bool:
