@@ -5,6 +5,7 @@ This module provides SSH connection management with connection reuse,
 host key caching, and unified remote command execution.
 """
 
+import shlex
 import subprocess
 import os
 from pathlib import Path
@@ -103,9 +104,12 @@ class SSHConnectionManager:
         # Add target
         cmd.append(f"{username}@{server}")
         
-        # Add command if provided
+        # Add command if provided. Pass as a single string so the server runs
+        # "bash -lc 'full command'" and the -c script is the entire command.
+        # Passing ["bash", "-lc", command] causes ssh to send separate args, so
+        # the server only gets "ilha" as the -c script and the rest is lost.
         if command:
-            cmd.extend(["bash", "-lc", command])
+            cmd.append("bash -lc " + shlex.quote(command))
         
         return cmd
     
