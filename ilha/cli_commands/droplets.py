@@ -257,7 +257,7 @@ def register_commands(cli) -> None:
 
     @droplet.command("create")
     @click.argument("branch_name", required=False)
-    @click.option("--region", help="Droplet region (default: nyc1 or from DIGITALOCEAN_REGION env var)")
+    @click.option("--region", help='Droplet region (e.g., nyc1, sfo3). Use "ilha droplet regions" to list available regions. Default: nyc1 or from DROPLET_DEFAULT_REGION env var')
     @click.option(
         "--size",
         help='Droplet size slug (e.g., s-1vcpu-1gb, s-2vcpu-4gb). Use "ilha droplet sizes" to list all available sizes. Default: s-1vcpu-1gb or from DIGITALOCEAN_SIZE env var',
@@ -767,6 +767,28 @@ def register_commands(cli) -> None:
                 JSONOutput.print_error(f"Error listing droplet sizes: {exc}")
             else:
                 error_exit(f"Error listing droplet sizes: {exc}")
+
+    @droplet.command("regions")
+    @click.option("--api-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
+    @click.option("--as-json", "--json", "output_json", is_flag=True, default=False, help="Output results as JSON format")
+    @click.option("--as-csv", "output_csv", is_flag=True, default=False, help="Output results as CSV format")
+    @click.option("--show-all", is_flag=True, default=False, help="Include unavailable regions in output")
+    @add_verbose_option
+    def droplet_regions(api_token: Optional[str], output_json: bool, output_csv: bool, show_all: bool):
+        try:
+            check_prerequisites_no_git()
+            droplet_commands = DropletCommands()
+            success = droplet_commands.list_regions(api_token=api_token, json=output_json, csv=output_csv, show_all=show_all)
+            if not success:
+                if output_json or output_csv:
+                    JSONOutput.print_error("Failed to list droplet regions")
+                else:
+                    error_exit("Failed to list droplet regions")
+        except Exception as exc:
+            if output_json or output_csv:
+                JSONOutput.print_error(f"Error listing droplet regions: {exc}")
+            else:
+                error_exit(f"Error listing droplet regions: {exc}")
 
     @droplet.command("destroy")
     @click.argument("droplet_ids", type=str)

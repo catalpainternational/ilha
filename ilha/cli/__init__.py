@@ -53,10 +53,50 @@ class ilhaCLI(click.Group):
                 return super().parse_args(ctx, new_args)
 
         elif args[0] in {"up", "down"}:
-            error_exit(
-                f"Error: The command pattern has changed. Use 'ilha <worktree_name> {args[0]}' "
-                f"instead of 'ilha {args[0]} <worktree_name>'"
-            )
+            # Try to resolve worktree from current context
+            resolved_branch = None
+            
+            # Lazy import to avoid circular dependencies
+            from ..utils.path_utils import detect_execution_context, get_worktree_branch_name
+            from ..core.git_manager import GitManager
+            from ..config.settings import get_project_root
+            
+            # First, try to detect if we're in a worktree directory
+            worktree_path, branch_name, is_worktree = detect_execution_context()
+            if branch_name:
+                resolved_branch = branch_name
+            else:
+                # Not in a worktree, try to use current git branch
+                try:
+                    project_root = get_project_root()
+                    git_manager = GitManager(project_root=project_root, validate=False)
+                    current_branch = git_manager.get_current_branch()
+                    if current_branch:
+                        # Validate that a worktree exists for this branch
+                        if git_manager.validate_worktree_exists(current_branch):
+                            resolved_branch = current_branch
+                except Exception:
+                    # If we can't determine the branch, we'll error below
+                    pass
+            
+            if resolved_branch:
+                # Rewrite args: command, branch_name, then remaining args
+                # For "up", ensure "-d" is included if not already present
+                remaining_args = args[1:] if len(args) > 1 else []
+                
+                if args[0] == "up":
+                    # Ensure "-d" is present for "up" command (docker compose up -d)
+                    if "-d" not in remaining_args and "--detach" not in remaining_args:
+                        remaining_args = ["-d"] + remaining_args
+                
+                new_args = [args[0], resolved_branch] + remaining_args
+                return super().parse_args(ctx, new_args)
+            else:
+                # Could not resolve worktree - provide helpful error
+                error_exit(
+                    f"Error: Could not determine worktree. Run from a worktree directory or use: "
+                    f"ilha <worktree_name> {args[0]}"
+                )
 
         return super().parse_args(ctx, args)
 
@@ -70,13 +110,16 @@ Each worktree gets its own database, Redis, media storage, and unique URL.
 
 Usage:
     ilha <worktree_name> up|down
+    ilha up|down  (from worktree directory or project root with current branch)
 
     ilha <command> [options]
 
 Examples:
     ilha create feature-auth
     ilha feature-auth up
+    ilha up  (from worktree directory or project root)
     ilha feature-auth down
+    ilha down  (from worktree directory or project root)
     ilha remove feature-auth
     ilha list
 """

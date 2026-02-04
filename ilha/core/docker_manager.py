@@ -15,6 +15,7 @@ from ..config.settings import (
     CADDY_NETWORK, 
     get_compose_command, 
     get_volume_names,
+    get_volume_names_for_project_root,
     get_source_volume_names,
     DEFAULT_ENV_VARS,
     get_project_root,
@@ -649,7 +650,9 @@ class DockerManager:
             else:
                 log_success("Containers stopped successfully")
         
-        volume_names = get_volume_names(branch_name)
+        # Use project-root-based volume names so standalone import (cwd=/root) gets
+        # correct names (e.g. business-intelligence-lipstick_*) instead of cwd-based (root-lipstick_*)
+        volume_names = get_volume_names_for_project_root(self.project_root, branch_name)
         restore_temp_dir = backup_file.parent / "restore_temp"
         
         try:

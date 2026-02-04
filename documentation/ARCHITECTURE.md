@@ -306,6 +306,8 @@ The system uses a fallback hierarchy:
 **Key Methods**:
 - `create_droplet()` - Create new droplet with configurable options (default: creates and pushes environment)
 - `list_droplets()` - List all droplets with status information (supports table, JSON, CSV output)
+- `list_sizes()` - List available droplet sizes (table, JSON, CSV; optional show unavailable)
+- `list_regions()` - List available droplet regions (table, JSON, CSV; optional show unavailable via `--show-all`)
 - `destroy_droplet()` - Destroy droplet and/or DNS records with confirmation
 - `get_droplet_info()` - Get detailed droplet information
 - `_destroy_dns_only()` - Destroy DNS records only (internal helper)
@@ -333,6 +335,13 @@ The system uses a fallback hierarchy:
 - Each feature area registers its commands from `ilha/cli_commands/<feature>.py` via a `register_commands(cli)` hook. Adding a new feature no longer bloats `cli.py`.
 - Shared decorators in `ilha/cli/helpers.py` expose `add_verbose_option`, `add_json_option`, and a `command_wrapper` that performs prerequisite checks and formats results.
 - Commands raise `ilhaCommandError` (from `ilha/exceptions.py`) on failure; the wrapper converts these into consistent human and JSON responses.
+
+**Worktree Auto-Detection**:
+- Bare `ilha up` and `ilha down` commands automatically resolve the worktree from execution context:
+  - If running from within a worktree directory: uses `detect_execution_context()` to get the branch name
+  - If running from project root: uses current git branch and validates worktree exists via `GitManager.validate_worktree_exists()`
+  - For `ilha up`, automatically includes `-d` flag (docker compose up -d) if not already present
+  - If worktree cannot be resolved, provides helpful error message suggesting explicit worktree name
 
 **Command Wrapper Flow**:
 ```python
@@ -1028,7 +1037,7 @@ ilha includes a droplet provider abstraction layer for cloud server management:
 - `wait_for_droplet_ready()` - Wait for droplet to be ready
 
 **Provider Implementations**:
-- `DigitalOceanProvider` (`core/dns_providers/digitalocean.py`) - Digital Ocean Droplets API v2
+- `DigitalOceanProvider` (`core/dns_providers/digitalocean.py`) - Digital Ocean Droplets API v2 (implements `list_regions()` and `list_sizes()` for discovery)
 
 **Features**:
 - Automatic droplet creation with configurable defaults

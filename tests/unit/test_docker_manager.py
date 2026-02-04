@@ -229,14 +229,14 @@ class TestDockerManager:
         assert result.suffix == ".tar"
         mock_get_volume_names.assert_called_once_with(branch_name)
     
-    @patch('ilha.core.docker_manager.get_volume_names')
+    @patch('ilha.core.docker_manager.get_volume_names_for_project_root')
     @patch('subprocess.run')
-    def test_restore_volumes_success(self, mock_run, mock_get_volume_names, docker_manager):
+    def test_restore_volumes_success(self, mock_run, mock_get_volume_names_for_project_root, docker_manager):
         """Test successful volume restore."""
         branch_name = "test-branch"
         backup_file = Path("/test/backup.tar")
         
-        mock_get_volume_names.return_value = {
+        mock_get_volume_names_for_project_root.return_value = {
             "postgres": "test-branch_postgres_data",
             "redis": "test-branch_redis_data",
             "media": "test-branch_media_files",
@@ -283,7 +283,7 @@ class TestDockerManager:
             result = docker_manager.restore_volumes(branch_name, mock_backup_file)
         
         assert result == True
-        mock_get_volume_names.assert_called_once_with(branch_name)
+        mock_get_volume_names_for_project_root.assert_called_once_with(docker_manager.project_root, branch_name)
     
     @patch('subprocess.run')
     def test_start_services_success(self, mock_run, docker_manager):

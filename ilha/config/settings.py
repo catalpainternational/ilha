@@ -29,11 +29,36 @@ POSTGRES_VOLUME_SUFFIX = "postgres_data"
 REDIS_VOLUME_SUFFIX = "redis_data"
 MEDIA_VOLUME_SUFFIX = "media_files"
 SQLITE_VOLUME_SUFFIX = "sqlite_data"
+
+
+def get_volume_names_for_project_root(project_root: Path, branch_name: str) -> dict[str, str]:
+    """Get volume names for a worktree using a specific project root (not cwd).
+    Used when restoring volumes so the correct project name is used (e.g. standalone import).
+    """
+    project_name = None
+    config_path = Path(project_root) / ".ilha" / "config.yml"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = yaml.safe_load(f) or {}
+                project_name = config.get("project_name")
+        except Exception:
+            pass
+    if not project_name:
+        project_name = Path(project_root).name
+    project_name = sanitize_project_name(project_name)
+    prefix = f"{project_name}-{branch_name}_"
+    return {
+        "postgres": prefix + POSTGRES_VOLUME_SUFFIX,
+        "redis": prefix + REDIS_VOLUME_SUFFIX,
+        "media": prefix + MEDIA_VOLUME_SUFFIX,
+        "sqlite": prefix + SQLITE_VOLUME_SUFFIX,
+    }
 CADDY_DATA_VOLUME_SUFFIX = "caddy_data"
 CADDY_CONFIG_VOLUME_SUFFIX = "caddy_config"
 
 # Protected branches that cannot be deleted
-PROTECTED_BRANCHES = {"main", "master", "develop", "production", "staging"}
+PROTECTED_BRANCHES = {"main", "master",}
 
 # Branch name validation pattern
 BRANCH_NAME_PATTERN = r"^[a-zA-Z0-9_.-]+$"

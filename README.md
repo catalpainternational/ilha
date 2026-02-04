@@ -79,7 +79,11 @@ ilha CLI provides complete environment isolation through:
 
 ## 📋 Command Reference
 
-**Important**: ilha uses a **worktree-name-first pattern**. For `up` and `down` commands, the syntax is `ilha <worktree_name> up` and `ilha <worktree_name> down`, not `ilha up <worktree_name>`.
+**Important**: ilha uses a **worktree-name-first pattern**. For `up` and `down` commands, you can use:
+- `ilha <worktree_name> up` and `ilha <worktree_name> down` (explicit worktree name)
+- `ilha up` and `ilha down` (auto-detected from current directory or current git branch)
+
+The shorthand `ilha up` and `ilha down` automatically resolve the worktree from your current directory (if you're in a worktree) or from your current git branch (if you're at the project root).
 
 ### Setup Commands
 
@@ -109,9 +113,15 @@ ilha CLI provides complete environment isolation through:
 |---------|-------------|---------|
 | `create <branch>` | Create worktree | `ilha create feature-auth` |
 | `<branch> up -d` | Start worktree environment | `ilha feature-auth up -d` |
+| `up` | Start worktree environment (auto-detected) | `ilha up` (from worktree directory or project root) |
 | `<branch> down` | Stop worktree environment | `ilha feature-auth down` |
+| `down` | Stop worktree environment (auto-detected) | `ilha down` (from worktree directory or project root) |
 | `remove <branch>` | Remove worktree (keep branch) | `ilha remove feature-auth` |
 | `delete <branch>` | Delete worktree and branch | `ilha delete feature-auth` |
+
+**Note**: The `ilha up` and `ilha down` commands automatically detect the worktree from:
+- Your current directory (if you're inside a worktree directory)
+- Your current git branch (if you're at the project root and a worktree exists for that branch)
 
 **Important**: Branch names must match exactly. The `delete` and `remove` commands check worktrees, branches, and docker volumes for exact matches only. If no exact match is found, an error message will show what was checked.
 
@@ -179,15 +189,17 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 | `droplet list` | List all droplets (formatted table) | `ilha droplet list` |
 | `droplet list --as-json` | List droplets as JSON | `ilha droplet list --as-json` |
 | `droplet list --as-csv` | List droplets as CSV | `ilha droplet list --as-csv` |
-| `droplet regions` | List available Digital Ocean regions | `ilha droplet regions` |
+| `droplet regions` | List available Digital Ocean regions (table) | `ilha droplet regions` |
 | `droplet regions --show-all` | Include unavailable regions in region list | `ilha droplet regions --show-all` |
+| `droplet regions --as-json` | List regions as JSON | `ilha droplet regions --as-json` |
+| `droplet regions --as-csv` | List regions as CSV | `ilha droplet regions --as-csv` |
 | `droplet info <id>` | Get droplet information | `ilha droplet info 12345678` |
 | `droplet destroy <id>` | Destroy a droplet (supports ID or name, comma-separated) | `ilha droplet destroy 12345678` or `ilha droplet destroy my-droplet` or `ilha droplet destroy 123,456,789` |
 | `droplet push [<branch>] <scp_target_or_droplet>` | Push ilha package to remote server (supports progressive SCP patterns) | `ilha droplet push feature-auth user@server:/path` or `ilha droplet push feature-auth my-app` |
 
 **Droplet Creation Options:**
 - `branch_name` (optional argument) - Branch/worktree name (auto-detected from current directory if not provided)
-- `--region <region>` - Droplet region (defaults from env or nyc1)
+- `--region <region>` - Droplet region (e.g. nyc1, sfo3). Use `ilha droplet regions` to list available regions (defaults from env or nyc1)
 - `--size <size>` - Droplet size (defaults from env or s-1vcpu-1gb)
 - `--image <image>` - Droplet image (defaults from env or ubuntu-22-04-x64)
 - `--ssh-keys <key>` - SSH key IDs or fingerprints (can be specified multiple times)
