@@ -20,7 +20,10 @@ from ..utils.validation import validate_git_repository
 
 class ServerImportOrchestrator:
     """Orchestrates package import and service startup on remote servers."""
-    
+
+    # Timeout for long-running steps (build, up) that can take 15+ min on small servers
+    LONG_RUNNING_TIMEOUT = 1800  # 30 minutes
+
     def __init__(self, project_root: Optional[Path] = None):
         """Initialize server import orchestrator.
         
@@ -52,14 +55,18 @@ class ServerImportOrchestrator:
             if not base_path.exists():
                 continue
             
-            # Search up to 3 levels deep
-            for depth in range(1, 4):
-                for path in base_path.rglob(".ilha/config.yml"):
-                    if path.parent.parent == base_path or depth <= 3:
-                        project_root = path.parent.parent
-                        # Verify it's a valid project (has git or is standalone)
-                        if (project_root / ".ilha" / "config.yml").exists():
-                            return project_root
+            # Search up to 3 levels deep using iterative glob
+            # Level 0: base_path/.ilha/config.yml
+            # Level 1: base_path/*/.ilha/config.yml
+            # Level 2: base_path/*/*/.ilha/config.yml
+            # Level 3: base_path/*/*/*/.ilha/config.yml
+            for depth in range(4):
+                pattern = "/".join(["*"] * depth) + "/.ilha/config.yml" if depth > 0 else ".ilha/config.yml"
+                for path in base_path.glob(pattern):
+                    project_root = path.parent.parent
+                    # Verify it's a valid project (has git or is standalone)
+                    if (project_root / ".ilha" / "config.yml").exists():
+                        return project_root
         
         return None
     
@@ -191,7 +198,8 @@ class ServerImportOrchestrator:
         Returns:
             Dictionary with volume verification results
         """
-        from ..config.settings import get_project_name, sanitize_project_name
+        from ..config.settings import get_project_name, sanitize_project_name, ILHA_DIR
+        import yaml
         
         project_name = sanitize_project_name(get_project_name())
         volumes_found = 0
@@ -199,7 +207,21 @@ class ServerImportOrchestrator:
         empty_volumes = 0
         need_restore = False
         
-        volume_types = ["postgres_data", "redis_data", "media_files", "sqlite_data"]
+        # Read volume types from config.yml instead of hardcoding
+        volume_types = []
+        config_path = project_root / ILHA_DIR / "config.yml"
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config = yaml.safe_load(f) or {}
+                    volume_types = config.get("volumes", [])
+            except Exception as e:
+                log_warning(f"Failed to read volumes from config.yml: {e}")
+        
+        # Fallback to common volume types if config doesn't specify any
+        if not volume_types:
+            volume_types = ["postgres_data", "redis_data", "media_files", "sqlite_data"]
+            log_info("Using default volume types (config.yml did not specify volumes)")
         
         for vol_type in volume_types:
             if project_name:
@@ -274,14 +296,13 @@ class ServerImportOrchestrator:
         }
     
     def _restore_volumes_if_needed(self, package_path: str, branch_name: str, 
-                                   project_root: Path, is_standalone: bool) -> bool:
+                                   project_root: Path) -> bool:
         """Restore volumes if verification indicates they're missing or empty.
         
         Args:
             package_path: Path to package file
             branch_name: Branch name
             project_root: Project root directory
-            is_standalone: Whether in standalone mode
             
         Returns:
             True if restore succeeded or not needed, False on failure
@@ -319,48 +340,26 @@ class ServerImportOrchestrator:
         
         package_path_absolute = str(package_file)
         
-        if is_standalone:
-            # In standalone mode, use direct ilha command
-            log_info("Restoring volumes using ilha command...")
-            try:
-                result = subprocess.run(
-                    ["ilha", "volumes", "restore", branch_name, package_path_absolute],
-                    cwd=project_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=600
-                )
-                if result.returncode == 0:
-                    log_success("Volumes restored successfully")
-                    return True
-                else:
-                    log_error(f"Volume restoration failed: {result.stderr}")
-                    return False
-            except Exception as e:
-                log_error(f"Failed to restore volumes: {e}")
+        # Use ilha command to restore volumes (same for both standalone and normal modes)
+        log_info("Restoring volumes using ilha command...")
+        try:
+            result = subprocess.run(
+                ["ilha", "volumes", "restore", branch_name, package_path_absolute],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self.LONG_RUNNING_TIMEOUT,
+            )
+            if result.returncode == 0:
+                log_success("Volumes restored successfully")
+                return True
+            else:
+                log_error(f"Volume restoration failed: {result.stderr}")
                 return False
-        else:
-            # Normal mode: use ilha command
-            log_info("Restoring volumes using ilha command...")
-            try:
-                result = subprocess.run(
-                    ["ilha", "volumes", "restore", branch_name, package_path_absolute],
-                    cwd=project_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=600
-                )
-                if result.returncode == 0:
-                    log_success("Volumes restored successfully")
-                    return True
-                else:
-                    log_error(f"Volume restoration failed: {result.stderr}")
-                    return False
-            except Exception as e:
-                log_error(f"Failed to restore volumes: {e}")
-                return False
+        except Exception as e:
+            log_error(f"Failed to restore volumes: {e}")
+            return False
     
     def _build_images_if_needed(self, branch_name: str, project_root: Path, build: bool) -> bool:
         """Build Docker images if requested.
@@ -394,7 +393,7 @@ class ServerImportOrchestrator:
             capture_output=True,
             text=True,
             check=False,
-            timeout=600
+            timeout=self.LONG_RUNNING_TIMEOUT,
         )
         
         if result.returncode == 0:
@@ -409,7 +408,7 @@ class ServerImportOrchestrator:
             capture_output=True,
             text=True,
             check=False,
-            timeout=600
+            timeout=self.LONG_RUNNING_TIMEOUT,
         )
         
         if result.returncode == 0:
@@ -419,14 +418,15 @@ class ServerImportOrchestrator:
             log_error("Failed to rebuild images even with --no-cache")
             return False
     
-    def _start_services(self, branch_name: str, project_root: Path, 
-                       is_standalone: bool) -> bool:
+    def _start_services(self, branch_name: str, project_root: Path) -> bool:
         """Start services for the worktree.
+        
+        Uses ilha command which works for both standalone and normal imports
+        since worktrees are properly registered via git in both cases.
         
         Args:
             branch_name: Branch name
             project_root: Project root directory
-            is_standalone: Whether in standalone mode
             
         Returns:
             True if services started successfully, False otherwise
@@ -434,104 +434,31 @@ class ServerImportOrchestrator:
         log_info(f"Bringing up worktree environment for branch: {branch_name}")
         log_info("This may take a few minutes if containers need to be pulled or built...")
         
-        if is_standalone:
-            # Standalone mode: use docker compose directly
-            worktree_path = project_root / "worktrees" / branch_name
-            compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-            
-            if not compose_file.exists():
-                log_error(f"Docker Compose file not found: {compose_file}")
-                return False
-            
-            from ..utils.env_loader import load_env_file
-            from ..utils.path_utils import get_env_compose_file_path
-            import os
-            
-            # Read COMPOSE_PROJECT_NAME from env.ilha (already set correctly during import)
-            env_file_path = get_env_compose_file_path(worktree_path)
-            env_vars = load_env_file(env_file_path)
-            compose_project_name = env_vars.get("COMPOSE_PROJECT_NAME")
-            
-            # Fallback: reconstruct if not found in env.ilha using self.project_root
-            if not compose_project_name:
-                from ..config.settings import ilha_DIR, sanitize_project_name
-                import yaml
-                
-                # Get project name from self.project_root's config.yml
-                project_name = None
-                config_path = self.project_root / ilha_DIR / "config.yml"
-                if config_path.exists():
-                    try:
-                        with open(config_path) as f:
-                            config = yaml.safe_load(f) or {}
-                            project_name = config.get("project_name")
-                    except Exception:
-                        pass
-                
-                # Fallback to project root directory name if config doesn't have project_name
-                if not project_name:
-                    project_name = self.project_root.name
-                
-                project_name = sanitize_project_name(project_name)
-                compose_project_name = f"{project_name}-{branch_name}"
-            
-            # Set environment variables
-            os.environ["COMPOSE_PROJECT_NAME"] = compose_project_name
-            os.environ["PROJECT_ROOT"] = str(worktree_path)
-            
-            # Stop existing containers first
-            subprocess.run(
-                ["docker", "compose", "-f", str(compose_file.relative_to(worktree_path)),
-                 "--env-file", ".ilha/env.ilha", "-p", compose_project_name, "down"],
-                cwd=worktree_path,
-                capture_output=True,
-                check=False
-            )
-            
-            # Start containers
-            result = subprocess.run(
-                ["docker", "compose", "-f", str(compose_file.relative_to(worktree_path)),
-                 "--env-file", ".ilha/env.ilha", "-p", compose_project_name,
-                 "up", "-d", "--force-recreate", "--remove-orphans"],
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=600
-            )
-            
-            if result.returncode == 0:
-                log_success("Services started successfully")
-                return True
-            else:
-                log_error(f"Failed to start services: {result.stderr}")
-                return False
+        # Single unified code path - works for both standalone and normal imports
+        # Stop existing containers first
+        subprocess.run(
+            ["ilha", branch_name, "down"],
+            cwd=project_root,
+            capture_output=True,
+            check=False
+        )
+        
+        # Start containers (docker compose up can take 15+ min on first run)
+        result = subprocess.run(
+            ["ilha", branch_name, "up", "-d"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=self.LONG_RUNNING_TIMEOUT,
+        )
+        
+        if result.returncode == 0:
+            log_success("Services started successfully")
+            return True
         else:
-            # Normal mode: use ilha command
-            # Stop existing containers first
-            subprocess.run(
-                ["ilha", branch_name, "down"],
-                cwd=project_root,
-                capture_output=True,
-                check=False
-            )
-            
-            # Start containers
-            result = subprocess.run(
-                ["ilha", branch_name, "up", "-d"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=600
-            )
-            
-            if result.returncode == 0:
-                log_success("Services started successfully")
-                return True
-            else:
-                log_error(f"Failed to start services: {result.stderr}")
-                return False
+            log_error(f"Failed to start services: {result.stderr}")
+            return False
     
     def _verify_containers(self, branch_name: str) -> Dict[str, any]:
         """Verify containers are running.
@@ -572,6 +499,7 @@ class ServerImportOrchestrator:
             "running": len(running),
             "total": len(total),
             "exited": len(exited),
+            "exited_containers": exited,
             "container_names": running
         }
     
@@ -663,7 +591,7 @@ class ServerImportOrchestrator:
         time.sleep(2)
         
         # Verify and restore volumes if needed
-        if not self._restore_volumes_if_needed(package_path, branch_name, project_root, is_standalone):
+        if not self._restore_volumes_if_needed(package_path, branch_name, project_root):
             log_warning("Volume restoration had issues, but continuing...")
         
         # Build images if requested
@@ -675,7 +603,7 @@ class ServerImportOrchestrator:
         
         # Start services if requested
         if start:
-            if not self._start_services(branch_name, project_root, is_standalone):
+            if not self._start_services(branch_name, project_root):
                 return {
                     "success": False,
                     "error": "Failed to start services"

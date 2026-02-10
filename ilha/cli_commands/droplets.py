@@ -16,6 +16,7 @@ from ilha.cli.helpers import add_json_option, add_verbose_option
 from ilha.commands.droplets import DropletCommands
 from ilha.commands.push.push_manager import PushManager
 from ilha.utils.json_output import JSONOutput
+from ilha.utils.ssh_manager import SCPTarget
 from ilha.utils.logging import (
     error_exit,
     format_elapsed_time,
@@ -291,7 +292,7 @@ def register_commands(cli) -> None:
     @click.option("--dns-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
     @click.option("--skip-dns-check", is_flag=True, default=False, help="Skip DNS validation and management")
     @click.option("--resume", is_flag=True, default=False, help="Resume a failed push operation by detecting what's already completed")
-    @click.option("--code-only", is_flag=True, default=False, help="Push code-only update to pre-existing server")
+    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server")
     @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
     @click.option(
         "--containers",
@@ -447,10 +448,15 @@ def register_commands(cli) -> None:
                             if not json:
                                 log_info(f"Found central droplet '{central_droplet_name}' in region {central_droplet.region}")
                                 if central_droplet.region != resolved_region:
-                                    log_warning("⚠️  Region mismatch detected!")
-                                    log_warning(f"   Central droplet '{central_droplet_name}' is in region: {central_droplet.region}")
-                                    log_warning(f"   Worker droplet will be created in region: {resolved_region}")
-                                    log_warning("   VPCs are region-specific. Ensure both droplets are in the same region.")
+                                    log_error("❌ Region mismatch detected!")
+                                    log_error(f"   Central droplet '{central_droplet_name}' is in region: {central_droplet.region}")
+                                    log_error(f"   Worker droplet would be created in region: {resolved_region}")
+                                    log_error("   VPCs are region-specific and cannot span regions.")
+                                    log_error(f"   Please use --region {central_droplet.region} to match the central droplet's region.")
+                                    if json_requested:
+                                        return {"success": False, "error": f"Region mismatch: central droplet in {central_droplet.region}, requested region {resolved_region}"}
+                                    else:
+                                        sys.exit(1)
                                 log_info(f"Using VPC UUID from central droplet: {resolved_vpc_uuid}")
                                 if central_droplet.private_ip_address:
                                     log_info(f"Central droplet private IP: {central_droplet.private_ip_address}")
@@ -958,7 +964,7 @@ def register_commands(cli) -> None:
         default=False,
         help="Resume a failed push operation by detecting what's already completed (skips export/transfer if package exists, skips server prep if already done)",
     )
-    @click.option("--code-only", is_flag=True, default=False, help="Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
+    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
     @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
     @click.option(
         "--debug",
@@ -1173,4 +1179,426 @@ def register_commands(cli) -> None:
             else:
                 error_exit(f"Error pushing package: {exc}")
 
+    # ── droplet deploy (slim) ─────────────────────────────────────────
+
+    @droplet.command("deploy")
+    @click.argument("branch_name", required=False)
+    @click.option("--region", help='Droplet region (e.g., nyc1, sfo3). Default: nyc1 or DROPLET_DEFAULT_REGION')
+    @click.option("--size", help='Droplet size slug (e.g., s-1vcpu-1gb). Default: s-1vcpu-1gb or DIGITALOCEAN_SIZE')
+    @click.option("--image", help="Droplet image (default: ubuntu-22-04-x64)")
+    @click.option("--ssh-keys", type=str, help="SSH key names (comma-separated)")
+    @click.option("--tags", multiple=True, help="Tags for the droplet")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @click.option("--scp-target", help="SCP target (default: root@<droplet-ip>:/root)")
+    @click.option("--domain", help="Domain for HTTPS deployment (e.g., app.example.com)")
+    @click.option("--ip", help="IP for HTTP-only deployment")
+    @click.option("--dns-token", help="DNS API token for domain management")
+    @click.option("--skip-dns-check", is_flag=True, default=False, help="Skip DNS management")
+    @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on server")
+    @click.option("--debug", is_flag=True, default=False, help="Enable DEBUG mode on server")
+    @click.option("--create-only", is_flag=True, default=False, help="Only create droplet, skip deploy")
+    @click.option("--no-create", is_flag=True, default=False, help="Skip droplet creation, deploy to existing server (requires --scp-target or --domain/--ip)")
+    @click.option("--no-prepare", is_flag=True, default=False, help="Skip server preparation")
+    @click.option("--vpc-uuid", help="VPC UUID for the droplet")
+    @click.option("--central-droplet-name", help="Reuse VPC UUID from central droplet")
+    @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
+    @add_json_option
+    @add_verbose_option
+    def droplet_deploy(
+        branch_name: Optional[str],
+        region: Optional[str],
+        size: Optional[str],
+        image: Optional[str],
+        ssh_keys: Optional[str],
+        tags: tuple,
+        api_token: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        dns_token: Optional[str],
+        skip_dns_check: bool,
+        build: bool,
+        debug: bool,
+        create_only: bool,
+        no_create: bool,
+        no_prepare: bool,
+        vpc_uuid: Optional[str],
+        central_droplet_name: Optional[str],
+        use_staging_certificates: bool,
+        json: bool,
+    ):
+        """Deploy a worktree to a DigitalOcean droplet (slim mode).
+
+        Uses rsync + remote docker compose. No Python, git, or ilha needed on
+        the server — only Docker.
+
+        \b
+        Examples:
+          ilha droplet deploy --domain app.example.com
+          ilha droplet deploy test --domain app.example.com --build
+          ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root
+        """
+        from ilha.commands.push.slim_deploy_manager import SlimDeployManager
+        from ilha.core.droplet_manager import DropletManager
+
+        start_time = time.time()
+        try:
+            # Validate mutually exclusive flags
+            if domain and ip:
+                if json:
+                    JSONOutput.print_error("--domain and --ip are mutually exclusive")
+                else:
+                    error_exit("--domain and --ip are mutually exclusive")
+                return
+            if create_only and no_create:
+                if json:
+                    JSONOutput.print_error("--create-only and --no-create are mutually exclusive")
+                else:
+                    error_exit("--create-only and --no-create are mutually exclusive")
+                return
+
+            # Auto-detect branch
+            branch_name = _auto_detect_branch_name(branch_name, json)
+            if not branch_name:
+                return
+
+            check_prerequisites_no_git()
+
+            # ── Droplet creation (unless --no-create) ────────────────
+            droplet_info = None
+            if not no_create:
+                droplet_name = _resolve_droplet_name(branch_name, domain, json)
+                defaults = DropletManager.get_droplet_defaults()
+                resolved_region = region or defaults.get("region", "nyc1")
+                resolved_size = size or defaults.get("size", "s-1vcpu-1gb")
+                resolved_image = image or defaults.get("image", "ubuntu-22-04-x64")
+
+                if not json:
+                    log_info("Slim deploy: creating droplet...")
+                    _log_creation_context(
+                        droplet_name, resolved_region, resolved_size,
+                        resolved_image, ssh_keys, tags, None, None, json,
+                    )
+
+                # Resolve VPC UUID from central droplet if requested
+                resolved_vpc_uuid = vpc_uuid
+                token = DropletManager.resolve_droplet_token(api_token or dns_token)
+                provider = None
+                if token:
+                    provider = DropletManager.create_provider("digitalocean", token)
+
+                if central_droplet_name and not vpc_uuid and provider:
+                    droplets_list = provider.list_droplets()
+                    for d in droplets_list:
+                        if d.name == central_droplet_name and d.vpc_uuid:
+                            resolved_vpc_uuid = d.vpc_uuid
+                            if not json:
+                                log_info(f"Using VPC UUID from '{central_droplet_name}': {resolved_vpc_uuid}")
+                            break
+
+                # Generate unique name
+                if provider:
+                    droplet_name = _generate_unique_droplet_name(droplet_name, provider)
+
+                droplet_commands = DropletCommands()
+                ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else None
+                tags_list = list(tags) if tags else None
+
+                success = droplet_commands.create_droplet(
+                    name=droplet_name,
+                    region=resolved_region,
+                    size=resolved_size,
+                    image=resolved_image,
+                    ssh_keys=ssh_keys_list,
+                    tags=tags_list,
+                    wait=True,
+                    api_token=api_token,
+                    json=json,
+                    vpc_uuid=resolved_vpc_uuid,
+                )
+                if not success:
+                    _print_elapsed(start_time, json)
+                    if json:
+                        JSONOutput.print_error(f"Failed to create droplet: {droplet_name}")
+                    else:
+                        error_exit(f"Failed to create droplet: {droplet_name}")
+                    return
+
+                if create_only:
+                    _print_elapsed(start_time, json)
+                    return
+
+                # Refresh droplet info to get IP
+                if not provider:
+                    token = DropletManager.resolve_droplet_token(api_token or dns_token)
+                    if token:
+                        provider = DropletManager.create_provider("digitalocean", token)
+                if provider:
+                    for d in provider.list_droplets():
+                        if d.name == droplet_name:
+                            droplet_info = d
+                            break
+
+                if not droplet_info or not droplet_info.ip_address:
+                    _print_elapsed(start_time, json)
+                    if json:
+                        JSONOutput.print_error("Droplet created but IP not available")
+                    else:
+                        error_exit("Droplet created but IP not available")
+                    return
+
+                # Build SCP target from droplet IP
+                if scp_target:
+                    try:
+                        t = SCPTarget(scp_target)
+                        scp_target = f"{t.username}@{droplet_info.ip_address}:{t.remote_path}"
+                    except ValueError:
+                        scp_target = f"root@{droplet_info.ip_address}:/root"
+                else:
+                    scp_target = f"root@{droplet_info.ip_address}:/root"
+
+                if not json:
+                    log_info(f"Droplet ready. IP: {droplet_info.ip_address}")
+            else:
+                # --no-create: need an explicit scp_target or domain/ip
+                if not scp_target:
+                    if domain:
+                        scp_target = _parse_scp_target_or_droplet(domain, api_token)
+                    elif ip:
+                        scp_target = f"root@{ip}:/root"
+                    else:
+                        _print_elapsed(start_time, json)
+                        if json:
+                            JSONOutput.print_error("--no-create requires --scp-target, --domain, or --ip")
+                        else:
+                            error_exit("--no-create requires --scp-target, --domain, or --ip")
+                        return
+                else:
+                    try:
+                        scp_target = _parse_scp_target_or_droplet(scp_target, api_token)
+                    except ValueError as exc:
+                        _print_elapsed(start_time, json)
+                        if json:
+                            JSONOutput.print_error(str(exc))
+                        else:
+                            error_exit(str(exc))
+                        return
+
+            # ── Prerequisites for deploy ─────────────────────────────
+            check_setup_or_prompt()
+            check_prerequisites()
+
+            # ── Run slim deploy ──────────────────────────────────────
+            deploy_mgr = SlimDeployManager()
+            try:
+                success = deploy_mgr.deploy(
+                    branch_name=branch_name,
+                    scp_target=scp_target,
+                    domain=domain or None,
+                    ip=ip or None,
+                    prepare_server=not no_prepare,
+                    dns_token=dns_token or api_token,
+                    skip_dns_check=skip_dns_check,
+                    build=build,
+                    debug=debug,
+                    droplet_info=droplet_info,
+                    use_staging_certificates=use_staging_certificates,
+                )
+            finally:
+                deploy_mgr.cleanup()
+
+            _print_elapsed(start_time, json)
+
+            if not success:
+                if json:
+                    JSONOutput.print_error("Slim deploy failed")
+                else:
+                    error_exit("Slim deploy failed")
+            else:
+                url = None
+                if domain:
+                    url = f"https://{domain}"
+                elif ip:
+                    url = f"http://{ip}"
+                elif droplet_info and droplet_info.ip_address:
+                    url = f"http://{droplet_info.ip_address}"
+
+                if json:
+                    data = {"branch": branch_name}
+                    if url:
+                        data["url"] = url
+                    if droplet_info:
+                        data["ip_address"] = droplet_info.ip_address
+                    JSONOutput.print_success("Slim deploy completed", data=data)
+                else:
+                    if url:
+                        log_success(f"🌐 {url}")
+
+        except Exception as exc:
+            _print_elapsed(start_time, json)
+            if json:
+                JSONOutput.print_error(f"Deploy error: {exc}")
+            else:
+                error_exit(f"Deploy error: {exc}")
+
+    @droplet.command("put")
+    @click.argument("branch_name", required=False)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment (e.g., beta.example.com)")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on server")
+    @click.option("--debug", is_flag=True, default=False, help="Enable DEBUG mode on server")
+    @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
+    @click.option("--use-production-certificates", is_flag=True, default=False, help="Use production certificates (explicit default)")
+    @click.option("--code-only", is_flag=True, default=False, help="Only sync code and config (no volume/data transfer)")
+    @click.option("--db-only", is_flag=True, default=False, help="Only sync volumes/data (no code transfer). Stops app during restore.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_json_option
+    @add_verbose_option
+    def droplet_put(
+        branch_name: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        build: bool,
+        debug: bool,
+        use_staging_certificates: bool,
+        use_production_certificates: bool,
+        code_only: bool,
+        db_only: bool,
+        api_token: Optional[str],
+        json: bool,
+    ):
+        """Update an existing slim-deployed server.
+
+        By default syncs code, config, and volumes (full update). Use --code-only
+        or --db-only to limit scope. No DNS changes or server prep.
+
+        \b
+        Examples:
+          ilha droplet put --domain beta.bower.bid
+          ilha droplet put lipstick --scp-target root@1.2.3.4:/root --domain beta.bower.bid --build
+          ilha droplet put --domain beta.bower.bid --code-only
+          ilha droplet put --domain beta.bower.bid --db-only
+        """
+        from ilha.commands.push.slim_deploy_manager import SlimDeployManager
+
+        start_time = time.time()
+        try:
+            if domain and ip:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error("--domain and --ip are mutually exclusive")
+                else:
+                    error_exit("--domain and --ip are mutually exclusive")
+                return
+            if use_staging_certificates and use_production_certificates:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error("--use-staging-certificates and --use-production-certificates are mutually exclusive")
+                else:
+                    error_exit("--use-staging-certificates and --use-production-certificates are mutually exclusive")
+                return
+            if code_only and db_only:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error("--code-only and --db-only are mutually exclusive")
+                else:
+                    error_exit("--code-only and --db-only are mutually exclusive")
+                return
+
+            branch_name = _auto_detect_branch_name(branch_name, json)
+            if not branch_name:
+                return
+
+            check_prerequisites_no_git()
+
+            from ilha.core.environment_manager import EnvironmentManager
+            from ilha.config.settings import get_project_root
+
+            env_manager = EnvironmentManager(project_root=get_project_root())
+            stored_config = env_manager.get_droplet_config(branch_name)
+
+            if not scp_target:
+                scp_target = stored_config.get("scp_target")
+            if not domain:
+                domain = stored_config.get("domain") or ""
+            if not ip:
+                ip = stored_config.get("ip") or ""
+
+            if not scp_target:
+                if domain:
+                    scp_target = domain
+                elif ip:
+                    scp_target = f"root@{ip}:/root"
+            if not scp_target:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error("scp_target is required (provide --scp-target or --domain/--ip, or use stored config)")
+                else:
+                    error_exit("scp_target is required (provide --scp-target or --domain/--ip, or use stored config)")
+                return
+
+            try:
+                resolved = _parse_scp_target_or_droplet(scp_target, api_token)
+                if resolved != scp_target and not json:
+                    log_info(f"Resolved SCP target: {scp_target} → {resolved}")
+                scp_target = resolved
+            except ValueError as exc:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error(str(exc))
+                else:
+                    error_exit(str(exc))
+                return
+            except Exception as exc:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error(f"Error resolving SCP target: {exc}")
+                else:
+                    error_exit(f"Error resolving SCP target: {exc}")
+                return
+
+            deploy_mgr = SlimDeployManager()
+            try:
+                success = deploy_mgr.put(
+                    branch_name=branch_name,
+                    scp_target=scp_target,
+                    domain=domain or None,
+                    ip=ip or None,
+                    build=build,
+                    debug=debug,
+                    use_staging_certificates=use_staging_certificates,
+                    code_only=code_only,
+                    db_only=db_only,
+                )
+            finally:
+                deploy_mgr.cleanup()
+
+            _print_elapsed(start_time, json)
+            if not success:
+                if json:
+                    JSONOutput.print_error("Slim put failed")
+                else:
+                    error_exit("Slim put failed")
+            elif json:
+                data = {"branch": branch_name}
+                if domain:
+                    data["url"] = f"https://{domain}"
+                elif ip:
+                    data["url"] = f"http://{ip}"
+                JSONOutput.print_success("Slim put completed", data=data)
+
+        except Exception as exc:
+            _print_elapsed(start_time, json)
+            if json:
+                JSONOutput.print_error(f"Put error: {exc}")
+            else:
+                error_exit(f"Put error: {exc}")
+
+
+def _print_elapsed(start_time: float, json: bool) -> None:
+    elapsed = time.time() - start_time
+    if not json:
+        print_plain(f"Total elapsed time: {format_elapsed_time(elapsed)}")
 

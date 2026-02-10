@@ -36,7 +36,7 @@ def register_commands(cli) -> None:
     @click.option("--droplet-image", help="Droplet image (default: from environment)")
     @click.option("--droplet-ssh-keys", multiple=True, help="SSH key IDs or fingerprints for droplet (can be specified multiple times)")
     @click.option("--resume", is_flag=True, default=False, help="Resume interrupted push (skip completed steps)")
-    @click.option("--code-only", is_flag=True, default=False, help="Push code-only update (not full package)")
+    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update (not full package)")
     @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on remote server")
     @click.option("--containers", help="Comma-separated list of 'worktree.container' patterns to push only specific containers")
     @click.option("--exclude-deps", multiple=True, help="Services to exclude from dependencies (can be specified multiple times)")

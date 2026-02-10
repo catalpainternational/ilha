@@ -1671,6 +1671,84 @@ class PackageManager:
                 log_warning(f"git commit failed: {result.stderr}")
                 return False
             
+            # Register extracted worktree directories as git worktrees
+            # This ensures 'ilha <branch> up' and other commands work correctly
+            worktrees_dir = target_directory / "worktrees"
+            if worktrees_dir.exists() and worktrees_dir.is_dir():
+                log_info("Registering extracted worktrees with git...")
+                
+                for wt_dir in worktrees_dir.iterdir():
+                    if not wt_dir.is_dir():
+                        continue
+                    
+                    # Only register directories that have .ilha/ (valid worktrees)
+                    if not (wt_dir / ".ilha").exists():
+                        continue
+                    
+                    branch_name = wt_dir.name
+                    log_info(f"Registering worktree: {branch_name}")
+                    
+                    try:
+                        # 1. Create branch for this worktree
+                        result = subprocess.run(
+                            ["git", "branch", branch_name],
+                            cwd=target_directory,
+                            capture_output=True,
+                            text=True
+                        )
+                        if result.returncode != 0:
+                            log_warning(f"Failed to create branch {branch_name}: {result.stderr}")
+                            continue
+                        
+                        # 2. Move extracted content to temp directory
+                        temp_dir = Path(tempfile.mkdtemp())
+                        temp_wt = temp_dir / branch_name
+                        shutil.move(str(wt_dir), str(temp_wt))
+                        
+                        # 3. Register git worktree (this creates the directory fresh)
+                        result = subprocess.run(
+                            ["git", "worktree", "add", f"worktrees/{branch_name}", branch_name],
+                            cwd=target_directory,
+                            capture_output=True,
+                            text=True
+                        )
+                        if result.returncode != 0:
+                            log_warning(f"Failed to register worktree {branch_name}: {result.stderr}")
+                            # Restore the directory since registration failed
+                            shutil.move(str(temp_wt), str(wt_dir))
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                            continue
+                        
+                        # 4. Copy back all files from temp (overwriting what git worktree add created)
+                        # git worktree add creates a fresh checkout, but we want the extracted files
+                        for item in temp_wt.iterdir():
+                            dest = wt_dir / item.name
+                            if item.is_dir():
+                                # Remove git's fresh checkout and replace with extracted version
+                                if dest.exists():
+                                    shutil.rmtree(dest)
+                                shutil.copytree(item, dest)
+                            else:
+                                if dest.exists():
+                                    dest.unlink()
+                                shutil.copy2(item, dest)
+                        
+                        # 5. Clean up temp directory
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        
+                        log_success(f"Registered worktree: {branch_name}")
+                        
+                    except Exception as e:
+                        log_warning(f"Failed to register worktree {branch_name}: {e}")
+                        # Try to restore original state
+                        if temp_wt.exists():
+                            if wt_dir.exists():
+                                shutil.rmtree(wt_dir, ignore_errors=True)
+                            shutil.move(str(temp_wt), str(wt_dir))
+                        if temp_dir.exists():
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        continue
+            
             log_success("Git repository initialized for standalone deployment")
             return True
             

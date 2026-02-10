@@ -248,6 +248,8 @@ class PushManager:
                            use_staging_certificates: bool = False) -> bool:
         """Run remote import using ilha server-import command.
         
+        Wraps the command in nohup to survive SSH disconnection and polls for completion.
+        
         Args:
             username: SSH username
             server: Server hostname or IP
@@ -287,43 +289,170 @@ class PushManager:
             if use_staging_certificates:
                 cmd_parts.append("--use-staging-certificates")
             
-            # Build SSH command - properly escape arguments for bash -lc
-            # bash -lc expects a single quoted string, so we need to escape
-            # special characters in each argument and join them with spaces
+            # Build command string with proper escaping
             escaped_parts = [shlex.quote(part) for part in cmd_parts]
             command_string = " ".join(escaped_parts)
             
+            # Log file for remote import output
+            log_file = "/tmp/ilha-server-import.log"
+            
+            # Wrap in nohup with output redirection and echo PID
+            # This makes the command survive SSH disconnection
+            nohup_command = f"nohup {command_string} > {log_file} 2>&1 & echo $!"
+            
+            # Start the remote command
             ssh_cmd = self.ssh.build_ssh_command(
                 username,
                 server,
-                command_string,
+                nohup_command,
                 use_control_master=True
             )
             
-            log_info(f"Executing: {' '.join(ssh_cmd)}")
+            log_info(f"Starting remote import in background...")
+            log_info(f"Remote log file: {log_file}")
             
-            # Execute with streaming
-            from ...utils.streaming import execute_with_streaming
-            
-            success, stdout_lines, stderr_lines = execute_with_streaming(
+            import subprocess
+            result = subprocess.run(
                 ssh_cmd,
-                script=None,  # No script, just command
-                timeout=1800,  # 30 minutes
-                progress_interval=30,
-                prefix="  ",
-                filter_keywords=None
+                capture_output=True,
+                text=True,
+                timeout=30  # Just to start the command
             )
             
-            if not success:
-                log_error("Remote import failed")
-                if stderr_lines:
-                    log_error("Import errors:")
-                    for line in stderr_lines:
-                        log_error(f"  {line}")
+            if result.returncode != 0:
+                log_error(f"Failed to start remote import: {result.stderr}")
                 return False
             
-            log_success("Remote import completed successfully")
-            return True
+            # Extract PID from output
+            pid = result.stdout.strip()
+            if not pid.isdigit():
+                log_error(f"Failed to get PID from remote command: {result.stdout}")
+                return False
+            
+            log_info(f"Remote import started with PID: {pid}")
+            log_info("Monitoring progress (this may take several minutes)...")
+            
+            # Poll for completion
+            import time
+            max_wait = 1800  # 30 minutes
+            poll_interval = 5  # seconds
+            elapsed = 0
+            last_line_count = 0
+            
+            while elapsed < max_wait:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                
+                # Check if process is still running
+                check_cmd = self.ssh.build_ssh_command(
+                    username,
+                    server,
+                    f"ps -p {pid} > /dev/null && echo RUNNING || echo FINISHED",
+                    use_control_master=True
+                )
+                
+                check_result = subprocess.run(
+                    check_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                process_status = check_result.stdout.strip()
+                
+                # Tail log file to show progress
+                tail_cmd = self.ssh.build_ssh_command(
+                    username,
+                    server,
+                    f"wc -l {log_file} 2>/dev/null || echo 0",
+                    use_control_master=True
+                )
+                
+                tail_result = subprocess.run(
+                    tail_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                current_line_count = int(tail_result.stdout.strip().split()[0]) if tail_result.stdout.strip() else 0
+                
+                # Show new log lines
+                if current_line_count > last_line_count:
+                    lines_to_show = current_line_count - last_line_count
+                    show_tail_cmd = self.ssh.build_ssh_command(
+                        username,
+                        server,
+                        f"tail -n {lines_to_show} {log_file}",
+                        use_control_master=True
+                    )
+                    
+                    show_result = subprocess.run(
+                        show_tail_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    
+                    for line in show_result.stdout.splitlines():
+                        log_info(f"  {line}")
+                    
+                    last_line_count = current_line_count
+                
+                # Check if process finished
+                if process_status == "FINISHED":
+                    log_info("Remote import process finished")
+                    
+                    # Check exit status by looking for success marker in log
+                    check_success_cmd = self.ssh.build_ssh_command(
+                        username,
+                        server,
+                        f"grep -q 'Remote import process completed' {log_file} && echo SUCCESS || echo FAILED",
+                        use_control_master=True
+                    )
+                    
+                    success_result = subprocess.run(
+                        check_success_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    
+                    if success_result.stdout.strip() == "SUCCESS":
+                        log_success("Remote import completed successfully")
+                        return True
+                    else:
+                        log_error("Remote import failed - check log for details")
+                        # Show last 20 lines of log
+                        final_log_cmd = self.ssh.build_ssh_command(
+                            username,
+                            server,
+                            f"tail -n 20 {log_file}",
+                            use_control_master=True
+                        )
+                        
+                        final_result = subprocess.run(
+                            final_log_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                        
+                        log_error("Last 20 lines of import log:")
+                        for line in final_result.stdout.splitlines():
+                            log_error(f"  {line}")
+                        
+                        return False
+                
+                # Show progress indicator every minute
+                if elapsed % 60 == 0:
+                    log_info(f"Still running... ({elapsed}s elapsed)")
+            
+            # Timeout reached
+            log_error(f"Remote import timed out after {max_wait} seconds")
+            log_error("Import may still be running on the server")
+            log_error(f"Check progress with: ssh {username}@{server} 'tail -f {log_file}'")
+            return False
             
         except Exception as e:
             log_error(f"Remote import failed: {e}")
@@ -529,13 +658,6 @@ class PushManager:
                     log_error(f"Invalid container selection: {e}")
                     return False
             
-            # Set staging certificate flag if requested (before export)
-            if use_staging_certificates:
-                from ...core.environment_manager import EnvironmentManager
-                env_manager = EnvironmentManager(project_root=self.project_root)
-                if not env_manager.set_staging_certificate_flag(branch_name, value=True):
-                    log_warning("Failed to set USE_STAGING_CERTIFICATES flag, but continuing with export...")
-            
             # Export package only if not already on server
             if not package_already_on_server:
                 log_info("Worktree validated, proceeding with export...")
@@ -672,7 +794,7 @@ class PushManager:
                     log_info(f"Domain override: {domain}")
                 if ip:
                     log_info(f"IP override: {ip}")
-                self._run_remote_import(
+                import_success = self._run_remote_import(
                     scp_target_obj.username,
                     scp_target_obj.server,
                     remote_package_path,
@@ -683,7 +805,12 @@ class PushManager:
                     debug=debug,
                     use_staging_certificates=use_staging_certificates,
                 )
-                log_info("Remote import process completed")
+                
+                if not import_success:
+                    log_error("Remote import failed. Deployment unsuccessful.")
+                    return False
+                
+                log_info("Remote import process completed successfully")
                 
                 # Configure VPC firewall if enabled and droplet info is available
                 if droplet_info:
@@ -1035,8 +1162,8 @@ log_success "VPC firewall configuration completed"
                        domain: Optional[str], ip: Optional[str], output_dir: Path, build: bool = False) -> bool:
         """Push code-only update to remote server.
         
-        This is a simplified version that only transfers code, not full packages.
-        Implementation would go here - for now, just log that it's not implemented.
+        DEPRECATED: This feature is not yet implemented in the current version.
+        Use full push instead for reliable deployments.
         
         Args:
             branch_name: Branch name (optional, can be from config)
@@ -1047,9 +1174,18 @@ log_success "VPC firewall configuration completed"
             build: Whether to rebuild Docker images after code update
             
         Returns:
-            True if successful, False otherwise
+            False (always fails - not implemented)
         """
-        # TODO: Implement code-only push
-        log_error("Code-only push is not yet implemented in refactored version")
+        log_error("❌ Code-only push is not yet implemented")
+        log_error("")
+        log_error("The --code-only flag is currently not supported.")
+        log_error("Please use full push instead:")
+        log_error("")
+        if branch_name and scp_target:
+            log_error(f"  ilha droplet push {branch_name} {scp_target}")
+        else:
+            log_error("  ilha droplet push <branch-name> <target>")
+        log_error("")
+        log_error("Full push includes code, configuration, and volumes for reliable deployment.")
         return False
 

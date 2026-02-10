@@ -6,6 +6,7 @@ rsync (preferred) or SCP (fallback).
 """
 
 import subprocess
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -230,10 +231,13 @@ class TransferManager:
             add_ssh_host_key(target.server)
             
             # Search for ilha package files matching the branch name
+            # Escape branch_name and remote_path to prevent shell injection
+            escaped_path = shlex.quote(target.remote_path)
+            escaped_branch = shlex.quote(branch_name)
             cmd = self.ssh.build_ssh_command(
                 target.username,
                 target.server,
-                f'find {target.remote_path} -maxdepth 1 -type f -name "*{branch_name}*.ilha-package.tar.gz" 2>/dev/null | head -1',
+                f'find {escaped_path} -maxdepth 1 -type f -name "*{escaped_branch}*.ilha-package.tar.gz" 2>/dev/null | head -1',
                 use_control_master=True
             )
             

@@ -352,8 +352,8 @@ class DockerManager:
         Stops containers safely before backup, then restarts them if they were running.
         All volumes (including PostgreSQL) are backed up using file-level copy.
         """
-        backup_file = backup_dir / f"backup_{branch_name}.tar"
-        volume_names = get_volume_names(branch_name)
+        backup_file = Path(backup_dir) / f"backup_{branch_name}.tar"
+        volume_names = get_volume_names_for_project_root(self.project_root, branch_name)
         
         log_info(f"Backing up volumes for {branch_name} to {backup_file}")
         

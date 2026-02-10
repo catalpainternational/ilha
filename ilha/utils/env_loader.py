@@ -52,6 +52,13 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
                     key = key.strip()
                     value = value.strip()
                     
+                    # Remove surrounding quotes from value if present
+                    # Handle both single and double quotes
+                    if len(value) >= 2:
+                        if (value.startswith('"') and value.endswith('"')) or \
+                           (value.startswith("'") and value.endswith("'")):
+                            value = value[1:-1]
+                    
                     # Skip if key is empty
                     if key:
                         env_vars[key] = value

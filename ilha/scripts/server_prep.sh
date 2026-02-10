@@ -355,13 +355,20 @@ if [ ! -f "$VENV_DIR/bin/pip" ]; then
   }
 fi
 
+# Determine ilha version to install (can be set via ILHA_VERSION env var)
+# Format: commit hash, tag, or branch name (defaults to master)
+ILHA_VERSION="${ILHA_VERSION:-master}"
+ILHA_GIT_URL="git+https://github.com/catalpainternational/ilha.git@${ILHA_VERSION}"
+
+echo "[PREP] Installing ilha version: ${ILHA_VERSION}"
+
 "$VENV_DIR/bin/pip" install --upgrade pip wheel
-"$VENV_DIR/bin/pip" install --upgrade git+https://github.com/catalpainternational/ilha.git || {
+"$VENV_DIR/bin/pip" install --upgrade "$ILHA_GIT_URL" || {
   echo "[PREP] venv install failed, trying pipx/system pip as fallback" >&2
   if command -v pipx >/dev/null 2>&1; then
-    pipx install --force git+https://github.com/catalpainternational/ilha.git || true
+    pipx install --force "$ILHA_GIT_URL" || true
   else
-    $PYTHON_CMD -m pip install --break-system-packages --upgrade git+https://github.com/catalpainternational/ilha.git || true
+    $PYTHON_CMD -m pip install --break-system-packages --upgrade "$ILHA_GIT_URL" || true
   fi
 }
 ln -sf "$VENV_DIR/bin/ilha" /usr/local/bin/ilha || true

@@ -219,7 +219,7 @@ def register_commands(cli) -> None:
         default=False,
         help="Resume a failed push operation by detecting what's already completed (skips export/transfer if package exists, skips server prep if already done)",
     )
-    @click.option("--code-only", is_flag=True, default=False, help="Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
+    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
     @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
     @click.option(
         "--containers",

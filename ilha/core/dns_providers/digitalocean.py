@@ -483,21 +483,23 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             DropletInfo if successful, None otherwise
         """
-        # Resolve VPC UUID (required for private networking)
+        # Resolve VPC UUID when possible; API can use region default if omitted
+        resolved_vpc_uuid = None
         try:
             resolved_vpc_uuid = self._resolve_vpc_uuid(region, vpc_uuid)
             log_info(f"Creating droplet in VPC: {resolved_vpc_uuid}")
         except ValueError as e:
-            log_error(str(e))
-            return None
+            log_warning(str(e))
+            log_info("Creating droplet without VPC; API may assign default for region.")
         
         payload = {
             'name': name,
             'region': region,
             'size': size,
             'image': image,
-            'vpc_uuid': resolved_vpc_uuid
         }
+        if resolved_vpc_uuid:
+            payload['vpc_uuid'] = resolved_vpc_uuid
         
         if ssh_keys:
             # Resolve SSH key names to IDs

@@ -58,6 +58,16 @@ class ServerPreparer:
             log_info(f"Preparing server: {username}@{server}")
             log_info("This will install: curl, git, Python 3.11+, Docker, and ilha")
             
+            # Get local ilha version to install same version on server
+            try:
+                from ...config.settings import VERSION
+                ilha_version = VERSION
+                log_info(f"Will install ilha version {ilha_version} on server to match local client")
+            except (ImportError, AttributeError):
+                # Fallback to master if version not available
+                ilha_version = "master"
+                log_warning("Could not determine local ilha version, will install latest from master")
+            
             # Add SSH host key before connection
             log_info("Adding SSH host key...")
             add_ssh_host_key(server)
@@ -66,7 +76,8 @@ class ServerPreparer:
             script = self._load_prep_script()
             
             # Send script via SSH stdin and execute under bash -lc
-            exec_cmd = "cat > /tmp/dtprep.sh && chmod +x /tmp/dtprep.sh && /tmp/dtprep.sh && rm -f /tmp/dtprep.sh"
+            # Pass ILHA_VERSION environment variable to the script
+            exec_cmd = f"export ILHA_VERSION={ilha_version} && cat > /tmp/dtprep.sh && chmod +x /tmp/dtprep.sh && /tmp/dtprep.sh && rm -f /tmp/dtprep.sh"
             ssh_cmd = ["ssh", f"{username}@{server}", "bash", "-lc", exec_cmd]
             log_info("Executing server preparation script via SSH...")
             log_info("This may take 5-10 minutes depending on server state and network speed...")

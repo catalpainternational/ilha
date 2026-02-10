@@ -211,3 +211,32 @@ VITE_ALLOWED_HOSTS=boards.are.temporarily.fun,*.are.temporarily.fun,localhost,12
 - Add validation/warning if `VITE_ALLOWED_HOSTS` is missing when deploying with a domain
 - Consider supporting multiple domains in a single deployment
 
+## Slim deploy: app not running after deploy
+
+### Symptom
+- Slim deploy reports success (e.g. EXIT_CODE=0 in log) but only Caddy containers are running on the server; no app stack (web, db, redis, rq-worker).
+- `curl https://staging.example.com/` times out or connection refused.
+
+### What to do manually (bring server up)
+SSH into the server and run the same steps the deploy uses:
+
+1. **Start app stack in background** (so long build/up is not killed by SSH timeout):
+   ```bash
+   ssh root@<server>
+   cd /app
+   nohup docker compose --env-file .env up -d --build >> /tmp/ilha-manual-up.log 2>&1 &
+   ```
+2. **Wait for completion** (pull/build can take 10–20+ minutes). Monitor:
+   ```bash
+   tail -f /tmp/ilha-manual-up.log
+   docker compose --env-file .env ps -a
+   ```
+3. **Connect web to Caddy network** (if not already on `ilha_caddy_proxy`):
+   ```bash
+   CID=$(docker compose --env-file .env ps -q 2>/dev/null | head -1)
+   [ -n "$CID" ] && docker network connect ilha_caddy_proxy "$CID" 2>/dev/null || true
+   ```
+4. **Verify**: `curl -sI http://127.0.0.1:8000/` from the server, and `curl -sI https://staging.example.com/` from your machine.
+
+### Deploy command alignment (DRY)
+The slim deploy app-start step (`_start_app_remote` in `slim_deploy_manager.py`) was updated to do the same thing without a script file over stdin: it runs a single nohup one-liner that `cd`s to `/app`, runs `docker compose down` then `up -d --build`, connects the first app container to `ilha_caddy_proxy`, and echoes EXIT_CODE. Success is verified by checking the log for EXIT_CODE=0 and that at least one app container is running. If a deploy still leaves the app down, use the manual steps above and then re-run deploy with `--no-create` if needed.
