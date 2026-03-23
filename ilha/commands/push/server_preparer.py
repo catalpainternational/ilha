@@ -86,7 +86,7 @@ class ServerPreparer:
             success, stdout_lines, stderr_lines = execute_with_streaming(
                 ssh_cmd,
                 script=script,
-                timeout=None,  # No timeout for server prep (can take 5-10 minutes)
+                timeout=600,  # 10 minute timeout for server prep
                 progress_interval=30,
                 prefix="  ",
                 filter_keywords=None  # Show all output in verbose mode, filtered in non-verbose

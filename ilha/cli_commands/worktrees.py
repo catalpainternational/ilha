@@ -4,14 +4,12 @@ Worktree lifecycle ilha CLI commands.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import click
 
 from pathlib import Path
 from typing import Optional
 
-from ilha.cli.helpers import add_json_option, add_verbose_option, command_wrapper
+from ilha.cli.helpers import add_json_option, add_remote_push_options, add_verbose_option, command_wrapper
 from ilha.commands.push.push_manager import PushManager
 from ilha.commands.utility import UtilityManager
 from ilha.commands.worktree import WorktreeManager
@@ -26,13 +24,18 @@ def register_commands(cli) -> None:
 
     @cli.command()
     @click.argument("branch_name")
+    @click.option(
+        "--force",
+        is_flag=True,
+        help="Recreate ilha environment for existing worktrees (volumes, env files). Use when worktree exists but env is missing or you want a fresh copy from main.",
+    )
     @add_json_option
     @add_verbose_option
     @command_wrapper()
-    def create(branch_name: str, json: bool):
-        """Create a new worktree for the specified branch."""
+    def create(branch_name: str, force: bool, json: bool):
+        """Create a new worktree or ilha environment for an existing worktree (database, caddy network, env files)."""
         worktree_manager = WorktreeManager()
-        success, result_data = worktree_manager.create_worktree(branch_name, interactive=not json)
+        success, result_data = worktree_manager.create_worktree(branch_name, interactive=not json, force=force)
         if not success:
             raise ilhaCommandError(f"Failed to create worktree for {branch_name}")
         data = (result_data or {}).get("data", {}) if result_data else {}
@@ -197,38 +200,7 @@ def register_commands(cli) -> None:
     @cli.command()
     @click.argument("branch_name", required=False)
     @click.argument("scp_target", required=False)
-    @click.option("--output-dir", type=click.Path(), default="./packages", help="Temporary package location (default: ./packages)")
-    @click.option("--keep-package", is_flag=True, default=False, help="Keep package file after successful push (default: delete after push)")
-    @click.option(
-        "--no-auto-import",
-        is_flag=True,
-        default=False,
-        help="Skip automatic import and start on remote server after push (default: auto-import is enabled)",
-    )
-    @click.option("--prepare-server", is_flag=True, default=False, help="Check remote server for required dependencies before push")
-    @click.option(
-        "--domain",
-        help="Domain override for remote import (subdomain.domain.tld). DNS A record will be automatically created if it does not exist.",
-    )
-    @click.option("--ip", help="IP override for remote import (HTTP-only, no TLS)")
-    @click.option("--dns-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
-    @click.option("--skip-dns-check", is_flag=True, default=False, help="Skip DNS validation and management")
-    @click.option(
-        "--resume",
-        is_flag=True,
-        default=False,
-        help="Resume a failed push operation by detecting what's already completed (skips export/transfer if package exists, skips server prep if already done)",
-    )
-    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
-    @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
-    @click.option(
-        "--containers",
-        help="Comma-separated list of worktree.container patterns to push only specific containers and their volumes (e.g., feature-auth.db,feature-auth.redis)",
-    )
-    @click.option(
-        "--exclude-deps",
-        help="Comma-separated list of service names to exclude from dependency resolution (e.g., db,redis). Useful when deploying workers that connect to remote services.",
-    )
+    @add_remote_push_options()
     @add_json_option
     @add_verbose_option
     @command_wrapper(require_setup=True, require_prerequisites=True)
@@ -301,5 +273,4 @@ def register_commands(cli) -> None:
                 JSONOutput.print_success("Package pushed successfully")
             else:
                 log_success("Package pushed successfully")
-
 

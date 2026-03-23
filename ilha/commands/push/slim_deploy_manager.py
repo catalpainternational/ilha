@@ -13,23 +13,44 @@ Flow:
   6. Start Caddy and app services via SSH + docker compose
 """
 
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
+import uuid
+import fnmatch
+import random
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any, Set
 
 from ...config.settings import get_script_dir, get_worktree_dir
 from ...core.dns_manager import DNSManager, parse_domain, is_domain
 from ...core.droplet_manager import DropletInfo
 from ...core.environment_manager import EnvironmentManager
+from ...utils.checksum import calculate_file_checksum
 from ...utils.caddy_config import ensure_caddy_labels_and_network
-from ...utils.logging import log_info, log_success, log_warning, log_error, print_plain
+from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
+from ...utils.logging import (
+    log_info,
+    log_success,
+    log_warning,
+    log_error,
+    log_step,
+    print_plain,
+    is_verbose,
+    StageTracker,
+    render_deploy_report,
+)
 from ...utils.ssh_manager import SSHConnectionManager, SCPTarget
 from ...utils.ssh_utils import add_ssh_host_key
 from ...utils.streaming import execute_with_streaming
+from ...utils.validation import validate_branch_name
+from .deploy_doctor import DeployDoctor
+from .deploy_preflight import DeployPreflight
+from .remote_compose_probe import remote_compose_service_known, remote_compose_service_logs_tail
+from .remote_disk import RemoteDiskManager
 from .server_preparer import ServerPreparer
 from .transfer_manager import TransferManager
 
@@ -42,6 +63,49 @@ class SlimDeployManager:
     REMOTE_CADDY_DIR = "/app/caddy"
     REMOTE_VOLUMES_DIR = "/app/volumes"
 
+    # Timeouts (seconds) for parallel futures
+    _FUTURE_TIMEOUTS = {
+        "dns": 300,
+        "prepare": 600,
+        "assemble": 1800,
+        "build": 1800,
+        "restore": 600,
+        "caddy": 300,
+    }
+
+    # Exclude heavy/non-runtime paths from deploy context by default
+    _DEFAULT_DEPLOY_IGNORE = [
+        ".git",
+        "__pycache__",
+        "*.pyc",
+        ".tox",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".pytest_cache",
+        "packages",
+        "*.ilha-package.tar.gz",
+        "test-results",
+        "*.log",
+    ]
+
+    _ENOSPC_MARKERS = (
+        "no space left on device",
+        "failed to extract layer",
+        "failed to solve: failed to extract",
+    )
+
+    _STAGE_DISPLAY_NAMES = {
+        "preflight": "Preflight",
+        "assemble_prepare_dns": "Server prep + assembly",
+        "disk_check": "Disk check",
+        "volume_backup": "Volume backup",
+        "transfer": "Code sync",
+        "remote_prepare": "Remote services",
+        "app_start": "App start",
+        "smoke_checks": "Smoke checks",
+    }
+
     def __init__(self, project_root: Optional[Path] = None):
         if project_root is None:
             from ...config.settings import get_project_root
@@ -51,6 +115,399 @@ class SlimDeployManager:
 
         self.ssh = SSHConnectionManager()
         self.transfer = TransferManager()
+        self.disk = RemoteDiskManager(self.ssh, self.REMOTE_APP_ROOT)
+        self.doctor_mgr = DeployDoctor(self.ssh, self.REMOTE_APP_ROOT)
+        self.preflight = DeployPreflight(self.project_root)
+        self._session_id = uuid.uuid4().hex[:8]
+        self._tracker: Optional[StageTracker] = None
+        self._last_report: Dict[str, Any] = {
+            "success": False,
+            "stage_timings": {},
+            "failure_category": None,
+            "error": None,
+            "disk_check": None,
+            "source_manifest": None,
+            "drift_report": None,
+            "smoke_checks": None,
+            "recovery_attempted": False,
+            "recovery_succeeded": False,
+        }
+        self._last_failure_category: Optional[str] = None
+
+    def _remote_tmp(self, name):
+        """Session-namespaced /tmp path for remote scripts/logs."""
+        return f"/tmp/ilha-{name}-{self._session_id}"
+
+    def get_last_deploy_report(self) -> Dict[str, Any]:
+        """Return the latest deploy report for JSON output and diagnostics."""
+        return dict(self._last_report)
+
+    def _reset_report(self) -> None:
+        self._last_failure_category = None
+        self._last_report = {
+            "success": False,
+            "stage_timings": {},
+            "failure_category": None,
+            "error": None,
+            "disk_check": None,
+            "source_manifest": None,
+            "drift_report": None,
+            "smoke_checks": None,
+            "recovery_attempted": False,
+            "recovery_succeeded": False,
+        }
+
+    def _mark_stage_timing(self, stage: str, started_at: float) -> None:
+        elapsed = round(time.time() - started_at, 3)
+        self._last_report["stage_timings"][stage] = elapsed
+        if self._tracker:
+            name = self._STAGE_DISPLAY_NAMES.get(stage, stage)
+            self._tracker.record(name, elapsed)
+
+    def _set_failure(
+        self,
+        *,
+        error_code: str,
+        stage: str,
+        root_cause: str,
+        suggested_actions: Optional[List[str]] = None,
+        failure_category: Optional[str] = None,
+    ) -> None:
+        category = failure_category or error_code
+        self._last_failure_category = category
+        self._last_report["failure_category"] = category
+        self._last_report["error"] = {
+            "error_code": error_code,
+            "stage": stage,
+            "root_cause": root_cause,
+            "suggested_actions": suggested_actions or [],
+        }
+
+    @classmethod
+    def _is_enospc_line(cls, line: str) -> bool:
+        lower = line.strip().lower()
+        return any(marker in lower for marker in cls._ENOSPC_MARKERS)
+
+    @staticmethod
+    def _safe_int(value: str, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _load_deployignore_patterns(
+        self,
+        worktree_path: Path,
+        deployignore: Optional[str],
+    ) -> List[str]:
+        patterns: List[str] = list(self._DEFAULT_DEPLOY_IGNORE)
+        ignore_file: Optional[Path] = None
+        if deployignore:
+            ignore_file = Path(deployignore)
+        else:
+            candidate = worktree_path / ".ilha" / "deployignore"
+            if candidate.exists():
+                ignore_file = candidate
+        if ignore_file and ignore_file.exists():
+            try:
+                for raw in ignore_file.read_text().splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    patterns.append(line)
+                log_info(f"Loaded deploy ignore patterns from {ignore_file}")
+            except Exception as exc:
+                log_warning(f"Failed to read deploy ignore file {ignore_file}: {exc}")
+        return patterns
+
+    @staticmethod
+    def _pattern_matches(rel_path: str, name: str, pattern: str) -> bool:
+        normalized = rel_path
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.replace("\\", "/")
+        normalized_name = name.replace("\\", "/")
+        rule = pattern.strip().replace("\\", "/")
+        if not rule:
+            return False
+        if rule.endswith("/"):
+            prefix = rule.rstrip("/")
+            return normalized == prefix or normalized.startswith(prefix + "/")
+        if "/" in rule and not any(ch in rule for ch in "*?[]"):
+            return normalized == rule or normalized.startswith(rule + "/")
+        if "/" not in rule and not any(ch in rule for ch in "*?[]"):
+            parts = normalized.split("/")
+            if rule in parts:
+                return True
+        return fnmatch.fnmatch(normalized, rule) or fnmatch.fnmatch(normalized_name, rule)
+
+    def _build_copy_ignore(
+        self,
+        worktree_path: Path,
+        patterns: List[str],
+        excluded: Set[str],
+    ):
+        def _ignore(current_dir: str, names: List[str]):
+            ignored = set()
+            current_path = Path(current_dir)
+            try:
+                rel_base = current_path.relative_to(worktree_path)
+            except ValueError:
+                rel_base = Path(".")
+            for name in names:
+                rel_path = (rel_base / name) if str(rel_base) != "." else Path(name)
+                rel_posix = rel_path.as_posix()
+                if any(self._pattern_matches(rel_posix, name, p) for p in patterns):
+                    ignored.add(name)
+                    excluded.add(rel_posix)
+            return ignored
+        return _ignore
+
+    @staticmethod
+    def _dir_size_bytes(path: Path) -> int:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+    def _run_local_text(
+        self,
+        command: List[str],
+        timeout: int = 30,
+    ) -> Tuple[int, str, str]:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            return result.returncode, result.stdout or "", result.stderr or ""
+        except subprocess.TimeoutExpired:
+            return 1, "", f"Local command timed out after {timeout}s"
+        except Exception as exc:
+            return 1, "", str(exc)
+
+    def _run_deploy_preflight(
+        self,
+        branch_name: str,
+        strict_deploy_drift: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Delegate to DeployPreflight and wire results into the deploy report."""
+        result = self.preflight._run_deploy_preflight(
+            branch_name,
+            strict_deploy_drift=strict_deploy_drift,
+        )
+        if result is None:
+            # Determine failure reason and populate report even on failure
+            worktree_path = self.preflight._resolve_worktree_path(branch_name)
+            if not worktree_path.exists():
+                self._set_failure(
+                    error_code="worktree_not_found",
+                    stage="preflight",
+                    root_cause=f"Worktree directory not found: {worktree_path}",
+                    suggested_actions=["Create the worktree or run the deploy from the correct repository."],
+                    failure_category="validation_error",
+                )
+            else:
+                # Gather manifest/drift for the report even though we're failing
+                comparison_root = self.preflight._resolve_comparison_root(worktree_path)
+                manifest = self.preflight._gather_source_manifest(branch_name, worktree_path, comparison_root)
+                drift_report = self.preflight._build_drift_report(
+                    worktree_path, comparison_root, strict_deploy_drift=strict_deploy_drift,
+                )
+                self._last_report["source_manifest"] = manifest
+                self._last_report["drift_report"] = drift_report
+                self._set_failure(
+                    error_code="critical_file_drift",
+                    stage="preflight",
+                    root_cause=(
+                        "Critical deploy files differ between root and worktree. "
+                        "Deploy the worktree copy or sync the changes first."
+                    ),
+                    suggested_actions=[
+                        "Deploy the worktree copy or sync the changes first.",
+                    ],
+                    failure_category="validation_error",
+                )
+            return None
+
+        self._last_report["source_manifest"] = result["manifest"]
+        self._last_report["drift_report"] = result["drift_report"]
+        return result
+
+    def _run_smoke_checks(
+        self,
+        *,
+        username: str,
+        server: str,
+        smoke_path: str,
+        domain: Optional[str],
+        ip: Optional[str],
+        timeout_seconds: int = 60,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        started_at = time.time()
+        delays = [0, 1, 2, 4, 8, 15]
+        checks: List[Dict[str, Any]] = []
+        via_web = self._remote_service_exists(username, server, "web")
+        local_url = f"http://127.0.0.1:8000{self._normalized_smoke_path(smoke_path)}"
+        probe_target = "web_container" if via_web else "host_local"
+        external_url = f"https://{domain}/" if domain else None
+
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                time.sleep(delay)
+            probe_cmd = self._build_smoke_probe_command(
+                smoke_path, via_compose_web=via_web, quiet=True
+            )
+            local_code, _, local_err = self._run_remote_text(
+                username,
+                server,
+                probe_cmd,
+                timeout=10,
+            )
+            local_ok = local_code == 0
+            local_result = {
+                "name": "local_app",
+                "target": local_url,
+                "probe": probe_target,
+                "attempt": attempt,
+                "success": local_ok,
+                "error": local_err.strip() or None,
+            }
+
+            external_result = None
+            external_ok = True
+            if local_ok and external_url:
+                external_code, _, external_err = self._run_local_text(
+                    ["curl", "-kfsSI", "--max-time", "5", external_url],
+                    timeout=10,
+                )
+                external_ok = external_code == 0
+                external_result = {
+                    "name": "external_domain",
+                    "target": external_url,
+                    "attempt": attempt,
+                    "success": external_ok,
+                    "error": external_err.strip() or None,
+                }
+
+            checks = [local_result] + ([external_result] if external_result else [])
+            if local_ok and external_ok:
+                report = {
+                    "success": True,
+                    "path": smoke_path,
+                    "checks": checks,
+                    "duration_seconds": round(time.time() - started_at, 3),
+                }
+                self._last_report["smoke_checks"] = report
+                return True, report
+
+            if time.time() - started_at >= timeout_seconds:
+                break
+
+        report: Dict[str, Any] = {
+            "success": False,
+            "path": smoke_path,
+            "checks": checks,
+            "duration_seconds": round(time.time() - started_at, 3),
+        }
+        if via_web:
+            tail = remote_compose_service_logs_tail(
+                self._run_remote_text,
+                username=username,
+                server=server,
+                remote_app_root=self.REMOTE_APP_ROOT,
+                service_name="web",
+                lines=100,
+                timeout=45,
+            )
+            if tail:
+                report["web_logs_tail"] = tail[:12000]
+                log_error("Smoke checks failed — recent web container logs:")
+                for line in tail.splitlines()[-40:]:
+                    print_plain(f"  {line}")
+        self._last_report["smoke_checks"] = report
+        return False, report
+
+    def _remote_service_exists(self, username: str, server: str, service_name: str) -> bool:
+        return remote_compose_service_known(
+            self._run_remote_text,
+            username=username,
+            server=server,
+            remote_app_root=self.REMOTE_APP_ROOT,
+            service_name=service_name,
+            timeout=15,
+        )
+
+    @staticmethod
+    def _normalized_smoke_path(smoke_path: str) -> str:
+        p = (smoke_path or "/").strip()
+        if not p.startswith("/"):
+            p = "/" + p
+        return p or "/"
+
+    def _build_smoke_probe_command(
+        self,
+        smoke_path: str,
+        *,
+        via_compose_web: bool,
+        quiet: bool = True,
+    ) -> str:
+        """Shell command to verify the app responds on port 8000.
+
+        Caddy-only setups often do not publish 8000 on the host; the listener
+        lives inside the ``web`` container. When ``via_compose_web`` is true,
+        run curl inside that service via ``docker compose exec``.
+        """
+        norm = self._normalized_smoke_path(smoke_path)
+        url = f"http://127.0.0.1:8000{norm}"
+        tail = " >/dev/null" if quiet else " 2>&1"
+        inner_curl = f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
+        if via_compose_web:
+            root = shlex.quote(self.REMOTE_APP_ROOT)
+            return (
+                f"cd {root} && docker compose --env-file .env exec -T web sh -c {shlex.quote(inner_curl)}"
+            )
+        return f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
+
+    def _doctor_collect_command(
+        self,
+        title: str,
+        command: str,
+        *,
+        username: str,
+        server: str,
+        local: bool = False,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        if local:
+            code, stdout, stderr = self._run_local_text(["zsh", "-lc", command], timeout=timeout)
+        else:
+            code, stdout, stderr = self._run_remote_text(username, server, command, timeout=timeout)
+        return {
+            "title": title,
+            "command": command,
+            "success": code == 0,
+            "stdout": stdout.strip(),
+            "stderr": stderr.strip(),
+        }
+
+    def doctor(
+        self,
+        *,
+        branch_name: str,
+        scp_target: str,
+        domain: Optional[str] = None,
+        ip: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        target = SCPTarget(scp_target)
+        preflight = self._run_deploy_preflight(branch_name)
+        smoke_path = preflight["smoke_path"] if preflight else "/"
+
+        report = self.doctor_mgr.doctor(
+            username=target.username,
+            server=target.server,
+            smoke_path=smoke_path,
+            source_manifest=self._last_report.get("source_manifest"),
+            drift_report=self._last_report.get("drift_report"),
+            domain=domain,
+        )
+        report["branch"] = branch_name
+        report["target"] = scp_target
+        return report
 
     # ──────────────────────────────────────────────────────────────────
     # Public entry point
@@ -68,19 +525,41 @@ class SlimDeployManager:
         debug: bool = False,
         droplet_info: Optional[DropletInfo] = None,
         use_staging_certificates: bool = False,
+        disk_recovery: str = "safe",
+        retry_on_disk_reclaim: bool = False,
+        deployignore: Optional[str] = None,
+        no_disk_check: bool = False,
+        skip_volume_backup: bool = False,
+        strict_deploy_drift: bool = False,
+        smoke_timeout: int = 60,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
         Returns True on success, False on failure.
         """
+        self._reset_report()
         try:
             target = SCPTarget(scp_target)
         except ValueError:
             log_error(f"Invalid SCP target: {scp_target}  (expected user@host:path)")
+            self._set_failure(
+                error_code="invalid_scp_target",
+                stage="preflight",
+                root_cause=f"Invalid target: {scp_target}",
+                suggested_actions=["Use format user@host:path."],
+                failure_category="validation_error",
+            )
             return False
 
         username = target.username
         server = target.server
+        preflight = self._run_deploy_preflight(
+            branch_name,
+            strict_deploy_drift=strict_deploy_drift,
+        )
+        if preflight is None:
+            render_deploy_report(self._last_report)
+            return False
 
         log_info("Starting slim deploy (no ilha required on server)...")
         log_info(f"  Branch:  {branch_name}")
@@ -90,97 +569,303 @@ class SlimDeployManager:
         elif ip:
             log_info(f"  IP:      {ip}")
 
-        # ── 1–3. DNS, prepare server, assemble deploy dir (in parallel) ─
-        log_info("Running DNS, server preparation, and deploy assembly in parallel...")
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {}
-            if domain and not skip_dns_check:
-                futures["dns"] = executor.submit(
-                    self._handle_dns, domain, server, dns_token, droplet_info
+        target_label = domain or ip or f"{username}@{server}"
+        self._tracker = StageTracker(f"Deploying {branch_name} → {target_label}")
+
+        with self._tracker:
+            attempts = 2 if retry_on_disk_reclaim else 1
+            for attempt in range(1, attempts + 1):
+                if attempt > 1:
+                    print_plain(f"Retrying slim deploy after disk recovery (attempt {attempt}/{attempts})...")
+                success = self._deploy_once(
+                    branch_name=branch_name,
+                    username=username,
+                    server=server,
+                    domain=domain,
+                    ip=ip,
+                    prepare_server=prepare_server,
+                    dns_token=dns_token,
+                    skip_dns_check=skip_dns_check,
+                    build=build,
+                    debug=debug,
+                    droplet_info=droplet_info,
+                    use_staging_certificates=use_staging_certificates,
+                    deployignore=deployignore,
+                    no_disk_check=no_disk_check,
+                    skip_volume_backup=skip_volume_backup,
+                    smoke_path=preflight["smoke_path"],
+                    smoke_timeout=smoke_timeout,
                 )
-            if prepare_server:
-                futures["prepare"] = executor.submit(
-                    self._prepare_server_slim, username, server
+                if success:
+                    self._last_report["success"] = True
+                    break
+                if (
+                    self._last_failure_category != "disk_full"
+                    or attempt >= attempts
+                    or disk_recovery == "off"
+                ):
+                    break
+                self._last_report["recovery_attempted"] = True
+                self.disk._log_remote_disk_diagnostics(username, server)
+                recovered = self.disk._attempt_remote_disk_recovery(username, server, disk_recovery)
+                self._last_report["recovery_succeeded"] = recovered
+                if not recovered:
+                    break
+
+        render_deploy_report(self._last_report)
+        self._tracker = None
+        return self._last_report["success"]
+
+    def _deploy_once(
+        self,
+        *,
+        branch_name: str,
+        username: str,
+        server: str,
+        domain: Optional[str],
+        ip: Optional[str],
+        prepare_server: bool,
+        dns_token: Optional[str],
+        skip_dns_check: bool,
+        build: bool,
+        debug: bool,
+        droplet_info: Optional[DropletInfo],
+        use_staging_certificates: bool,
+        deployignore: Optional[str],
+        no_disk_check: bool,
+        skip_volume_backup: bool,
+        smoke_path: str,
+        smoke_timeout: int = 60,
+    ) -> bool:
+        deploy_dir: Optional[Path] = None
+        try:
+            stage_started = time.time()
+            log_step("Preparing server, DNS, and assembly")
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {}
+                if domain and not skip_dns_check:
+                    futures["dns"] = executor.submit(
+                        self._handle_dns, domain, server, dns_token, droplet_info
+                    )
+                if prepare_server:
+                    futures["prepare"] = executor.submit(
+                        self._prepare_server_slim, username, server
+                    )
+                futures["assemble"] = executor.submit(
+                    self._assemble_deploy_dir,
+                    branch_name,
+                    domain=domain,
+                    ip=ip,
+                    debug=debug,
+                    use_staging_certificates=use_staging_certificates,
+                    deployignore=deployignore,
                 )
-            futures["assemble"] = executor.submit(
-                self._assemble_deploy_dir,
-                branch_name,
+
+                try:
+                    dns_ok = futures["dns"].result(timeout=self._FUTURE_TIMEOUTS["dns"]) if "dns" in futures else True
+                except TimeoutError:
+                    log_error(f"DNS management timed out after {self._FUTURE_TIMEOUTS['dns']}s")
+                    dns_ok = False
+                try:
+                    prepare_ok = futures["prepare"].result(timeout=self._FUTURE_TIMEOUTS["prepare"]) if "prepare" in futures else True
+                except TimeoutError:
+                    log_error(f"Server preparation timed out after {self._FUTURE_TIMEOUTS['prepare']}s")
+                    prepare_ok = False
+                try:
+                    deploy_dir = futures["assemble"].result(timeout=self._FUTURE_TIMEOUTS["assemble"])
+                except TimeoutError:
+                    log_error(f"Deploy assembly timed out after {self._FUTURE_TIMEOUTS['assemble']}s")
+                    deploy_dir = None
+            self._mark_stage_timing("assemble_prepare_dns", stage_started)
+
+            if "dns" in futures and not dns_ok:
+                log_warning("DNS management failed, continuing anyway...")
+            if prepare_server and not prepare_ok:
+                self._set_failure(
+                    error_code="server_prepare_failed",
+                    stage="prepare",
+                    root_cause="Slim server preparation failed.",
+                    suggested_actions=["Re-run with --no-prepare if server is already configured."],
+                    failure_category="remote_setup_error",
+                )
+                return False
+            if deploy_dir is None:
+                self._set_failure(
+                    error_code="assemble_failed",
+                    stage="assemble",
+                    root_cause="Failed to assemble deploy directory.",
+                    suggested_actions=["Check worktree paths and compose files."],
+                    failure_category="local_build_error",
+                )
+                return False
+
+            deploy_size = self._dir_size_bytes(deploy_dir)
+            if not no_disk_check:
+                log_step("Checking remote disk space")
+                stage_started = time.time()
+                disk_ok, disk_report = self.disk._check_remote_disk_capacity(
+                    username=username,
+                    server=server,
+                    deploy_size_bytes=deploy_size,
+                )
+                self._last_report["disk_check"] = disk_report
+                self._mark_stage_timing("disk_check", stage_started)
+                if not disk_ok:
+                    self._set_failure(
+                        error_code="insufficient_remote_disk",
+                        stage="disk_check",
+                        root_cause="Insufficient disk space on remote server for deploy/build.",
+                        suggested_actions=[
+                            "Free disk space on /app and /var/lib/docker.",
+                            "Re-run with --retry-on-disk-reclaim and --disk-recovery safe.",
+                        ],
+                        failure_category="disk_full",
+                    )
+                    self.disk._log_remote_disk_diagnostics(username, server)
+                    self.disk._print_disk_recovery_guidance(username, server)
+                    return False
+
+            stage_started = time.time()
+            volume_tar = None
+            if skip_volume_backup:
+                log_info("Skipping local volume backup (--skip-volume-backup)")
+            else:
+                log_step("Backing up volumes")
+                volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+            self._mark_stage_timing("volume_backup", stage_started)
+
+            log_step("Syncing code to server")
+            stage_started = time.time()
+            add_ssh_host_key(server)
+            if not self._rsync_to_server(deploy_dir, username, server):
+                self._set_failure(
+                    error_code="rsync_failed",
+                    stage="transfer",
+                    root_cause="Failed to transfer deploy directory to remote server.",
+                    suggested_actions=["Check SSH connectivity and remote permissions."],
+                    failure_category="transfer_error",
+                )
+                return False
+            self._mark_stage_timing("transfer", stage_started)
+
+            stage_started = time.time()
+            restore_ok = True
+            build_ok = True
+
+            # Phase 1: restore volumes + start caddy (in parallel)
+            log_step("Starting remote services")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                phase1_futures = {}
+                if volume_tar:
+                    phase1_futures["restore"] = executor.submit(
+                        self._restore_volumes_remote, username, server, branch_name
+                    )
+                phase1_futures["caddy"] = executor.submit(
+                    self._start_caddy_remote, username, server
+                )
+                for key in phase1_futures:
+                    try:
+                        ok = phase1_futures[key].result(timeout=self._FUTURE_TIMEOUTS.get(key, 600))
+                    except TimeoutError:
+                        log_error(f"{key} timed out after {self._FUTURE_TIMEOUTS.get(key, 600)}s")
+                        ok = False
+                    if key == "restore":
+                        restore_ok = ok
+                    elif key == "caddy" and not ok:
+                        log_warning("Caddy start had issues, but continuing with app services...")
+
+            # Phase 2: build (only if restore succeeded — build may depend on restored volumes)
+            if build and restore_ok:
+                log_step("Running Docker build")
+                try:
+                    build_ok = self._build_remote(username, server, debug)
+                except Exception as exc:
+                    log_error(f"Docker build failed: {exc}")
+                    build_ok = False
+                if not build_ok:
+                    log_warning("Docker build had issues, but continuing with app start...")
+            elif build and not restore_ok:
+                log_warning("Skipping Docker build because volume restore failed")
+                build_ok = False
+
+            self._mark_stage_timing("remote_prepare", stage_started)
+
+            if not restore_ok:
+                self._set_failure(
+                    error_code="volume_restore_failed",
+                    stage="restore",
+                    root_cause="Remote volume restore failed.",
+                    suggested_actions=["Check remote volume backup file and docker volume permissions."],
+                    failure_category="remote_data_error",
+                )
+                return False
+            if build and not build_ok and self._last_failure_category == "disk_full":
+                return False
+
+            log_step("Starting application")
+            stage_started = time.time()
+            if not self._start_app_remote(username, server, build=build, debug=debug):
+                if self._last_failure_category != "disk_full":
+                    self._set_failure(
+                        error_code="app_start_failed",
+                        stage="start_app",
+                        root_cause="Failed to start application services on the server.",
+                        suggested_actions=["Inspect remote logs under /tmp/ilha-*.log and docker compose ps output."],
+                        failure_category="remote_runtime_error",
+                )
+                return False
+            self._mark_stage_timing("app_start", stage_started)
+
+            log_step("Running smoke checks")
+            stage_started = time.time()
+            smoke_ok, smoke_report = self._run_smoke_checks(
+                username=username,
+                server=server,
+                smoke_path=smoke_path,
                 domain=domain,
                 ip=ip,
-                debug=debug,
-                use_staging_certificates=use_staging_certificates,
+                timeout_seconds=smoke_timeout,
             )
-
-            dns_ok = futures["dns"].result() if "dns" in futures else True
-            prepare_ok = futures["prepare"].result() if "prepare" in futures else True
-            deploy_dir = futures["assemble"].result()
-
-        if "dns" in futures and not dns_ok:
-            log_warning("DNS management failed, continuing anyway...")
-        if prepare_server and not prepare_ok:
-            log_error("Slim server preparation failed.")
-            return False
-        if deploy_dir is None:
-            return False
-
-        # ── 4. Backup volumes locally ────────────────────────────────
-        volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
-
-        # ── 5. rsync to server ───────────────────────────────────────
-        add_ssh_host_key(server)
-        if not self._rsync_to_server(deploy_dir, username, server):
-            return False
-
-        # ── 6–8. Restore volumes, start Caddy, build (in parallel) ─────
-        log_info("Running volume restore, Caddy start, and build (if requested) in parallel...")
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {}
-            if volume_tar:
-                futures["restore"] = executor.submit(
-                    self._restore_volumes_remote, username, server, branch_name
+            self._mark_stage_timing("smoke_checks", stage_started)
+            if not smoke_ok:
+                self._set_failure(
+                    error_code="smoke_checks_failed",
+                    stage="smoke_checks",
+                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    suggested_actions=[
+                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote compose ps output and service logs.",
+                    ],
+                    failure_category="remote_runtime_error",
                 )
-            futures["caddy"] = executor.submit(
-                self._start_caddy_remote, username, server
-            )
-            if build:
-                futures["build"] = executor.submit(
-                    self._build_remote, username, server, debug
-                )
+                for check in smoke_report.get("checks", []):
+                    if not check.get("success"):
+                        probe = check.get("probe")
+                        via = f" [{probe}]" if probe else ""
+                        log_error(
+                            f"Smoke check failed: {check['name']}{via} -> {check['target']} "
+                            f"({check.get('error') or 'unknown error'})"
+                        )
+                return False
 
-            for key in futures:
-                ok = futures[key].result()
-                if key == "caddy" and not ok:
-                    log_warning("Caddy start had issues, but continuing with app services...")
-                elif key == "build" and not ok:
-                    log_warning("Docker build had issues, but continuing with app start...")
+            url = None
+            if domain:
+                url = f"https://{domain}"
+            elif ip:
+                url = f"http://{ip}"
+            elif droplet_info and droplet_info.ip_address:
+                url = f"http://{droplet_info.ip_address}"
+            if url:
+                self._last_report["url"] = url
 
-        # ── 9. Start app services ────────────────────────────────────
-        if not self._start_app_remote(username, server, build=build, debug=debug):
-            log_error("Failed to start application services on the server.")
-            return False
-
-        # ── 10. Summary ──────────────────────────────────────────────
-        url = None
-        if domain:
-            url = f"https://{domain}"
-        elif ip:
-            url = f"http://{ip}"
-        elif droplet_info and droplet_info.ip_address:
-            url = f"http://{droplet_info.ip_address}"
-
-        print_plain("")
-        log_success("Slim deploy completed successfully!")
-        if url:
-            log_success(f"🌐 Your site is available at: {url}")
-        print_plain("")
-
-        # Cleanup local temp dir
-        try:
-            shutil.rmtree(deploy_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-        return True
+            log_success("Slim deploy completed successfully!")
+            return True
+        finally:
+            if deploy_dir is not None:
+                try:
+                    shutil.rmtree(deploy_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
     def put(
         self,
@@ -193,6 +878,7 @@ class SlimDeployManager:
         use_staging_certificates: bool = False,
         code_only: bool = False,
         db_only: bool = False,
+        smoke_timeout: int = 60,
     ) -> bool:
         """Update an existing slim-deployed server.
 
@@ -201,13 +887,26 @@ class SlimDeployManager:
         db_only: backup volumes, sync only volumes to server, stop app, restore volumes, start app.
         """
         try:
+            self._reset_report()
             target = SCPTarget(scp_target)
         except ValueError:
             log_error(f"Invalid SCP target: {scp_target}  (expected user@host:path)")
+            self._set_failure(
+                error_code="invalid_scp_target",
+                stage="preflight",
+                root_cause=f"Invalid target: {scp_target}",
+                suggested_actions=["Use format user@host:path."],
+                failure_category="validation_error",
+            )
             return False
 
         username = target.username
         server = target.server
+        preflight = None
+        if not db_only:
+            preflight = self._run_deploy_preflight(branch_name)
+            if preflight is None:
+                return False
 
         log_info("Starting slim put...")
         log_info(f"  Branch:  {branch_name}")
@@ -221,6 +920,10 @@ class SlimDeployManager:
         elif db_only:
             log_info("  Mode:    db/volumes only (no code sync)")
 
+        mode = " (code-only)" if code_only else (" (db-only)" if db_only else "")
+        target_label = domain or ip or f"{username}@{server}"
+        self._tracker = StageTracker(f"Updating {branch_name} → {target_label}{mode}")
+
         def _cleanup_deploy_dir(d: Optional[Path]) -> None:
             if d is not None:
                 try:
@@ -231,33 +934,49 @@ class SlimDeployManager:
         # ── db_only: volumes only ─────────────────────────────────────
         if db_only:
             deploy_dir = Path(tempfile.mkdtemp(prefix=f"ilha-put-volumes-{branch_name}-"))
-            try:
-                (deploy_dir / "volumes").mkdir()
-                volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
-                if not volume_tar:
-                    log_warning("No volumes to sync; nothing to do for --db-only")
-                    _cleanup_deploy_dir(deploy_dir)
+            with self._tracker:
+                try:
+                    (deploy_dir / "volumes").mkdir()
+                    log_step("Backing up volumes")
+                    volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+                    if not volume_tar:
+                        log_warning("No volumes to sync; nothing to do for --db-only")
+                        _cleanup_deploy_dir(deploy_dir)
+                        return True
+                    log_step("Syncing volumes to server")
+                    add_ssh_host_key(server)
+                    if not self._rsync_volumes_to_server(deploy_dir, username, server):
+                        _cleanup_deploy_dir(deploy_dir)
+                        return False
+                    log_step("Stopping application")
+                    if not self._stop_app_remote(username, server):
+                        log_warning("App stop had issues, but continuing with volume restore...")
+                    log_step("Restoring volumes")
+                    if not self._restore_volumes_remote(username, server, branch_name):
+                        _cleanup_deploy_dir(deploy_dir)
+                        return False
+                    log_step("Starting application")
+                    if not self._start_app_remote(username, server, build=False, debug=False):
+                        _cleanup_deploy_dir(deploy_dir)
+                        log_error("Failed to start application services on the server.")
+                        self._set_failure(
+                            error_code="app_start_failed",
+                            stage="start_app",
+                            root_cause="Failed to start application services on the server.",
+                            suggested_actions=["Inspect remote compose ps output and service logs."],
+                            failure_category="remote_runtime_error",
+                        )
+                        return False
+                    self._last_report["success"] = True
+                    log_success("Slim put (db-only) completed successfully!")
                     return True
-                add_ssh_host_key(server)
-                if not self._rsync_volumes_to_server(deploy_dir, username, server):
+                finally:
                     _cleanup_deploy_dir(deploy_dir)
-                    return False
-                if not self._stop_app_remote(username, server):
-                    log_warning("App stop had issues, but continuing with volume restore...")
-                if not self._restore_volumes_remote(username, server, branch_name):
-                    _cleanup_deploy_dir(deploy_dir)
-                    return False
-                if not self._start_app_remote(username, server, build=False, debug=False):
-                    _cleanup_deploy_dir(deploy_dir)
-                    log_error("Failed to start application services on the server.")
-                    return False
-                log_success("Slim put (db-only) completed successfully!")
-                return True
-            finally:
-                _cleanup_deploy_dir(deploy_dir)
 
         # ── code_only: code + config, no volumes ───────────────────────
         if code_only:
+          with self._tracker:
+            log_step("Assembling deploy directory")
             deploy_dir = self._assemble_deploy_dir(
                 branch_name,
                 domain=domain,
@@ -266,65 +985,145 @@ class SlimDeployManager:
                 use_staging_certificates=use_staging_certificates,
             )
             if deploy_dir is None:
+                render_deploy_report(self._last_report)
                 return False
+            log_step("Syncing code to server")
             add_ssh_host_key(server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 _cleanup_deploy_dir(deploy_dir)
+                render_deploy_report(self._last_report)
                 return False
+            log_step("Starting remote services")
             if not self._start_caddy_remote(username, server):
                 log_warning("Caddy start had issues, but continuing with app services...")
+            log_step("Starting application")
             if not self._start_app_remote(username, server, build=build, debug=debug):
                 _cleanup_deploy_dir(deploy_dir)
                 log_error("Failed to start application services on the server.")
+                self._set_failure(
+                    error_code="app_start_failed",
+                    stage="start_app",
+                    root_cause="Failed to start application services on the server.",
+                    suggested_actions=["Inspect remote compose ps output and service logs."],
+                    failure_category="remote_runtime_error",
+                )
+                render_deploy_report(self._last_report)
+                return False
+            log_step("Running smoke checks")
+            smoke_ok, smoke_report = self._run_smoke_checks(
+                username=username,
+                server=server,
+                smoke_path=(preflight or {}).get("smoke_path", "/"),
+                domain=domain,
+                ip=ip,
+                timeout_seconds=smoke_timeout,
+            )
+            if not smoke_ok:
+                _cleanup_deploy_dir(deploy_dir)
+                self._set_failure(
+                    error_code="smoke_checks_failed",
+                    stage="smoke_checks",
+                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    suggested_actions=[
+                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote compose ps output and service logs.",
+                    ],
+                    failure_category="remote_runtime_error",
+                )
+                render_deploy_report(self._last_report)
                 return False
             url = f"https://{domain}" if domain else (f"http://{ip}" if ip else None)
-            print_plain("")
-            log_success("Slim put (code-only) completed successfully!")
             if url:
-                log_success(f"🌐 Your site is available at: {url}")
-            print_plain("")
+                self._last_report["url"] = url
+            self._last_report["success"] = True
+            log_success("Slim put (code-only) completed successfully!")
+            render_deploy_report(self._last_report)
             _cleanup_deploy_dir(deploy_dir)
+            self._tracker = None
             return True
 
         # ── Default: full sync (volumes + code + config) ────────────────
-        deploy_dir = self._assemble_deploy_dir(
-            branch_name,
-            domain=domain,
-            ip=ip,
-            debug=debug,
-            use_staging_certificates=use_staging_certificates,
-        )
-        if deploy_dir is None:
-            return False
-        volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
-        add_ssh_host_key(server)
-        if not self._rsync_to_server(deploy_dir, username, server):
-            _cleanup_deploy_dir(deploy_dir)
-            return False
-        log_info("Running volume restore and Caddy start...")
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {}
-            if volume_tar:
-                futures["restore"] = executor.submit(
-                    self._restore_volumes_remote, username, server, branch_name
+        with self._tracker:
+            log_step("Assembling deploy directory")
+            deploy_dir = self._assemble_deploy_dir(
+                branch_name,
+                domain=domain,
+                ip=ip,
+                debug=debug,
+                use_staging_certificates=use_staging_certificates,
+            )
+            if deploy_dir is None:
+                render_deploy_report(self._last_report)
+                return False
+            log_step("Backing up volumes")
+            volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+            log_step("Syncing to server")
+            add_ssh_host_key(server)
+            if not self._rsync_to_server(deploy_dir, username, server):
+                _cleanup_deploy_dir(deploy_dir)
+                render_deploy_report(self._last_report)
+                return False
+            log_step("Starting remote services")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {}
+                if volume_tar:
+                    futures["restore"] = executor.submit(
+                        self._restore_volumes_remote, username, server, branch_name
+                    )
+                futures["caddy"] = executor.submit(self._start_caddy_remote, username, server)
+                for key in futures:
+                    try:
+                        ok = futures[key].result(timeout=self._FUTURE_TIMEOUTS.get(key, 600))
+                    except TimeoutError:
+                        log_error(f"{key} timed out after {self._FUTURE_TIMEOUTS.get(key, 600)}s")
+                        ok = False
+                    if key == "caddy" and not ok:
+                        log_warning("Caddy start had issues, but continuing with app services...")
+            log_step("Starting application")
+            if not self._start_app_remote(username, server, build=build, debug=debug):
+                _cleanup_deploy_dir(deploy_dir)
+                log_error("Failed to start application services on the server.")
+                self._set_failure(
+                    error_code="app_start_failed",
+                    stage="start_app",
+                    root_cause="Failed to start application services on the server.",
+                    suggested_actions=["Inspect remote compose ps output and service logs."],
+                    failure_category="remote_runtime_error",
                 )
-            futures["caddy"] = executor.submit(self._start_caddy_remote, username, server)
-            for key in futures:
-                ok = futures[key].result()
-                if key == "caddy" and not ok:
-                    log_warning("Caddy start had issues, but continuing with app services...")
-        if not self._start_app_remote(username, server, build=build, debug=debug):
+                render_deploy_report(self._last_report)
+                return False
+            log_step("Running smoke checks")
+            smoke_ok, smoke_report = self._run_smoke_checks(
+                username=username,
+                server=server,
+                smoke_path=(preflight or {}).get("smoke_path", "/"),
+                domain=domain,
+                ip=ip,
+                timeout_seconds=smoke_timeout,
+            )
+            if not smoke_ok:
+                _cleanup_deploy_dir(deploy_dir)
+                self._set_failure(
+                    error_code="smoke_checks_failed",
+                    stage="smoke_checks",
+                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    suggested_actions=[
+                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote compose ps output and service logs.",
+                    ],
+                    failure_category="remote_runtime_error",
+                )
+                render_deploy_report(self._last_report)
+                return False
+            url = f"https://{domain}" if domain else (f"http://{ip}" if ip else None)
+            if url:
+                self._last_report["url"] = url
+            self._last_report["success"] = True
+            log_success("Slim put completed successfully!")
+            render_deploy_report(self._last_report)
             _cleanup_deploy_dir(deploy_dir)
-            log_error("Failed to start application services on the server.")
-            return False
-        url = f"https://{domain}" if domain else (f"http://{ip}" if ip else None)
-        print_plain("")
-        log_success("Slim put completed successfully!")
-        if url:
-            log_success(f"🌐 Your site is available at: {url}")
-        print_plain("")
-        _cleanup_deploy_dir(deploy_dir)
-        return True
+            self._tracker = None
+            return True
 
     # ──────────────────────────────────────────────────────────────────
     # Internal: assemble deploy directory
@@ -336,6 +1135,7 @@ class SlimDeployManager:
         ip: Optional[str] = None,
         debug: bool = False,
         use_staging_certificates: bool = False,
+        deployignore: Optional[str] = None,
     ) -> Optional[Path]:
         """Build a flat deploy directory ready to rsync.
 
@@ -352,12 +1152,16 @@ class SlimDeployManager:
           └── volumes/           # (populated later if needed)
         """
         log_info("Assembling deploy directory...")
+        if not validate_branch_name(branch_name):
+            log_error(f"Invalid branch name: {branch_name!r}")
+            return None
         deploy_dir = Path(tempfile.mkdtemp(prefix=f"ilha-deploy-{branch_name}-"))
 
         try:
             # Locate worktree using config (respects fractal worktree_dir setting)
-            worktree_dir = get_worktree_dir()
-            worktree_path = self.project_root / worktree_dir / branch_name
+            worktree_path = self.preflight._resolve_worktree_path(branch_name)
+            if worktree_path == self.project_root.resolve():
+                log_info("Using current worktree as deploy source")
             if not worktree_path.exists():
                 log_error(f"Worktree directory not found: {worktree_path}")
                 return None
@@ -371,13 +1175,23 @@ class SlimDeployManager:
             # ── code/ ────────────────────────────────────────────────
             code_dir = deploy_dir / "code"
             log_info(f"Copying worktree code from {worktree_path}...")
+            ignore_patterns = self._load_deployignore_patterns(worktree_path, deployignore)
+            excluded_paths: Set[str] = set()
             shutil.copytree(
                 worktree_path, code_dir,
-                ignore=shutil.ignore_patterns(
-                    ".git", "__pycache__", "*.pyc", ".tox",
-                    "node_modules", ".venv", "venv",
-                ),
+                ignore=self._build_copy_ignore(worktree_path, ignore_patterns, excluded_paths),
             )
+            if excluded_paths:
+                important = sorted(
+                    p for p in excluded_paths
+                    if p.startswith("packages") or p.endswith(".ilha-package.tar.gz")
+                )
+                if important:
+                    preview = ", ".join(important[:3])
+                    print_plain(
+                        f"Excluded deploy artifacts from build context ({len(excluded_paths)} paths). "
+                        f"Examples: {preview}"
+                    )
             log_success(f"Code copied ({_dir_size_mb(code_dir):.1f} MB)")
 
             # ── docker-compose.yml (app) ─────────────────────────────
@@ -430,9 +1244,17 @@ class SlimDeployManager:
             data = yaml.safe_load(compose_path.read_text())
             if not data:
                 return
-            ensure_caddy_labels_and_network(data, domain=domain, ip=ip)
+            normalized_domain = normalize_deploy_host(domain) if domain else None
+            normalized_ip = normalize_deploy_host(ip) if ip else None
+            ensure_caddy_labels_and_network(data, domain=normalized_domain, ip=normalized_ip)
+            # Production deploy: ensure web service restarts on exit (e.g. OOM 137)
+            if normalized_domain or normalized_ip:
+                services = data.get("services") or {}
+                web_config = services.get("web")
+                if web_config is not None and "restart" not in web_config:
+                    web_config["restart"] = "unless-stopped"
             compose_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
-            log_info(f"Applied {'domain' if domain else 'IP'} override to compose labels")
+            log_info(f"Applied {'domain' if normalized_domain else 'IP'} override to compose labels")
         except ImportError:
             log_warning("PyYAML not available — skipping compose label override")
         except Exception as exc:
@@ -486,28 +1308,45 @@ class SlimDeployManager:
         # references in docker-compose.worktree.yml resolve correctly.
         merged["PROJECT_ROOT"] = REMOTE_CODE_DIR
 
+        from ...config.settings import build_allowed_hosts_with_container
+
         if domain:
             from ...core.dns_manager import get_base_domain
-            base_domain = get_base_domain(domain)
-            merged["SITE_DOMAIN"] = f"https://{domain}"
-            merged["ALLOWED_HOSTS"] = f"localhost,127.0.0.1,{domain},*.{base_domain},web"
+            normalized_domain = normalize_deploy_host(domain)
+            base_domain = get_base_domain(normalized_domain)
+            additional_hosts = [normalized_domain]
+            if base_domain:
+                additional_hosts.append(f"*.{base_domain}")
+            # Bare hostname only — Django/allauth often build URLs from SITE_DOMAIN;
+            # a scheme here produces invalid CSRF/origin values (e.g. https://https://...).
+            merged["SITE_DOMAIN"] = normalized_domain
+            merged["ALLOWED_HOSTS"] = build_allowed_hosts_with_container(branch_name, additional_hosts)
             merged["USE_X_FORWARDED_HOST"] = "True"
             merged["SECURE_PROXY_SSL_HEADER"] = "HTTP_X_FORWARDED_PROTO,https"
             # Django settings split CSRF_TRUSTED_ORIGINS by comma, not space
-            csrf = f"https://{domain},http://{domain}"
-            if base_domain:
-                csrf += f",https://*.{base_domain}"
-            merged["CSRF_TRUSTED_ORIGINS"] = csrf
+            merged["CSRF_TRUSTED_ORIGINS"] = build_csrf_trusted_origins(
+                normalized_domain,
+                base_domain=base_domain,
+            )
             # Vite allowedHosts
-            merged["VITE_ALLOWED_HOSTS"] = f"{domain},*.{base_domain},localhost,127.0.0.1"
+            vite_allowed_hosts = [normalized_domain]
+            if base_domain:
+                vite_allowed_hosts.append(f"*.{base_domain}")
+            vite_allowed_hosts.extend(["localhost", "127.0.0.1"])
+            merged["VITE_ALLOWED_HOSTS"] = ",".join(vite_allowed_hosts)
             if "CADDY_EMAIL" not in merged:
-                merged["CADDY_EMAIL"] = f"admin@{domain}"
+                merged["CADDY_EMAIL"] = f"admin@{normalized_domain}"
         elif ip:
-            merged["SITE_DOMAIN"] = f"http://{ip}"
-            merged["ALLOWED_HOSTS"] = f"localhost,127.0.0.1,{ip},web"
+            normalized_ip = normalize_deploy_host(ip)
+            merged["SITE_DOMAIN"] = normalized_ip
+            merged["ALLOWED_HOSTS"] = build_allowed_hosts_with_container(branch_name, [normalized_ip])
             merged["USE_X_FORWARDED_HOST"] = "True"
             # Comma-separated for Django's split(',')
-            merged["CSRF_TRUSTED_ORIGINS"] = f"http://{ip}"
+            merged["CSRF_TRUSTED_ORIGINS"] = build_csrf_trusted_origins(
+                normalized_ip,
+                include_https=False,
+                include_wildcard_https=False,
+            )
 
         merged["DEBUG"] = "True" if debug else "False"
         merged["BUILD_MODE"] = "prod"
@@ -521,6 +1360,11 @@ class SlimDeployManager:
             password = merged.get("POSTGRES_PASSWORD", "bipassword")
             db = merged.get("POSTGRES_DB", "business_intelligence")
             merged["DATABASE_URL"] = f"postgres://{user}:{password}@db:5432/{db}"
+            if password == "bipassword":
+                log_warning(
+                    "DATABASE_URL synthesized with default password 'bipassword'. "
+                    "Set POSTGRES_PASSWORD in your .env for production."
+                )
 
         # ── Write top-level .env (used by ``docker compose --env-file`` and sourced by scripts) ──
         # Quote values so shell `source .env` does not treat space-separated parts as commands
@@ -567,6 +1411,10 @@ class SlimDeployManager:
         if dynamic_src.exists():
             shutil.copy2(dynamic_src, caddy_dir / "caddy-dynamic-config.py")
 
+        helper_src = script_dir / "scripts" / "caddy_admin_utils.py"
+        if helper_src.exists():
+            shutil.copy2(helper_src, caddy_dir / "caddy_admin_utils.py")
+
         # Build a concrete caddy compose (resolve path placeholders)
         caddy_compose_template = config_dir / "docker-compose.global-caddy.yml"
         if caddy_compose_template.exists():
@@ -579,6 +1427,10 @@ class SlimDeployManager:
             content = content.replace(
                 "{MONITOR_SCRIPT_PATH}",
                 f"{self.REMOTE_CADDY_DIR}/caddy-docker-monitor.py",
+            )
+            content = content.replace(
+                "{HELPER_UTILS_PATH}",
+                f"{self.REMOTE_CADDY_DIR}/caddy_admin_utils.py",
             )
             (caddy_dir / "docker-compose.yml").write_text(content)
             log_info("Caddy compose file assembled with server-side paths")
@@ -621,10 +1473,15 @@ class SlimDeployManager:
 
     def _restore_volumes_remote(self, username: str, server: str, branch_name: str) -> bool:
         """Restore volumes on the remote server using docker run + alpine."""
+        if not validate_branch_name(branch_name):
+            log_error(f"Invalid branch name for volume restore: {branch_name!r}")
+            return False
         log_info("Restoring volumes on remote server...")
 
-        # Backup format: gzipped tar (tar czf) containing volume_name.tar.gz members.
-        # Each member is a gzipped tar of that volume's contents.
+        # Backup format: gzipped tar (tar czf) containing volume_name.tar members.
+        # Each member is an uncompressed tar of that volume's contents (single
+        # compression pass on the outer archive to avoid redundant gzip layers).
+        # Also supports legacy .tar.gz members for backwards compatibility.
         script = f"""#!/bin/bash
 set -euo pipefail
 BACKUP_TAR="{self.REMOTE_VOLUMES_DIR}/backup_{branch_name}.tar"
@@ -636,13 +1493,15 @@ echo "Restoring volumes from $BACKUP_TAR..."
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 tar xzf "$BACKUP_TAR" -C "$TMPDIR"
-for f in "$TMPDIR"/*.tar.gz; do
+for f in "$TMPDIR"/*.tar "$TMPDIR"/*.tar.gz; do
     [ -f "$f" ] || continue
-    vol=$(basename "$f" .tar.gz)
+    base=$(basename "$f")
+    vol="${{base%.tar.gz}}"
+    vol="${{vol%.tar}}"
     echo "  Restoring volume: $vol"
     docker volume create "$vol" >/dev/null 2>&1 || true
     docker run --rm -v "$vol":/data -v "$TMPDIR":/backup alpine \\
-        sh -c "cd /data && tar xzf /backup/$(basename "$f") -C ."
+        sh -c "rm -rf /data/* /data/..?* /data/.[!.]* 2>/dev/null; tar xf /backup/$base -C /data"
 done
 echo "Volume restore complete"
 """
@@ -681,11 +1540,10 @@ echo "Volume restore complete"
             return False
 
         script = script_path.read_text()
-        exec_cmd = "cat > /tmp/dtprep_slim.sh && chmod +x /tmp/dtprep_slim.sh && /tmp/dtprep_slim.sh && rm -f /tmp/dtprep_slim.sh"
-        ssh_cmd = ["ssh", f"{username}@{server}",
-                   "-o", "StrictHostKeyChecking=accept-new",
-                   "-o", "ConnectTimeout=10",
-                   "bash", "-lc", exec_cmd]
+        tmp_script = self._remote_tmp("prep.sh")
+        q = shlex.quote(tmp_script)
+        exec_cmd = f"cat > {q} && chmod +x {q} && {q} && rm -f {q}"
+        ssh_cmd = self.ssh.build_ssh_command(username, server, exec_cmd)
 
         success, stdout_lines, stderr_lines = execute_with_streaming(
             ssh_cmd, script=script, timeout=None, progress_interval=15, prefix="  "
@@ -701,6 +1559,22 @@ echo "Volume restore complete"
         log_success("Slim server preparation complete")
         return True
 
+    def _run_remote_text(
+        self,
+        username: str,
+        server: str,
+        command: str,
+        timeout: int = 30,
+    ) -> Tuple[int, str, str]:
+        ssh_cmd = self.ssh.build_ssh_command(username, server, command)
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+            return result.returncode, result.stdout or "", result.stderr or ""
+        except subprocess.TimeoutExpired:
+            return 1, "", f"Remote command timed out after {timeout}s"
+        except Exception as exc:
+            return 1, "", str(exc)
+
     # ──────────────────────────────────────────────────────────────────
     # Internal: rsync
     # ──────────────────────────────────────────────────────────────────
@@ -712,16 +1586,27 @@ echo "Volume restore complete"
         mkdir_cmd = self.ssh.build_ssh_command(
             username, server, f"mkdir -p {self.REMOTE_APP_ROOT}"
         )
-        subprocess.run(mkdir_cmd, capture_output=True, timeout=15)
+        mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=45)
+        if mkdir_result.returncode != 0:
+            log_error(f"Failed to create remote directory {self.REMOTE_APP_ROOT}: {mkdir_result.stderr.strip()}")
+            return False
 
-        # rsync with compression
+        # rsync with compression (reuse SSH connection from mkdir via same ControlPath)
         cmd = [
-            "rsync", "-avz", "--progress", "--delete",
-            "-e", "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10",
+            "rsync",
+            "-avz",
+            "--progress",
+            "--delete-delay",
+            "--partial",
+            "--inplace",
+            "-e", self.ssh.get_rsync_ssh_command(username, server),
             f"{deploy_dir}/",
             f"{username}@{server}:{self.REMOTE_APP_ROOT}/",
         ]
-        log_info(f"Running rsync ({_dir_size_mb(deploy_dir):.1f} MB)...")
+        if is_verbose():
+            log_info(f"Running rsync ({_dir_size_mb(deploy_dir):.1f} MB)...")
+        else:
+            log_info("Running rsync...")
 
         process = subprocess.Popen(
             cmd,
@@ -732,14 +1617,19 @@ echo "Volume restore complete"
             errors="replace",
             bufsize=1,
         )
+        out_lines = []
         for line in iter(process.stdout.readline, ""):
             line = line.rstrip()
+            out_lines.append(line)
             if "%" in line or "speedup" in line.lower():
                 log_info(f"  {line}")
         process.wait()
 
         if process.returncode != 0:
             log_error(f"rsync failed (exit {process.returncode})")
+            for line in out_lines[-20:]:
+                if line.strip() and ("%" not in line and "speedup" not in line.lower()):
+                    log_error(f"  {line}")
             return False
 
         log_success("Transfer complete")
@@ -755,10 +1645,11 @@ echo "Volume restore complete"
         mkdir_cmd = self.ssh.build_ssh_command(
             username, server, f"mkdir -p {self.REMOTE_VOLUMES_DIR}"
         )
-        subprocess.run(mkdir_cmd, capture_output=True, timeout=15)
+        subprocess.run(mkdir_cmd, capture_output=True, timeout=45)
+        # No -z: volume archives are already gzip-compressed
         cmd = [
-            "rsync", "-avz", "--progress",
-            "-e", "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10",
+            "rsync", "-av", "--progress",
+            "-e", self.ssh.get_rsync_ssh_command(username, server),
             f"{volumes_src}/",
             f"{username}@{server}:{self.REMOTE_VOLUMES_DIR}/",
         ]
@@ -786,7 +1677,9 @@ cd {self.REMOTE_APP_ROOT}
 docker compose --env-file .env down --remove-orphans 2>&1 || true
 echo "App services stopped"
 """
-        exec_cmd = "cat > /tmp/stop_app.sh && chmod +x /tmp/stop_app.sh && /tmp/stop_app.sh && rm -f /tmp/stop_app.sh"
+        tmp_script = self._remote_tmp("stop-app.sh")
+        q = shlex.quote(tmp_script)
+        exec_cmd = f"cat > {q} && chmod +x {q} && {q} && rm -f {q}"
         ssh_cmd = self.ssh.build_ssh_command(username, server, exec_cmd)
         success, _, stderr_lines = execute_with_streaming(
             ssh_cmd, script=script, timeout=120, progress_interval=15, prefix="  "
@@ -816,7 +1709,9 @@ set +a
 docker compose -p ilha-proxy up -d --force-recreate 2>&1
 echo "Caddy proxy started"
 """
-        exec_cmd = "cat > /tmp/start_caddy.sh && chmod +x /tmp/start_caddy.sh && /tmp/start_caddy.sh && rm -f /tmp/start_caddy.sh"
+        tmp_script = self._remote_tmp("start-caddy.sh")
+        q = shlex.quote(tmp_script)
+        exec_cmd = f"cat > {q} && chmod +x {q} && {q} && rm -f {q}"
         ssh_cmd = self.ssh.build_ssh_command(username, server, exec_cmd)
         success, stdout_lines, stderr_lines = execute_with_streaming(
             ssh_cmd, script=script, timeout=120, progress_interval=15, prefix="  "
@@ -844,9 +1739,11 @@ echo "Caddy proxy started"
         debug: bool = False,
     ) -> bool:
         """Upload script, launch via nohup, poll until done. Two-step pattern avoids stdin+nohup failure."""
+        stage_name = "build" if "build" in label.lower() else "start_app"
         # Step 1: upload script (synchronous, no nohup — reliable)
         upload_cmd = self.ssh.build_ssh_command(
-            username, server, f"cat > {script_path} && chmod +x {script_path}"
+            username, server,
+            f"cat > {shlex.quote(script_path)} && chmod +x {shlex.quote(script_path)}",
         )
         if debug:
             log_info(f"  [debug] {label} upload SSH: {' '.join(upload_cmd)}")
@@ -867,7 +1764,7 @@ echo "Caddy proxy started"
         # Step 2: launch via nohup (no stdin)
         launch_cmd = self.ssh.build_ssh_command(
             username, server,
-            f"nohup bash -c '{script_path}; echo EXIT_CODE=$?' >> {log_file} 2>&1 & echo $!",
+            f"nohup bash -c {shlex.quote(script_path + '; echo EXIT_CODE=$?')} >> {shlex.quote(log_file)} 2>&1 & echo $!",
         )
         if debug:
             log_info(f"  [debug] {label} launch SSH: {' '.join(launch_cmd)}")
@@ -894,12 +1791,16 @@ echo "Caddy proxy started"
         poll_interval = 5
         elapsed = 0
         last_line_count = 0
-        grep_parts = " || ".join(f"grep -q '{m}' {log_file}" for m in success_markers)
+        grep_parts = " || ".join(
+            f"grep -q {shlex.quote(m)} {shlex.quote(log_file)}"
+            for m in success_markers
+        )
         success_check = f"({grep_parts}) && echo SUCCESS || echo FAILED"
         is_build = "Build" in label
         while elapsed < max_wait:
             time.sleep(poll_interval)
             elapsed += poll_interval
+            # pid validated as digit above
             check_cmd = self.ssh.build_ssh_command(
                 username, server,
                 f"ps -p {pid} > /dev/null 2>&1 && echo RUNNING || echo FINISHED",
@@ -910,7 +1811,7 @@ echo "Caddy proxy started"
             process_status = (check_result.stdout or "").strip()
             wc_cmd = self.ssh.build_ssh_command(
                 username, server,
-                f"wc -l {log_file} 2>/dev/null | awk '{{print $1}}' || echo 0",
+                f"wc -l {shlex.quote(log_file)} 2>/dev/null | awk '{{print $1}}' || echo 0",
             )
             wc_result = subprocess.run(wc_cmd, capture_output=True, text=True, timeout=10)
             try:
@@ -920,9 +1821,10 @@ echo "Caddy proxy started"
             if current_line_count > last_line_count:
                 lines_to_show = current_line_count - last_line_count
                 tail_cmd = self.ssh.build_ssh_command(
-                    username, server, f"tail -n {lines_to_show} {log_file}",
+                    username, server, f"tail -n {lines_to_show} {shlex.quote(log_file)}",
                 )
                 tail_result = subprocess.run(tail_cmd, capture_output=True, text=True, timeout=10)
+                disk_full_detected = False
                 for line in (tail_result.stdout or "").splitlines():
                     s = line.strip()
                     if s == "EXIT_CODE=0":
@@ -931,7 +1833,25 @@ echo "Caddy proxy started"
                         log_info(f"  {label} script exited with code {s.split('=', 1)[1]}.")
                     elif s:
                         log_info(f"  {line}")
+                    if self._is_enospc_line(s):
+                        disk_full_detected = True
                 last_line_count = current_line_count
+                if disk_full_detected:
+                    self._set_failure(
+                        error_code="disk_full",
+                        stage=stage_name,
+                        root_cause="Remote build/runtime failed due to disk exhaustion (ENOSPC).",
+                        suggested_actions=[
+                            "Free space on /app and /var/lib/docker.",
+                            "Prune old images/build cache and retry.",
+                        ],
+                        failure_category="disk_full",
+                    )
+                    self.disk._log_remote_disk_diagnostics(username, server)
+                    self.disk._print_disk_recovery_guidance(username, server)
+                    kill_cmd = self.ssh.build_ssh_command(username, server, f"kill -9 {pid} >/dev/null 2>&1 || true")
+                    subprocess.run(kill_cmd, capture_output=True, timeout=10)
+                    return False
             if process_status == "FINISHED":
                 log_info(f"{label} process finished")
                 success_cmd = self.ssh.build_ssh_command(username, server, success_check)
@@ -946,6 +1866,26 @@ echo "Caddy proxy started"
                     log_warning(f"{label} failed - check log for details")
                 else:
                     log_error(f"{label} failed - check log for details")
+                # One more scan for ENOSPC markers after process exit.
+                scan_cmd = self.ssh.build_ssh_command(
+                    username,
+                    server,
+                    f"grep -Ei 'no space left on device|failed to extract layer|failed to solve: failed to extract' {shlex.quote(log_file)} >/dev/null && echo ENOSPC || echo OTHER",
+                )
+                scan_result = subprocess.run(scan_cmd, capture_output=True, text=True, timeout=10)
+                if (scan_result.stdout or "").strip() == "ENOSPC":
+                    self._set_failure(
+                        error_code="disk_full",
+                        stage=stage_name,
+                        root_cause="Remote build/runtime failed due to disk exhaustion (ENOSPC).",
+                        suggested_actions=[
+                            "Free space on /app and /var/lib/docker.",
+                            "Prune old images/build cache and retry.",
+                        ],
+                        failure_category="disk_full",
+                    )
+                    self.disk._log_remote_disk_diagnostics(username, server)
+                    self.disk._print_disk_recovery_guidance(username, server)
                 self._log_tail_and_return_false(username, server, log_file, label)
                 return False
             if elapsed % 60 == 0:
@@ -976,8 +1916,8 @@ echo "Build complete"
 """
         return self._run_nohup_remote(
             username, server, script,
-            script_path="/tmp/ilha-build.sh",
-            log_file="/tmp/ilha-build.log",
+            script_path=self._remote_tmp("build.sh"),
+            log_file=self._remote_tmp("build.log"),
             label="Build",
             success_markers=["Build complete", "EXIT_CODE=0"],
             max_wait=1800,
@@ -1000,15 +1940,23 @@ cd {app_root}
 
 docker compose --env-file .env down --remove-orphans 2>&1 || true
 {up_build}
-WEB_CID=$(docker compose --env-file .env ps -q web 2>/dev/null | head -1)
-[ -n "$WEB_CID" ] && docker network connect ilha_caddy_proxy "$WEB_CID" 2>/dev/null || true
+# Retry getting web container and connecting to Caddy network (container may not be listed immediately)
+for i in 1 2 3; do
+  WEB_CID=$(docker compose --env-file .env ps -q web 2>/dev/null | head -1)
+  if [ -n "$WEB_CID" ]; then
+    docker network connect ilha_caddy_proxy "$WEB_CID" 2>/dev/null || true
+    break
+  fi
+  [ $i -lt 3 ] && sleep 5
+done
 echo "Application services started"
 docker compose --env-file .env ps 2>&1
 """
+        log_file = self._remote_tmp("start-app.log")
         ok = self._run_nohup_remote(
             username, server, script,
-            script_path="/tmp/ilha-start-app.sh",
-            log_file="/tmp/ilha-start-app.log",
+            script_path=self._remote_tmp("start-app.sh"),
+            log_file=log_file,
             label="App start",
             success_markers=["EXIT_CODE=0"],
             max_wait=1800,
@@ -1016,19 +1964,33 @@ docker compose --env-file .env ps 2>&1
         )
         if not ok:
             return False
-        # Verify at least one app container is running
-        count_cmd = self.ssh.build_ssh_command(
+        # Verify web service container exists and is running
+        web_cid_cmd = self.ssh.build_ssh_command(
             username, server,
-            f"cd {app_root} && docker compose --env-file .env ps --status running -q 2>/dev/null | wc -l",
+            f"cd {app_root} && docker compose --env-file .env ps -q web 2>/dev/null | head -1",
         )
-        count_result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=10)
-        try:
-            running_count = int((count_result.stdout or "0").strip().split()[0])
-        except (ValueError, IndexError):
-            running_count = 0
-        if running_count < 1:
-            log_error("App start reported success but no app containers are running")
-            self._log_tail_and_return_false(username, server, "/tmp/ilha-start-app.log", "App start")
+        web_cid_result = subprocess.run(web_cid_cmd, capture_output=True, text=True, timeout=10)
+        web_cid = (web_cid_result.stdout or "").strip()
+        if not web_cid:
+            log_error("Web service container not found after start")
+            self._log_tail_and_return_false(username, server, log_file, "App start")
+            return False
+        running_cmd = self.ssh.build_ssh_command(
+            username, server,
+            f"docker inspect --format '{{{{.State.Running}}}}' {shlex.quote(web_cid)} 2>/dev/null",
+        )
+        running_result = subprocess.run(running_cmd, capture_output=True, text=True, timeout=10)
+        if (running_result.stdout or "").strip().lower() != "true":
+            log_error("Web container is not running after start")
+            logs_cmd = self.ssh.build_ssh_command(
+                username, server,
+                f"docker logs --tail 20 {shlex.quote(web_cid)} 2>&1",
+            )
+            logs_result = subprocess.run(logs_cmd, capture_output=True, text=True, timeout=10)
+            for line in (logs_result.stdout or "").splitlines():
+                if line.strip():
+                    log_error(f"  {line}")
+            self._log_tail_and_return_false(username, server, log_file, "App start")
             return False
         log_success("Application services started on server")
         return True
@@ -1037,7 +1999,7 @@ docker compose --env-file .env ps 2>&1
         self, username: str, server: str, log_file: str, label: str
     ) -> None:
         """Log last 30 lines of remote log file (DRY for app start / build failure paths)."""
-        final_cmd = self.ssh.build_ssh_command(username, server, f"tail -n 30 {log_file}")
+        final_cmd = self.ssh.build_ssh_command(username, server, f"tail -n 30 {shlex.quote(log_file)}")
         final_result = subprocess.run(final_cmd, capture_output=True, text=True, timeout=10)
         for line in (final_result.stdout or "").splitlines():
             s = line.strip()
@@ -1111,5 +2073,4 @@ docker compose --env-file .env ps 2>&1
 # ──────────────────────────────────────────────────────────────────────
 def _dir_size_mb(path: Path) -> float:
     """Rough size of a directory in megabytes."""
-    total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-    return total / 1024 / 1024
+    return SlimDeployManager._dir_size_bytes(path) / 1024 / 1024

@@ -8,11 +8,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import click
 
-from ilha.cli.helpers import add_json_option, add_verbose_option
+from ilha.cli.helpers import add_json_option, add_remote_push_options, add_verbose_option
 from ilha.commands.droplets import DropletCommands
 from ilha.commands.push.push_manager import PushManager
 from ilha.utils.json_output import JSONOutput
@@ -61,7 +61,7 @@ def _auto_detect_branch_name(branch_name: Optional[str], json: bool) -> str:
         if branch:
             return branch
     except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+        pass  # expected when not in a git directory; fall through to worktree path detection
 
     current_path = Path.cwd()
     if "worktrees" in str(current_path):
@@ -107,103 +107,93 @@ def _resolve_droplet_name(branch_name: str, domain: Optional[str], json: bool) -
 
 
 def _resolve_host_to_ip(host: str, push_manager, api_token: Optional[str] = None) -> str:
-    """Resolve host (IP, domain, droplet ID, or droplet name) to IP address.
-    
-    DRY: Reuses PushManager._resolve_server_ip() for domain/IP DNS resolution.
-    Only adds new logic for droplet ID/name resolution.
-    
-    Args:
-        host: Host identifier (IP, domain, droplet ID, or droplet name)
-        push_manager: PushManager instance for DNS resolution
-        api_token: Digital Ocean API token for droplet lookup
-        
-    Returns:
-        IP address string
-        
-    Raises:
-        ValueError: If host cannot be resolved as domain, droplet ID, or droplet name
-    """
+    """Resolve host to IP: already-IP, domain (via DO when token present), DNS, or droplet id/name."""
     import re
-    
-    # First try: Check if already an IP address
+
     if re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
         return host
-    
-    # Second try: Use existing PushManager method for domain DNS resolution (reuses existing code!)
+
+    # Domain + token: resolve via DO only (subdomain = droplet name), no DNS fallback
+    if "." in host and api_token:
+        from ilha.core.dns_manager import parse_domain
+        subdomain, _ = parse_domain(host)
+        if subdomain:
+            droplet_commands = DropletCommands()
+            droplet_id, error = droplet_commands._resolve_droplet_identifier(subdomain, api_token)
+            if error:
+                raise ValueError(f"Could not resolve domain '{host}' (droplet name '{subdomain}'): {error}")
+            if droplet_id:
+                provider, _ = droplet_commands._get_provider(api_token)
+                if provider:
+                    droplet = provider.get_droplet(droplet_id)
+                    if droplet and droplet.ip_address:
+                        return droplet.ip_address
+                raise ValueError(f"No droplet or IP for '{subdomain}' (domain '{host}')")
+
+    # DNS (when no token or not domain-like)
     try:
         ip = push_manager._resolve_server_ip(host)
-        # If it resolved successfully to an IP (different from host), return it
         if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip) and ip != host:
             return ip
-        # If it returned the host unchanged (DNS failed), continue to droplet lookup
-        if ip == host:
-            pass  # Fall through to droplet resolution
-        else:
-            # Shouldn't happen, but if we get here, return the result
+        if ip != host:
             return ip
-    except Exception:
-        pass  # Fall through to droplet resolution
-    
-    # Second try: Resolve as droplet ID or name (new logic, but minimal)
+    except Exception as exc:
+        log_warning(f"DNS lookup for '{host}' failed: {exc}")
+
+    # Droplet ID or name
     droplet_commands = DropletCommands()
     droplet_id, error = droplet_commands._resolve_droplet_identifier(host, api_token)
     if error:
-        raise ValueError(f"Could not resolve '{host}' as domain, droplet ID, or droplet name: {error}")
-    
+        raise ValueError(f"Could not resolve '{host}': {error}")
+
     provider, _ = droplet_commands._get_provider(api_token)
     if not provider:
         raise ValueError(f"Failed to create droplet provider: {error}")
-    
+
     droplet = provider.get_droplet(droplet_id)
     if not droplet or not droplet.ip_address:
         raise ValueError(f"Droplet {host} has no IP address")
-    
+
     return droplet.ip_address
 
 
-def _parse_scp_target_or_droplet(arg: str, api_token: Optional[str] = None) -> str:
-    """Parse progressive SCP target patterns and resolve to full SCP target.
-    
+def _parse_rsync_target_or_droplet(arg: str, api_token: Optional[str] = None) -> str:
+    """Parse rsync/connection target patterns and resolve to user@ip:path (used for rsync -e ssh).
+
     Supports:
-    - Full SCP target: `user@host:path` → use as-is
-    - Username + domain: `user@example.com` → resolve domain, construct `user@<ip>:/root`
-    - Domain/IP + path: `example.com:/path` or `192.168.1.100:/path` → construct `root@<ip>:<path>`
-    - Domain/IP only: `example.com` or `192.168.1.100` → construct `root@<ip>:/root`
-    - Droplet ID: `12345678` → resolve to IP, construct `root@<ip>:/root`
-    - Droplet name: `my-app` → resolve to IP, construct `root@<ip>:/root`
-    
-    DRY: Reuses PushManager._resolve_server_ip() for domain/IP resolution.
-    
-    Args:
-        arg: SCP target or droplet identifier
-        api_token: Digital Ocean API token for droplet lookup
-        
-    Returns:
-        Full SCP target string in format user@ip:path
+    - Full target: `user@host:path` → resolve host to IP, return user@ip:path
+    - Username + domain: `user@example.com` → resolve domain, return user@ip:/root
+    - Domain/IP + path: `example.com:/path` or `192.168.1.100:/path` → return root@ip:path
+    - Domain/IP only: `example.com` or `192.168.1.100` → return root@ip:/root
+    - Droplet ID or name → resolve to IP, return root@ip:/root
     """
     from ..commands.push.push_manager import PushManager
-    
-    # Full SCP target format (contains both @ and : with @ before :)
+
+    push_manager = PushManager()
+
+    # Full target format user@host:path — resolve host so we use current droplet IP
     if '@' in arg and ':' in arg:
         at_pos = arg.index('@')
         colon_pos = arg.index(':')
         if at_pos < colon_pos:
-            return arg  # Backward compatible: full SCP target
-    
-    push_manager = PushManager()
-    
-    # Username + domain/IP: `user@example.com` or `user@192.168.1.100`
+            username = arg[:at_pos]
+            host = arg[at_pos + 1:colon_pos]
+            path = arg[colon_pos + 1:]
+            ip = _resolve_host_to_ip(host, push_manager, api_token)
+            return f"{username}@{ip}:{path}"
+
+    # Username + domain/IP: user@example.com or user@192.168.1.100
     if '@' in arg and ':' not in arg:
         username, host = arg.split('@', 1)
         ip = _resolve_host_to_ip(host, push_manager, api_token)
         return f"{username}@{ip}:/root"
-    
-    # Domain/IP + path: `example.com:/path` or `192.168.1.100:/path`
+
+    # Domain/IP + path: example.com:/path or 192.168.1.100:/path
     if ':' in arg and '@' not in arg:
         host, path = arg.rsplit(':', 1)
         ip = _resolve_host_to_ip(host, push_manager, api_token)
         return f"root@{ip}:{path}"
-    
+
     # Just host (domain, IP, droplet ID, or droplet name)
     ip = _resolve_host_to_ip(arg, push_manager, api_token)
     return f"root@{ip}:/root"
@@ -236,6 +226,158 @@ def _log_creation_context(
         log_info(f"  Containers: {containers}")
     if exclude_deps:
         log_info(f"  Exclude Dependencies: {exclude_deps}")
+
+
+def _load_and_merge_config(branch_name, cli_args):
+    """Merge CLI arguments with stored droplet config.
+
+    Priority: CLI argument > stored config value > None.
+    Returns (merged_dict, env_manager, stored_config).
+    """
+    from ..core.environment_manager import EnvironmentManager
+    from ..config.settings import get_project_root
+
+    env_manager = EnvironmentManager(project_root=get_project_root())
+    stored_config = env_manager.get_droplet_config(branch_name or '')
+
+    result = dict(cli_args)
+
+    # String fields: CLI wins if truthy, else stored
+    for key in (
+        'region', 'size', 'image', 'ssh_keys', 'vpc_uuid',
+        'central_droplet_name', 'scp_target', 'containers', 'exclude_deps',
+    ):
+        if not result.get(key):
+            result[key] = stored_config.get(key)
+
+    # Empty-string fields: CLI wins if truthy, else stored or ''
+    for key in ('domain', 'ip', 'dns_token'):
+        if not result.get(key):
+            result[key] = stored_config.get(key) or ''
+
+    # Boolean fields: if CLI is falsy, parse stored string
+    for key in ('keep_package', 'prepare_server', 'resume', 'build', 'debug'):
+        if not result.get(key):
+            stored_val = stored_config.get(key)
+            if stored_val:
+                result[key] = str(stored_val).lower() in ('true', '1', 'yes')
+
+    # output_dir: only override if CLI is at the Click default
+    if result.get('output_dir') == './packages':
+        stored_dir = stored_config.get('output_dir')
+        if stored_dir:
+            result['output_dir'] = stored_dir
+
+    # tags: CLI tuple wins; stored is comma-separated string
+    if not result.get('tags'):
+        stored_tags = stored_config.get('tags')
+        if stored_tags:
+            result['tags'] = tuple(
+                t.strip() for t in stored_tags.split(',') if t.strip()
+            )
+
+    return result, env_manager, stored_config
+
+
+def _attach_deploy_report_data(data: Dict[str, Any], deploy_report: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach shared deploy report metadata to JSON output payloads."""
+    if not deploy_report:
+        return data
+
+    for key in (
+        "disk_check",
+        "failure_category",
+        "source_manifest",
+        "drift_report",
+        "smoke_checks",
+    ):
+        if deploy_report.get(key) is not None:
+            data[key] = deploy_report.get(key)
+    data["recovery_attempted"] = deploy_report.get("recovery_attempted", False)
+    data["recovery_succeeded"] = deploy_report.get("recovery_succeeded", False)
+    data["stage_timings"] = deploy_report.get("stage_timings", {})
+    return data
+
+
+def _resolve_existing_remote_target(
+    branch_name: str,
+    scp_target: Optional[str],
+    domain: Optional[str],
+    ip: Optional[str],
+    api_token: Optional[str],
+    json: bool,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
+    """Resolve stored config + CLI overrides to a concrete rsync/SSH target."""
+    cli_target = scp_target
+    cli_domain = domain or None
+
+    merged, _, stored_config = _load_and_merge_config(
+        branch_name,
+        {
+            "scp_target": scp_target,
+            "domain": domain,
+            "ip": ip,
+            "dns_token": api_token or "",
+        },
+    )
+    scp_target = merged["scp_target"]
+    domain = merged["domain"] or None
+    ip = merged["ip"] or None
+    token = api_token or stored_config.get("dns_token")
+
+    if cli_target:
+        scp_target = cli_target
+        if not json:
+            log_info(f"Using rsync target from command line: {cli_target}")
+    elif cli_domain:
+        scp_target = cli_domain
+        if not json:
+            log_info(f"Using domain from command line: {cli_domain}")
+    elif domain:
+        scp_target = domain
+        if not json:
+            log_info(f"Using domain from config: {domain}")
+    elif ip:
+        scp_target = f"root@{ip}:/root"
+    elif not scp_target:
+        scp_target = stored_config.get("scp_target")
+        if scp_target and not json:
+            log_info(f"Using rsync target from config: {scp_target}")
+
+    if not scp_target:
+        raise ValueError("Rsync target required (--scp-target or --domain or --ip or stored config)")
+
+    resolved = _parse_rsync_target_or_droplet(scp_target, token)
+    if resolved != scp_target and not json:
+        log_info(f"Resolved rsync target: {scp_target} → {resolved}")
+    return resolved, domain, ip, token, stored_config
+
+
+def _print_doctor_report(report: Dict[str, Any]) -> None:
+    print_plain("")
+    print_plain("Doctor report:")
+    if report.get("source_manifest"):
+        manifest = report["source_manifest"]
+        print_plain(f"  Source path: {manifest.get('source_path')}")
+        print_plain(f"  Branch: {manifest.get('branch_name')}")
+        print_plain(f"  Git branch: {manifest.get('git_branch') or 'unknown'}")
+        print_plain(f"  Dirty: {manifest.get('git_dirty')}")
+    print_plain(f"  Smoke path: {report.get('smoke_path')}")
+    print_plain("")
+    for check in report.get("checks", []):
+        title = check.get("title", "check")
+        if check.get("skipped"):
+            print_plain(f"{title}: skipped ({check.get('reason', 'not applicable')})")
+            continue
+        status = "ok" if check.get("success") else "failed"
+        print_plain(f"{title}: {status}")
+        if check.get("stdout"):
+            for line in check["stdout"].splitlines():
+                print_plain(f"  {line}")
+        if check.get("stderr"):
+            for line in check["stderr"].splitlines():
+                print_plain(f"  {line}")
+        print_plain("")
 
 
 def register_commands(cli) -> None:
@@ -275,36 +417,9 @@ def register_commands(cli) -> None:
         help="Only create droplet, do not push environment (default: creates droplet and pushes environment)",
     )
     @click.option("--scp-target", help="SCP target in format username@server:path (optional, defaults to root@<droplet-ip>:/root)")
-    @click.option("--output-dir", type=click.Path(), default="./packages", help="Temporary package location (default: ./packages)")
-    @click.option("--keep-package", is_flag=True, default=False, help="Keep package file after successful push (default: delete after push)")
-    @click.option(
-        "--no-auto-import",
-        is_flag=True,
-        default=False,
-        help="Skip automatic import and start on remote server after push (default: auto-import is enabled)",
-    )
-    @click.option("--prepare-server", is_flag=True, default=False, help="Check remote server for required dependencies before push")
-    @click.option(
-        "--domain",
-        help="Domain override for remote import (subdomain.domain.tld). DNS A record will be automatically created if it does not exist.",
-    )
-    @click.option("--ip", help="IP override for remote import (HTTP-only, no TLS)")
-    @click.option("--dns-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
-    @click.option("--skip-dns-check", is_flag=True, default=False, help="Skip DNS validation and management")
-    @click.option("--resume", is_flag=True, default=False, help="Resume a failed push operation by detecting what's already completed")
-    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server")
-    @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
-    @click.option(
-        "--containers",
-        help="Comma-separated list of worktree.container patterns to push only specific containers and their volumes (e.g., feature-auth.db,feature-auth.redis)",
-    )
-    @click.option(
-        "--exclude-deps",
-        help="Comma-separated list of service names to exclude from dependency resolution (e.g., db,redis). Useful when deploying workers that connect to remote services.",
-    )
     @click.option("--vpc-uuid", help="VPC UUID for the droplet. If not provided, will use the default VPC for the region.")
     @click.option("--central-droplet-name", help="Name of central droplet to reuse VPC UUID from (for worker deployments)")
-    @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates (doesn't count against rate limits)")
+    @add_remote_push_options(include_use_staging_certificates=True)
     @add_json_option
     @add_verbose_option
     def droplet_create(
@@ -345,63 +460,37 @@ def register_commands(cli) -> None:
             if not branch_name:
                 return
             
-            # Load stored droplet config and apply to parameters if not provided via CLI
-            from ..core.environment_manager import EnvironmentManager
-            from ..config.settings import get_project_root
-            
-            env_manager = EnvironmentManager(project_root=get_project_root())
-            stored_config = env_manager.get_droplet_config(branch_name)
-            
-            # Apply stored config values if CLI arguments are not provided
-            # Priority: CLI argument > stored config > global defaults
-            if not region:
-                region = stored_config.get('region')
-            if not size:
-                size = stored_config.get('size')
-            if not image:
-                image = stored_config.get('image')
-            if not ssh_keys:
-                ssh_keys = stored_config.get('ssh_keys')
-            if not tags:
-                stored_tags = stored_config.get('tags')
-                if stored_tags:
-                    tags = tuple(t.strip() for t in stored_tags.split(",") if t.strip())
-            if not vpc_uuid:
-                vpc_uuid = stored_config.get('vpc_uuid')
-            if not central_droplet_name:
-                central_droplet_name = stored_config.get('central_droplet_name')
-            if not scp_target:
-                scp_target = stored_config.get('scp_target')
-            if not domain:
-                domain = stored_config.get('domain') or ''
-            if not ip:
-                ip = stored_config.get('ip') or ''
-            if not dns_token:
-                dns_token = stored_config.get('dns_token') or ''
-            if output_dir == "./packages":  # Only use stored if default value
-                stored_output_dir = stored_config.get('output_dir')
-                if stored_output_dir:
-                    output_dir = stored_output_dir
-            if not keep_package:  # Only use stored if False (default)
-                stored_keep_package = stored_config.get('keep_package')
-                if stored_keep_package:
-                    keep_package = stored_keep_package.lower() in ('true', '1', 'yes')
-            if not prepare_server:  # Only use stored if False (default)
-                stored_prepare_server = stored_config.get('prepare_server')
-                if stored_prepare_server:
-                    prepare_server = stored_prepare_server.lower() in ('true', '1', 'yes')
-            if not resume:  # Only use stored if False (default)
-                stored_resume = stored_config.get('resume')
-                if stored_resume:
-                    resume = stored_resume.lower() in ('true', '1', 'yes')
-            if not build:  # Only use stored if False (default)
-                stored_build = stored_config.get('build')
-                if stored_build:
-                    build = stored_build.lower() in ('true', '1', 'yes')
-            if not containers:
-                containers = stored_config.get('containers')
-            if not exclude_deps:
-                exclude_deps = stored_config.get('exclude_deps')
+            # Load stored droplet config and merge with CLI arguments
+            merged, env_manager, stored_config = _load_and_merge_config(
+                branch_name, {
+                    'region': region, 'size': size, 'image': image,
+                    'ssh_keys': ssh_keys, 'tags': tags, 'vpc_uuid': vpc_uuid,
+                    'central_droplet_name': central_droplet_name,
+                    'scp_target': scp_target, 'domain': domain, 'ip': ip,
+                    'dns_token': dns_token, 'output_dir': output_dir,
+                    'keep_package': keep_package, 'prepare_server': prepare_server,
+                    'resume': resume, 'build': build,
+                    'containers': containers, 'exclude_deps': exclude_deps,
+                },
+            )
+            region = merged['region']
+            size = merged['size']
+            image = merged['image']
+            ssh_keys = merged['ssh_keys']
+            tags = merged.get('tags') or ()
+            vpc_uuid = merged['vpc_uuid']
+            central_droplet_name = merged['central_droplet_name']
+            scp_target = merged['scp_target']
+            domain = merged['domain']
+            ip = merged['ip']
+            dns_token = merged['dns_token']
+            output_dir = merged['output_dir']
+            keep_package = merged['keep_package']
+            prepare_server = merged['prepare_server']
+            resume = merged['resume']
+            build = merged['build']
+            containers = merged['containers']
+            exclude_deps = merged['exclude_deps']
             
             droplet_name = _resolve_droplet_name(branch_name, domain, json)
 
@@ -445,18 +534,24 @@ def register_commands(cli) -> None:
                                 break
                         if central_droplet and central_droplet.vpc_uuid:
                             resolved_vpc_uuid = central_droplet.vpc_uuid
-                            if not json:
-                                log_info(f"Found central droplet '{central_droplet_name}' in region {central_droplet.region}")
-                                if central_droplet.region != resolved_region:
-                                    log_error("❌ Region mismatch detected!")
+                            if central_droplet.region != resolved_region:
+                                msg = (
+                                    f"Region mismatch: central droplet '{central_droplet_name}' "
+                                    f"is in {central_droplet.region}, but worker would be in "
+                                    f"{resolved_region}. Use --region {central_droplet.region}"
+                                )
+                                if json:
+                                    JSONOutput.print_error(msg)
+                                else:
+                                    log_error("Region mismatch detected!")
                                     log_error(f"   Central droplet '{central_droplet_name}' is in region: {central_droplet.region}")
                                     log_error(f"   Worker droplet would be created in region: {resolved_region}")
                                     log_error("   VPCs are region-specific and cannot span regions.")
                                     log_error(f"   Please use --region {central_droplet.region} to match the central droplet's region.")
-                                    if json_requested:
-                                        return {"success": False, "error": f"Region mismatch: central droplet in {central_droplet.region}, requested region {resolved_region}"}
-                                    else:
-                                        sys.exit(1)
+                                    error_exit(msg)
+                                return
+                            if not json:
+                                log_info(f"Found central droplet '{central_droplet_name}' in region {central_droplet.region}")
                                 log_info(f"Using VPC UUID from central droplet: {resolved_vpc_uuid}")
                                 if central_droplet.private_ip_address:
                                     log_info(f"Central droplet private IP: {central_droplet.private_ip_address}")
@@ -904,7 +999,7 @@ def register_commands(cli) -> None:
 
             if failure_count > 0:
                 if json and suppress_json:
-                    sys.exit(1)
+                    raise SystemExit(1)
                 elif not json:
                     error_exit(f"Failed to destroy {failure_count} of {total} droplet(s)")
         except Exception as exc:
@@ -941,51 +1036,13 @@ def register_commands(cli) -> None:
 
     @droplet.command("push")
     @click.argument("branch_name", required=False)
-    @click.argument("scp_target", required=False)
-    @click.option("--output-dir", type=click.Path(), default="./packages", help="Temporary package location (default: ./packages)")
-    @click.option("--keep-package", is_flag=True, default=False, help="Keep package file after successful push (default: delete after push)")
-    @click.option(
-        "--no-auto-import",
-        is_flag=True,
-        default=False,
-        help="Skip automatic import and start on remote server after push (default: auto-import is enabled)",
-    )
-    @click.option("--prepare-server", is_flag=True, default=False, help="Check remote server for required dependencies before push")
-    @click.option(
-        "--domain",
-        help="Domain override for remote import (subdomain.domain.tld). DNS A record will be automatically created if it does not exist.",
-    )
-    @click.option("--ip", help="IP override for remote import (HTTP-only, no TLS)")
-    @click.option("--dns-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
-    @click.option("--skip-dns-check", is_flag=True, default=False, help="Skip DNS validation and management")
-    @click.option(
-        "--resume",
-        is_flag=True,
-        default=False,
-        help="Resume a failed push operation by detecting what's already completed (skips export/transfer if package exists, skips server prep if already done)",
-    )
-    @click.option("--code-only", is_flag=True, default=False, help="[NOT IMPLEMENTED] Push code-only update to pre-existing server (uses stored push config from env.ilha if available)")
-    @click.option("--build", is_flag=True, default=False, help="Rebuild Docker images on the remote server after deployment")
-    @click.option(
-        "--debug",
-        is_flag=True,
-        default=False,
-        help="Enable DEBUG mode in production deployment (default: False for production)"
-    )
-    @click.option(
-        "--containers",
-        help="Comma-separated list of worktree.container patterns to push only specific containers and their volumes (e.g., feature-auth.db,feature-auth.redis)",
-    )
-    @click.option(
-        "--exclude-deps",
-        help="Comma-separated list of service names to exclude from dependency resolution (e.g., db,redis). Useful when deploying workers that connect to remote services.",
-    )
-    @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates (doesn't count against rate limits)")
+    @click.argument("target", required=False)
+    @add_remote_push_options(include_debug=True, include_use_staging_certificates=True)
     @add_json_option
     @add_verbose_option
     def droplet_push(
         branch_name: Optional[str],
-        scp_target: Optional[str],
+        target: Optional[str],
         output_dir: str,
         keep_package: bool,
         no_auto_import: bool,
@@ -1008,51 +1065,32 @@ def register_commands(cli) -> None:
             check_setup_or_prompt()
             check_prerequisites()
             
-            # Load stored droplet config and apply to parameters if not provided via CLI
-            from ..core.environment_manager import EnvironmentManager
-            from ..config.settings import get_project_root
-            
-            env_manager = EnvironmentManager(project_root=get_project_root())
-            stored_config = env_manager.get_droplet_config(branch_name or '')
-            
-            # Apply stored config values if CLI arguments are not provided
-            # Priority: CLI argument > stored config > default
-            if not scp_target:
-                scp_target = stored_config.get('scp_target')
-            if not domain:
-                domain = stored_config.get('domain') or ''
-            if not ip:
-                ip = stored_config.get('ip') or ''
-            if not dns_token:
-                dns_token = stored_config.get('dns_token') or ''
-            if output_dir == "./packages":  # Only use stored if default value
-                stored_output_dir = stored_config.get('output_dir')
-                if stored_output_dir:
-                    output_dir = stored_output_dir
-            if not keep_package:  # Only use stored if False (default)
-                stored_keep_package = stored_config.get('keep_package')
-                if stored_keep_package:
-                    keep_package = stored_keep_package.lower() in ('true', '1', 'yes')
-            if not prepare_server:  # Only use stored if False (default)
-                stored_prepare_server = stored_config.get('prepare_server')
-                if stored_prepare_server:
-                    prepare_server = stored_prepare_server.lower() in ('true', '1', 'yes')
-            if not resume:  # Only use stored if False (default)
-                stored_resume = stored_config.get('resume')
-                if stored_resume:
-                    resume = stored_resume.lower() in ('true', '1', 'yes')
-            if not build:  # Only use stored if False (default)
-                stored_build = stored_config.get('build')
-                if stored_build:
-                    build = stored_build.lower() in ('true', '1', 'yes')
-            if not debug:  # Only use stored if False (default)
-                stored_debug = stored_config.get('debug')
-                if stored_debug:
-                    debug = stored_debug.lower() in ('true', '1', 'yes')
-            if not containers:
-                containers = stored_config.get('containers')
-            if not exclude_deps:
-                exclude_deps = stored_config.get('exclude_deps')
+            # CLI always wins over env file for rsync/connection target
+            cli_target = target
+            cli_domain = domain or None  # treat '' as not provided
+
+            # Load stored droplet config and merge with CLI arguments
+            merged, env_manager, stored_config = _load_and_merge_config(
+                branch_name, {
+                    'scp_target': target, 'domain': domain, 'ip': ip,
+                    'dns_token': dns_token, 'output_dir': output_dir,
+                    'keep_package': keep_package, 'prepare_server': prepare_server,
+                    'resume': resume, 'build': build, 'debug': debug,
+                    'containers': containers, 'exclude_deps': exclude_deps,
+                },
+            )
+            target = merged['scp_target']
+            domain = merged['domain']
+            ip = merged['ip']
+            dns_token = merged['dns_token']
+            output_dir = merged['output_dir']
+            keep_package = merged['keep_package']
+            prepare_server = merged['prepare_server']
+            resume = merged['resume']
+            build = merged['build']
+            debug = merged['debug']
+            containers = merged['containers']
+            exclude_deps = merged['exclude_deps']
             
             if domain and ip:
                 elapsed_time = time.time() - start_time
@@ -1064,36 +1102,40 @@ def register_commands(cli) -> None:
                     error_exit("Options --domain and --ip are mutually exclusive")
                 return
             
-            # Infer scp_target from domain or stored config if not explicitly provided
-            if not scp_target and not code_only:
-                # Priority 1: Use domain option if provided
-                if domain:
-                    scp_target = domain
-                    if not json:
-                        log_info(f"Inferred SCP target from domain: {domain}")
-                elif stored_config.get('scp_target'):
-                    scp_target = stored_config.get('scp_target')
-                    if not json:
-                        log_info(f"Using stored SCP target from config: {scp_target}")
-            
-            if not code_only and not scp_target:
+            # Rsync/connection target: CLI target > CLI domain > stored domain > stored target (always set when we have a value; --code-only does not skip this)
+            if cli_target:
+                target = cli_target
+                if not json:
+                    log_info(f"Using rsync target from command line: {cli_target}")
+            elif cli_domain:
+                target = cli_domain
+                if not json:
+                    log_info(f"Using domain from command line: {cli_domain}")
+            elif domain:
+                target = domain
+                if not json:
+                    log_info(f"Using domain from config: {domain}")
+            elif not target:
+                target = stored_config.get('scp_target')
+                if target and not json:
+                    log_info(f"Using rsync target from config: {target}")
+
+            if not code_only and not target:
                 elapsed_time = time.time() - start_time
                 if not json:
                     print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
                 if json:
-                    JSONOutput.print_error("scp_target is required")
+                    JSONOutput.print_error("Rsync target (or --domain) is required")
                 else:
-                    error_exit("scp_target is required")
+                    error_exit("Rsync target (or --domain) is required")
                 return
-            
-            # Parse and resolve SCP target (supports progressive patterns)
-            # This ensures resolved IP is used for DNS management (fixes domain setup issue)
+
+            # Resolve rsync target (domain, IP, or droplet id/name) to user@ip:path
             try:
-                # api_token is not in scope for this command; use the provided DNS token
-                resolved_scp_target = _parse_scp_target_or_droplet(scp_target, dns_token)
-                if resolved_scp_target != scp_target and not json:
-                    log_info(f"Resolved SCP target: {scp_target} → {resolved_scp_target}")
-                scp_target = resolved_scp_target
+                resolved = _parse_rsync_target_or_droplet(target, dns_token)
+                if resolved != target and not json:
+                    log_info(f"Resolved rsync target: {target} → {resolved}")
+                rsync_target = resolved
             except ValueError as e:
                 elapsed_time = time.time() - start_time
                 if not json:
@@ -1108,16 +1150,16 @@ def register_commands(cli) -> None:
                 if not json:
                     print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
                 if json:
-                    JSONOutput.print_error(f"Error resolving SCP target: {e}")
+                    JSONOutput.print_error(f"Error resolving rsync target: {e}")
                 else:
-                    error_exit(f"Error resolving SCP target: {e}")
+                    error_exit(f"Error resolving rsync target: {e}")
                 return
             
             push_manager = PushManager()
             exclude_deps_list = [d.strip() for d in exclude_deps.split(",")] if exclude_deps else None
             success = push_manager.push_package(
                 branch_name=branch_name,
-                scp_target=scp_target,
+                scp_target=rsync_target,
                 output_dir=Path(output_dir),
                 keep_package=keep_package,
                 auto_import=not no_auto_import,
@@ -1149,9 +1191,9 @@ def register_commands(cli) -> None:
                 else:
                     error_exit("Failed to push package")
             else:
-                # Save droplet configuration for future use
+                # Save droplet configuration for future use (stored key remains scp_target for compatibility)
                 config_to_save = {
-                    'scp_target': scp_target,
+                    'scp_target': rsync_target,
                     'domain': domain if domain else None,
                     'ip': ip if ip else None,
                     'dns_token': dns_token if dns_token else None,
@@ -1202,6 +1244,24 @@ def register_commands(cli) -> None:
     @click.option("--vpc-uuid", help="VPC UUID for the droplet")
     @click.option("--central-droplet-name", help="Reuse VPC UUID from central droplet")
     @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
+    @click.option(
+        "--disk-recovery",
+        type=click.Choice(["off", "safe", "aggressive"], case_sensitive=False),
+        default="safe",
+        show_default=True,
+        help="Disk recovery mode if remote disk fills during deploy",
+    )
+    @click.option("--retry-on-disk-reclaim", is_flag=True, default=False, help="Retry deploy once after successful disk recovery")
+    @click.option("--deployignore", type=click.Path(path_type=Path), help="Path to deploy ignore file (defaults to .ilha/deployignore in worktree)")
+    @click.option("--no-disk-check", is_flag=True, default=False, help="Skip remote disk preflight checks")
+    @click.option("--skip-volume-backup", is_flag=True, default=False, help="Skip local volume backup for faster stateless deploys")
+    @click.option(
+        "--strict-deploy-drift",
+        is_flag=True,
+        default=False,
+        help="Fail deploy when critical files differ between comparison root and worktree, even across different commits",
+    )
+    @click.option("--smoke-timeout", type=int, default=60, help="Timeout in seconds for post-deploy smoke checks (default: 60)")
     @add_json_option
     @add_verbose_option
     def droplet_deploy(
@@ -1225,6 +1285,13 @@ def register_commands(cli) -> None:
         vpc_uuid: Optional[str],
         central_droplet_name: Optional[str],
         use_staging_certificates: bool,
+        disk_recovery: str,
+        retry_on_disk_reclaim: bool,
+        deployignore: Optional[Path],
+        no_disk_check: bool,
+        skip_volume_backup: bool,
+        strict_deploy_drift: bool,
+        smoke_timeout: int,
         json: bool,
     ):
         """Deploy a worktree to a DigitalOcean droplet (slim mode).
@@ -1242,6 +1309,7 @@ def register_commands(cli) -> None:
         from ilha.core.droplet_manager import DropletManager
 
         start_time = time.time()
+        deploy_report: Dict[str, Any] = {}
         try:
             # Validate mutually exclusive flags
             if domain and ip:
@@ -1263,6 +1331,7 @@ def register_commands(cli) -> None:
                 return
 
             check_prerequisites_no_git()
+            effective_token = api_token or dns_token
 
             # ── Droplet creation (unless --no-create) ────────────────
             droplet_info = None
@@ -1282,7 +1351,7 @@ def register_commands(cli) -> None:
 
                 # Resolve VPC UUID from central droplet if requested
                 resolved_vpc_uuid = vpc_uuid
-                token = DropletManager.resolve_droplet_token(api_token or dns_token)
+                token = DropletManager.resolve_droplet_token(effective_token)
                 provider = None
                 if token:
                     provider = DropletManager.create_provider("digitalocean", token)
@@ -1304,7 +1373,7 @@ def register_commands(cli) -> None:
                 ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else None
                 tags_list = list(tags) if tags else None
 
-                success = droplet_commands.create_droplet(
+                created_droplet = droplet_commands.create_droplet(
                     name=droplet_name,
                     region=resolved_region,
                     size=resolved_size,
@@ -1312,32 +1381,23 @@ def register_commands(cli) -> None:
                     ssh_keys=ssh_keys_list,
                     tags=tags_list,
                     wait=True,
-                    api_token=api_token,
+                    api_token=effective_token,
                     json=json,
                     vpc_uuid=resolved_vpc_uuid,
+                    return_droplet=True,
                 )
-                if not success:
+                if not created_droplet:
                     _print_elapsed(start_time, json)
                     if json:
                         JSONOutput.print_error(f"Failed to create droplet: {droplet_name}")
                     else:
                         error_exit(f"Failed to create droplet: {droplet_name}")
                     return
+                droplet_info = created_droplet
 
                 if create_only:
                     _print_elapsed(start_time, json)
                     return
-
-                # Refresh droplet info to get IP
-                if not provider:
-                    token = DropletManager.resolve_droplet_token(api_token or dns_token)
-                    if token:
-                        provider = DropletManager.create_provider("digitalocean", token)
-                if provider:
-                    for d in provider.list_droplets():
-                        if d.name == droplet_name:
-                            droplet_info = d
-                            break
 
                 if not droplet_info or not droplet_info.ip_address:
                     _print_elapsed(start_time, json)
@@ -1363,7 +1423,7 @@ def register_commands(cli) -> None:
                 # --no-create: need an explicit scp_target or domain/ip
                 if not scp_target:
                     if domain:
-                        scp_target = _parse_scp_target_or_droplet(domain, api_token)
+                        scp_target = _parse_rsync_target_or_droplet(domain, effective_token)
                     elif ip:
                         scp_target = f"root@{ip}:/root"
                     else:
@@ -1375,7 +1435,7 @@ def register_commands(cli) -> None:
                         return
                 else:
                     try:
-                        scp_target = _parse_scp_target_or_droplet(scp_target, api_token)
+                        scp_target = _parse_rsync_target_or_droplet(scp_target, effective_token)
                     except ValueError as exc:
                         _print_elapsed(start_time, json)
                         if json:
@@ -1403,7 +1463,15 @@ def register_commands(cli) -> None:
                     debug=debug,
                     droplet_info=droplet_info,
                     use_staging_certificates=use_staging_certificates,
+                    disk_recovery=disk_recovery.lower(),
+                    retry_on_disk_reclaim=retry_on_disk_reclaim,
+                    deployignore=str(deployignore) if deployignore else None,
+                    no_disk_check=no_disk_check,
+                    skip_volume_backup=skip_volume_backup,
+                    strict_deploy_drift=strict_deploy_drift,
+                    smoke_timeout=smoke_timeout,
                 )
+                deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
                 deploy_mgr.cleanup()
 
@@ -1411,7 +1479,18 @@ def register_commands(cli) -> None:
 
             if not success:
                 if json:
-                    JSONOutput.print_error("Slim deploy failed")
+                    JSONOutput.print_json(
+                        JSONOutput.error(
+                            "Slim deploy failed",
+                            error_code=(deploy_report.get("error") or {}).get("error_code"),
+                            details={
+                                "stage": (deploy_report.get("error") or {}).get("stage"),
+                                "root_cause": (deploy_report.get("error") or {}).get("root_cause"),
+                                "suggested_actions": (deploy_report.get("error") or {}).get("suggested_actions", []),
+                                **_attach_deploy_report_data({}, deploy_report),
+                            },
+                        )
+                    )
                 else:
                     error_exit("Slim deploy failed")
             else:
@@ -1429,7 +1508,8 @@ def register_commands(cli) -> None:
                         data["url"] = url
                     if droplet_info:
                         data["ip_address"] = droplet_info.ip_address
-                    JSONOutput.print_success("Slim deploy completed", data=data)
+                    data = _attach_deploy_report_data(data, deploy_report)
+                    JSONOutput.print_json(JSONOutput.success("Slim deploy completed", data=data))
                 else:
                     if url:
                         log_success(f"🌐 {url}")
@@ -1437,7 +1517,13 @@ def register_commands(cli) -> None:
         except Exception as exc:
             _print_elapsed(start_time, json)
             if json:
-                JSONOutput.print_error(f"Deploy error: {exc}")
+                JSONOutput.print_json(
+                    JSONOutput.error(
+                        f"Deploy error: {exc}",
+                        error_code="deploy_exception",
+                        details=_attach_deploy_report_data({}, deploy_report),
+                    )
+                )
             else:
                 error_exit(f"Deploy error: {exc}")
 
@@ -1484,6 +1570,7 @@ def register_commands(cli) -> None:
         from ilha.commands.push.slim_deploy_manager import SlimDeployManager
 
         start_time = time.time()
+        deploy_report: Dict[str, Any] = {}
         try:
             if domain and ip:
                 _print_elapsed(start_time, json)
@@ -1513,37 +1600,15 @@ def register_commands(cli) -> None:
 
             check_prerequisites_no_git()
 
-            from ilha.core.environment_manager import EnvironmentManager
-            from ilha.config.settings import get_project_root
-
-            env_manager = EnvironmentManager(project_root=get_project_root())
-            stored_config = env_manager.get_droplet_config(branch_name)
-
-            if not scp_target:
-                scp_target = stored_config.get("scp_target")
-            if not domain:
-                domain = stored_config.get("domain") or ""
-            if not ip:
-                ip = stored_config.get("ip") or ""
-
-            if not scp_target:
-                if domain:
-                    scp_target = domain
-                elif ip:
-                    scp_target = f"root@{ip}:/root"
-            if not scp_target:
-                _print_elapsed(start_time, json)
-                if json:
-                    JSONOutput.print_error("scp_target is required (provide --scp-target or --domain/--ip, or use stored config)")
-                else:
-                    error_exit("scp_target is required (provide --scp-target or --domain/--ip, or use stored config)")
-                return
-
             try:
-                resolved = _parse_scp_target_or_droplet(scp_target, api_token)
-                if resolved != scp_target and not json:
-                    log_info(f"Resolved SCP target: {scp_target} → {resolved}")
-                scp_target = resolved
+                scp_target, domain, ip, _, _ = _resolve_existing_remote_target(
+                    branch_name=branch_name,
+                    scp_target=scp_target,
+                    domain=domain,
+                    ip=ip,
+                    api_token=api_token,
+                    json=json,
+                )
             except ValueError as exc:
                 _print_elapsed(start_time, json)
                 if json:
@@ -1554,9 +1619,9 @@ def register_commands(cli) -> None:
             except Exception as exc:
                 _print_elapsed(start_time, json)
                 if json:
-                    JSONOutput.print_error(f"Error resolving SCP target: {exc}")
+                    JSONOutput.print_error(f"Error resolving rsync target: {exc}")
                 else:
-                    error_exit(f"Error resolving SCP target: {exc}")
+                    error_exit(f"Error resolving rsync target: {exc}")
                 return
 
             deploy_mgr = SlimDeployManager()
@@ -1572,13 +1637,25 @@ def register_commands(cli) -> None:
                     code_only=code_only,
                     db_only=db_only,
                 )
+                deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
                 deploy_mgr.cleanup()
 
             _print_elapsed(start_time, json)
             if not success:
                 if json:
-                    JSONOutput.print_error("Slim put failed")
+                    JSONOutput.print_json(
+                        JSONOutput.error(
+                            "Slim put failed",
+                            error_code=(deploy_report.get("error") or {}).get("error_code"),
+                            details={
+                                "stage": (deploy_report.get("error") or {}).get("stage"),
+                                "root_cause": (deploy_report.get("error") or {}).get("root_cause"),
+                                "suggested_actions": (deploy_report.get("error") or {}).get("suggested_actions", []),
+                                **_attach_deploy_report_data({}, deploy_report),
+                            },
+                        )
+                    )
                 else:
                     error_exit("Slim put failed")
             elif json:
@@ -1587,18 +1664,94 @@ def register_commands(cli) -> None:
                     data["url"] = f"https://{domain}"
                 elif ip:
                     data["url"] = f"http://{ip}"
-                JSONOutput.print_success("Slim put completed", data=data)
+                data = _attach_deploy_report_data(data, deploy_report)
+                JSONOutput.print_json(JSONOutput.success("Slim put completed", data=data))
 
         except Exception as exc:
             _print_elapsed(start_time, json)
             if json:
-                JSONOutput.print_error(f"Put error: {exc}")
+                JSONOutput.print_json(
+                    JSONOutput.error(
+                        f"Put error: {exc}",
+                        error_code="put_exception",
+                        details=_attach_deploy_report_data({}, deploy_report),
+                    )
+                )
             else:
                 error_exit(f"Put error: {exc}")
+
+    @droplet.command("doctor")
+    @click.argument("branch_name", required=False)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment (e.g., beta.example.com)")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_json_option
+    @add_verbose_option
+    def droplet_doctor(
+        branch_name: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+        json: bool,
+    ):
+        """Collect read-only diagnostics for an existing slim deploy target."""
+        from ilha.commands.push.slim_deploy_manager import SlimDeployManager
+
+        if domain and ip:
+            if json:
+                JSONOutput.print_error("--domain and --ip are mutually exclusive")
+            else:
+                error_exit("--domain and --ip are mutually exclusive")
+            return
+
+        branch_name = _auto_detect_branch_name(branch_name, json)
+        if not branch_name:
+            return
+
+        check_prerequisites_no_git()
+
+        try:
+            scp_target, domain, ip, _, _ = _resolve_existing_remote_target(
+                branch_name=branch_name,
+                scp_target=scp_target,
+                domain=domain,
+                ip=ip,
+                api_token=api_token,
+                json=json,
+            )
+        except ValueError as exc:
+            if json:
+                JSONOutput.print_error(str(exc))
+            else:
+                error_exit(str(exc))
+            return
+        except Exception as exc:
+            if json:
+                JSONOutput.print_error(f"Error resolving rsync target: {exc}")
+            else:
+                error_exit(f"Error resolving rsync target: {exc}")
+            return
+
+        deploy_mgr = SlimDeployManager()
+        try:
+            report = deploy_mgr.doctor(
+                branch_name=branch_name,
+                scp_target=scp_target,
+                domain=domain or None,
+                ip=ip or None,
+            )
+        finally:
+            deploy_mgr.cleanup()
+
+        if json:
+            JSONOutput.print_json(JSONOutput.success("Doctor report collected", data=report))
+        else:
+            _print_doctor_report(report)
 
 
 def _print_elapsed(start_time: float, json: bool) -> None:
     elapsed = time.time() - start_time
     if not json:
         print_plain(f"Total elapsed time: {format_elapsed_time(elapsed)}")
-

@@ -5,11 +5,12 @@ This module provides commands for managing Digital Ocean droplets including
 creating, listing, and destroying droplets.
 """
 
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Union
 from ..core.droplet_manager import DropletManager, DropletProvider, DropletInfo
 from ..core.dns_manager import DNSManager
 from ..core import dns_providers  # noqa: F401 - Import to trigger registration
-from ..utils.logging import log_info, log_success, log_warning, log_error, print_plain
+from ..core.dns_providers.digitalocean import DigitalOceanProvider
+from ..utils.logging import log_info, log_success, log_warning, log_error, log_step, print_plain
 from ..utils.confirmation import confirm_action, confirm_by_typing_name
 from ..utils.json_output import JSONOutput
 from rich.table import Table
@@ -179,7 +180,8 @@ class DropletCommands:
                       tags: Optional[List[str]] = None,
                       wait: bool = False, api_token: Optional[str] = None,
                       json: bool = False, containers: Optional[str] = None,
-                      vpc_uuid: Optional[str] = None) -> bool:
+                      vpc_uuid: Optional[str] = None,
+                      return_droplet: bool = False) -> Union[bool, Optional[DropletInfo]]:
         """Create a new droplet.
         
         Args:
@@ -196,7 +198,8 @@ class DropletCommands:
                        for selective container/volume deployment (stored for future use)
             
         Returns:
-            True if successful, False otherwise
+            True if successful, False otherwise. If return_droplet=True,
+            returns DropletInfo on success and None on failure.
         """
         try:
             # Resolve API token
@@ -224,10 +227,10 @@ class DropletCommands:
                     JSONOutput.print_error("Failed to create droplet provider")
                 else:
                     log_error("Failed to create droplet provider")
-                return False
+                return None if return_droplet else False
             
             if not json:
-                log_info(f"Creating droplet: {name}")
+                log_step(f"Creating droplet {name}")
                 log_info(f"  Region: {region}")
                 log_info(f"  Size: {size}")
                 log_info(f"  Image: {image}")
@@ -252,12 +255,12 @@ class DropletCommands:
                     JSONOutput.print_error("Failed to create droplet")
                 else:
                     log_error("Failed to create droplet")
-                return False
+                return None if return_droplet else False
             
             # Wait for droplet to be ready if requested
             if wait:
                 if not json:
-                    log_info("Waiting for droplet to be ready...")
+                    log_step("Waiting for droplet to be ready")
                 if not provider.wait_for_droplet_ready(droplet.id):
                     if json:
                         JSONOutput.print_error("Droplet created but not ready within timeout")
@@ -302,6 +305,8 @@ class DropletCommands:
                 if droplet.tags:
                     print_plain(f"  Tags: {', '.join(droplet.tags)}")
             
+            if return_droplet:
+                return droplet
             return True
             
         except Exception as e:
@@ -309,7 +314,7 @@ class DropletCommands:
                 JSONOutput.print_error(f"Error creating droplet: {e}")
             else:
                 log_error(f"Error creating droplet: {e}")
-            return False
+            return None if return_droplet else False
     
     def list_droplets(self, api_token: Optional[str] = None, json: bool = False, csv: bool = False) -> bool:
         """List all droplets.
@@ -343,26 +348,30 @@ class DropletCommands:
             
             # List droplets
             droplets = provider.list_droplets()
-            
-            # Lookup domains for each droplet with an IP address
+            # Lookup domains for each droplet: precompute all A records by IP once (O(domains) API calls)
+            # instead of per-droplet find_dns_records_by_ip (O(droplets * domains) calls).
             droplet_domains = {}
-            for droplet in droplets:
-                if droplet.ip_address:
-                    try:
-                        # Find DNS records pointing to this IP
-                        dns_records = provider.find_dns_records_by_ip(droplet.ip_address)
-                        if dns_records:
-                            # Format as full domain names (subdomain.domain)
-                            domains = [f"{subdomain}.{domain}" for subdomain, domain, _ in dns_records]
-                            droplet_domains[droplet.id] = domains
-                        else:
-                            droplet_domains[droplet.id] = []
-                    except Exception:
-                        # If DNS lookup fails, just skip domain for this droplet
+            if isinstance(provider, DigitalOceanProvider):
+                all_by_ip = provider.get_all_dns_a_records_by_ip()
+                for droplet in droplets:
+                    if droplet.ip_address:
+                        dns_records = all_by_ip.get(droplet.ip_address, [])
+                        droplet_domains[droplet.id] = [f"{s}.{d}" for s, d, _ in dns_records]
+                    else:
                         droplet_domains[droplet.id] = []
-                else:
-                    droplet_domains[droplet.id] = []
-            
+            else:
+                for droplet in droplets:
+                    if droplet.ip_address:
+                        try:
+                            dns_records = provider.find_dns_records_by_ip(droplet.ip_address)
+                            if dns_records:
+                                droplet_domains[droplet.id] = [f"{subdomain}.{domain}" for subdomain, domain, _ in dns_records]
+                            else:
+                                droplet_domains[droplet.id] = []
+                        except Exception:
+                            droplet_domains[droplet.id] = []
+                    else:
+                        droplet_domains[droplet.id] = []
             if csv:
                 # Output as CSV
                 import csv
@@ -560,7 +569,7 @@ class DropletCommands:
             
             # Destroy droplet
             if not json:
-                log_info(f"Destroying droplet: {droplet.name} (ID: {droplet_id})")
+                log_step(f"Destroying droplet {droplet.name} (ID: {droplet_id})")
             
             success = provider.destroy_droplet(droplet_id)
             
@@ -1109,4 +1118,3 @@ class DropletCommands:
             else:
                 log_error(f"Error listing regions: {e}")
             return False
-
