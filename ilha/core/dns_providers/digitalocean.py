@@ -8,6 +8,7 @@ API Documentation: https://docs.digitalocean.com/reference/api/api-reference/#ta
 import requests
 import time
 import socket
+import random
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 from ..dns_manager import DNSProvider
@@ -19,6 +20,8 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
     """Digital Ocean DNS and Droplet provider implementation."""
     
     API_BASE_URL = "https://api.digitalocean.com/v2"
+    _RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    _MAX_REQUEST_ATTEMPTS = 5
     
     def __init__(self, api_token: str):
         """Initialize Digital Ocean provider.
@@ -45,21 +48,80 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             Response object or None if failed
         """
         url = f"{self.API_BASE_URL}{endpoint}"
-        try:
-            response = self.session.request(method, url, timeout=10, **kwargs)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                log_error("Digital Ocean API authentication failed. Check your API token.")
-            elif e.response.status_code == 404:
-                log_warning(f"Domain not found: {endpoint}")
-            else:
-                log_error(f"Digital Ocean API error: {e.response.status_code} - {e.response.text}")
-            return None
-        except requests.exceptions.RequestException as e:
-            log_error(f"Digital Ocean API request failed: {e}")
-            return None
+        timeout = kwargs.pop("timeout", 10)
+        for attempt in range(1, self._MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                response = self.session.request(method, url, timeout=timeout, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                if attempt >= self._MAX_REQUEST_ATTEMPTS:
+                    log_error(f"Digital Ocean API request failed: {exc}")
+                    return None
+                delay = self._retry_delay(attempt)
+                log_warning(f"Digital Ocean request error ({exc}); retrying in {delay:.1f}s [{attempt}/{self._MAX_REQUEST_ATTEMPTS}]")
+                time.sleep(delay)
+                continue
+
+            status = response.status_code
+            if status in self._RETRIABLE_STATUS_CODES:
+                if attempt >= self._MAX_REQUEST_ATTEMPTS:
+                    log_error(f"Digital Ocean API error: {status} - {response.text}")
+                    return None
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = max(1.0, float(retry_after))
+                else:
+                    delay = self._retry_delay(attempt)
+                log_warning(
+                    f"Digital Ocean API returned {status} for {endpoint}; "
+                    f"retrying in {delay:.1f}s [{attempt}/{self._MAX_REQUEST_ATTEMPTS}]"
+                )
+                time.sleep(delay)
+                continue
+
+            try:
+                response.raise_for_status()
+                return response
+            except requests.exceptions.HTTPError:
+                if status == 401:
+                    log_error("Digital Ocean API authentication failed. Check your API token.")
+                elif status == 404:
+                    log_warning(f"Digital Ocean resource not found: {endpoint}")
+                else:
+                    log_error(f"Digital Ocean API error: {status} - {response.text}")
+                return None
+        return None
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        base = min(2 ** (attempt - 1), 16)
+        jitter = random.uniform(0.0, 0.35 * base)
+        return base + jitter
+
+    def _collect_paginated(self, endpoint: str, key: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        page = 1
+        per_page = 200
+        while True:
+            sep = "&" if "?" in endpoint else "?"
+            response = self._make_request("GET", f"{endpoint}{sep}page={page}&per_page={per_page}")
+            if not response:
+                break
+            try:
+                data = response.json()
+                batch = data.get(key, [])
+            except (ValueError, KeyError):
+                break
+            if not batch:
+                break
+            items.extend(batch)
+            pages = (data.get("links") or {}).get("pages") or {}
+            if not pages.get("next"):
+                break
+            page += 1
+        return items
+
+    def _list_domain_records(self, domain: str) -> List[Dict[str, Any]]:
+        return self._collect_paginated(f"/domains/{domain}/records", "domain_records")
     
     def check_domain_exists(self, subdomain: str, domain: str) -> Tuple[bool, Optional[str]]:
         """Check if subdomain exists and return current IP if any.
@@ -71,27 +133,17 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             Tuple of (exists, current_ip). current_ip is None if doesn't exist.
         """
-        response = self._make_request('GET', f'/domains/{domain}/records')
-        if not response:
+        records = self._list_domain_records(domain)
+        if not records:
             return False, None
-        
-        try:
-            data = response.json()
-            records = data.get('domain_records', [])
-            
-            full_name = f"{subdomain}.{domain}" if subdomain else domain
-            
-            for record in records:
-                if record.get('type') == 'A' and record.get('name') == subdomain:
-                    ip = record.get('data')
-                    log_info(f"Found existing A record for {full_name}: {ip}")
-                    return True, ip
-            
-            log_info(f"No A record found for {full_name}")
-            return False, None
-        except (KeyError, ValueError) as e:
-            log_warning(f"Error parsing Digital Ocean API response: {e}")
-            return False, None
+        full_name = f"{subdomain}.{domain}" if subdomain else domain
+        for record in records:
+            if record.get('type') == 'A' and record.get('name') == subdomain:
+                ip = record.get('data')
+                log_info(f"Found existing A record for {full_name}: {ip}")
+                return True, ip
+        log_info(f"No A record found for {full_name}")
+        return False, None
     
     def create_subdomain(self, subdomain: str, domain: str, ip: str) -> bool:
         """Create A record for subdomain pointing to IP.
@@ -127,23 +179,14 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             List of subdomain names
         """
-        response = self._make_request('GET', f'/domains/{domain}/records')
-        if not response:
+        records = self._list_domain_records(domain)
+        if not records:
             return []
-        
-        try:
-            data = response.json()
-            records = data.get('domain_records', [])
-            
-            subdomains = []
-            for record in records:
-                if record.get('type') == 'A' and record.get('name'):
-                    subdomains.append(record.get('name'))
-            
-            return subdomains
-        except (KeyError, ValueError) as e:
-            log_warning(f"Error parsing Digital Ocean API response: {e}")
-            return []
+        subdomains = []
+        for record in records:
+            if record.get('type') == 'A' and record.get('name'):
+                subdomains.append(record.get('name'))
+        return subdomains
     
     def list_all_domains(self) -> List[str]:
         """List all base domains in the account.
@@ -151,17 +194,8 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             List of base domain names
         """
-        response = self._make_request('GET', '/domains')
-        if not response:
-            return []
-        
-        try:
-            data = response.json()
-            domains = data.get('domains', [])
-            return [d.get('name') for d in domains if d.get('name')]
-        except (KeyError, ValueError) as e:
-            log_warning(f"Error parsing Digital Ocean API response: {e}")
-            return []
+        domains = self._collect_paginated('/domains', 'domains')
+        return [d.get('name') for d in domains if d.get('name')]
     
     def update_subdomain(self, subdomain: str, domain: str, ip: str) -> bool:
         """Update A record for subdomain to point to new IP.
@@ -175,42 +209,32 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             True if successful, False otherwise
         """
         # First, get all records to find the record ID
-        response = self._make_request('GET', f'/domains/{domain}/records')
-        if not response:
+        records = self._list_domain_records(domain)
+        if not records:
             log_error(f"Failed to retrieve DNS records for {domain}")
             return False
-        
-        try:
-            data = response.json()
-            records = data.get('domain_records', [])
-            
-            # Find the A record matching the subdomain
-            record_id = None
-            for record in records:
-                if record.get('type') == 'A' and record.get('name') == subdomain:
-                    record_id = record.get('id')
-                    break
-            
-            if not record_id:
-                log_warning(f"No A record found for {subdomain}.{domain}")
-                return False
-            
-            # Update the record
-            payload = {
-                'data': ip,
-                'ttl': 3600
-            }
-            update_response = self._make_request('PUT', f'/domains/{domain}/records/{record_id}', json=payload)
-            if not update_response:
-                log_error(f"Failed to update DNS record for {subdomain}.{domain}")
-                return False
-            
-            log_info(f"Successfully updated A record: {subdomain}.{domain} -> {ip}")
-            return True
-            
-        except (KeyError, ValueError) as e:
-            log_error(f"Error parsing Digital Ocean API response: {e}")
+        # Find the A record matching the subdomain
+        record_id = None
+        for record in records:
+            if record.get('type') == 'A' and record.get('name') == subdomain:
+                record_id = record.get('id')
+                break
+
+        if not record_id:
+            log_warning(f"No A record found for {subdomain}.{domain}")
             return False
+
+        payload = {
+            'data': ip,
+            'ttl': 3600
+        }
+        update_response = self._make_request('PUT', f'/domains/{domain}/records/{record_id}', json=payload)
+        if not update_response:
+            log_error(f"Failed to update DNS record for {subdomain}.{domain}")
+            return False
+
+        log_info(f"Successfully updated A record: {subdomain}.{domain} -> {ip}")
+        return True
     
     def delete_subdomain(self, subdomain: str, domain: str) -> bool:
         """Delete A record for subdomain.
@@ -223,38 +247,28 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             True if successful, False otherwise
         """
         # First, get all records to find the record ID
-        response = self._make_request('GET', f'/domains/{domain}/records')
-        if not response:
+        records = self._list_domain_records(domain)
+        if not records:
             log_error(f"Failed to retrieve DNS records for {domain}")
             return False
-        
-        try:
-            data = response.json()
-            records = data.get('domain_records', [])
-            
-            # Find the A record matching the subdomain
-            record_id = None
-            for record in records:
-                if record.get('type') == 'A' and record.get('name') == subdomain:
-                    record_id = record.get('id')
-                    break
-            
-            if not record_id:
-                log_warning(f"No A record found for {subdomain}.{domain}")
-                return False
-            
-            # Delete the record
-            delete_response = self._make_request('DELETE', f'/domains/{domain}/records/{record_id}')
-            if not delete_response:
-                log_error(f"Failed to delete DNS record for {subdomain}.{domain}")
-                return False
-            
-            log_info(f"Successfully deleted A record: {subdomain}.{domain}")
-            return True
-            
-        except (KeyError, ValueError) as e:
-            log_error(f"Error parsing Digital Ocean API response: {e}")
+        # Find the A record matching the subdomain
+        record_id = None
+        for record in records:
+            if record.get('type') == 'A' and record.get('name') == subdomain:
+                record_id = record.get('id')
+                break
+
+        if not record_id:
+            log_warning(f"No A record found for {subdomain}.{domain}")
             return False
+
+        delete_response = self._make_request('DELETE', f'/domains/{domain}/records/{record_id}')
+        if not delete_response:
+            log_error(f"Failed to delete DNS record for {subdomain}.{domain}")
+            return False
+
+        log_info(f"Successfully deleted A record: {subdomain}.{domain}")
+        return True
     
     def find_dns_records_by_ip(self, ip: str, domain: Optional[str] = None) -> List[Tuple[str, str, int]]:
         """Find DNS A records pointing to a specific IP address.
@@ -274,40 +288,58 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
                 domains_to_search = [domain]
             else:
                 # Get all domains in the account
-                domains_response = self._make_request('GET', '/domains')
-                if not domains_response:
+                domains_data = self._collect_paginated('/domains', 'domains')
+                if not domains_data:
                     log_warning("Failed to retrieve domains list")
                     return results
-                
-                domains_data = domains_response.json()
-                domains_to_search = [d.get('name') for d in domains_data.get('domains', [])]
+                domains_to_search = [d.get('name') for d in domains_data]
             
             # Search each domain for A records pointing to the IP
             for search_domain in domains_to_search:
-                records_response = self._make_request('GET', f'/domains/{search_domain}/records')
-                if not records_response:
+                records = self._list_domain_records(search_domain)
+                if not records:
                     continue
-                
-                try:
-                    records_data = records_response.json()
-                    records = records_data.get('domain_records', [])
-                    
-                    for record in records:
-                        if (record.get('type') == 'A' and 
-                            record.get('data') == ip):
-                            subdomain = record.get('name', '')
-                            record_id = record.get('id')
-                            if record_id:
-                                results.append((subdomain, search_domain, record_id))
-                except (KeyError, ValueError) as e:
-                    log_warning(f"Error parsing records for {search_domain}: {e}")
-                    continue
+                for record in records:
+                    if (record.get('type') == 'A' and record.get('data') == ip):
+                        subdomain = record.get('name', '')
+                        record_id = record.get('id')
+                        if record_id:
+                            results.append((subdomain, search_domain, record_id))
             
             return results
             
         except Exception as e:
             log_error(f"Error finding DNS records by IP: {e}")
             return results
+
+    def get_all_dns_a_records_by_ip(self) -> Dict[str, List[Tuple[str, str, int]]]:
+        """Build a map of IP -> [(subdomain, domain, record_id), ...] for all A records.
+        Fetches domains and records once; use this instead of repeated find_dns_records_by_ip
+        when resolving domains for many droplets.
+        """
+        by_ip: Dict[str, List[Tuple[str, str, int]]] = {}
+        try:
+            domains_data = self._collect_paginated('/domains', 'domains')
+            if not domains_data:
+                return by_ip
+            for d in domains_data:
+                domain = d.get('name')
+                if not domain:
+                    continue
+                records = self._list_domain_records(domain)
+                for record in records:
+                    if record.get('type') != 'A':
+                        continue
+                    ip = record.get('data')
+                    if not ip:
+                        continue
+                    subdomain = record.get('name', '')
+                    record_id = record.get('id')
+                    if record_id:
+                        by_ip.setdefault(ip, []).append((subdomain, domain, record_id))
+        except Exception as e:
+            log_error(f"Error building DNS A records by IP: {e}")
+        return by_ip
     
     def list_ssh_keys(self) -> List[Dict[str, Any]]:
         """List all SSH keys from Digital Ocean account.
@@ -315,16 +347,7 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             List of dictionaries with keys: id, name, fingerprint, public_key
         """
-        response = self._make_request('GET', '/account/keys')
-        if not response:
-            return []
-        
-        try:
-            data = response.json()
-            return data.get('ssh_keys', [])
-        except (KeyError, ValueError) as e:
-            log_warning(f"Error parsing SSH keys response: {e}")
-            return []
+        return self._collect_paginated('/account/keys', 'ssh_keys')
 
     def resolve_ssh_key(self, key_name: str) -> Optional[int]:
         """Resolve SSH key name to key ID.
@@ -584,14 +607,10 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         Returns:
             List of DropletInfo objects
         """
-        response = self._make_request('GET', '/droplets')
-        if not response:
+        droplets_data = self._collect_paginated('/droplets', 'droplets')
+        if not droplets_data:
             return []
-        
         try:
-            data = response.json()
-            droplets_data = data.get('droplets', [])
-            
             droplets = []
             for droplet_data in droplets_data:
                 droplet_id = droplet_data.get('id')
@@ -909,4 +928,3 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
                 break
         
         return all_sizes
-
