@@ -213,9 +213,9 @@ Error response from daemon: failed to create task for container: failed to creat
                 stderr=error_stderr
             )
             
-            result = docker_manager.run_compose_command(compose_file, command, env_file, project_name)
+            success, _ = docker_manager.run_compose_command(compose_file, command, env_file, project_name)
             
-            assert result == False
+            assert success is False
             mock_run.assert_called_once()
             
             # Verify the command was called with correct parameters

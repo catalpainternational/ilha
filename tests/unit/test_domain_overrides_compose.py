@@ -203,7 +203,7 @@ DEBUG=True
         
         # Create env.ilha with domain in ALLOWED_HOSTS
         env_file = ilha_dir / "env.ilha"
-        env_file.write_text(f"ALLOWED_HOSTS=localhost,127.0.0.1,{domain},*.example.com\nSITE_DOMAIN=https://{domain}\n")
+        env_file.write_text(f"ALLOWED_HOSTS=localhost,127.0.0.1,{domain},*.example.com\nSITE_DOMAIN={domain}\n")
         
         # Verify configuration
         verification = env_manager.verify_domain_configuration(worktree_path, domain)
@@ -236,7 +236,7 @@ DEBUG=True
         
         # Create env.ilha with domain in ALLOWED_HOSTS
         env_file = ilha_dir / "env.ilha"
-        env_file.write_text(f"ALLOWED_HOSTS=localhost,127.0.0.1,{domain},*.example.com\nSITE_DOMAIN=https://{domain}\n")
+        env_file.write_text(f"ALLOWED_HOSTS=localhost,127.0.0.1,{domain},*.example.com\nSITE_DOMAIN={domain}\n")
         
         # Verify configuration
         verification = env_manager.verify_domain_configuration(worktree_path, domain)
@@ -272,7 +272,7 @@ DEBUG=True
         # Verify env.ilha was updated
         env_file = worktree_path / ".ilha" / "env.ilha"
         env_content = env_file.read_text()
-        assert f'SITE_DOMAIN=https://{domain}' in env_content
+        assert f'SITE_DOMAIN={domain}' in env_content
         assert domain in env_content
         # ALLOWED_HOSTS should include domain (localhost is still included for local development)
         assert domain in env_content
@@ -332,7 +332,7 @@ DEBUG=True
         
         # Verify env.ilha was updated
         env_content = env_file.read_text()
-        assert f'SITE_DOMAIN=https://{domain}' in env_content
+        assert f'SITE_DOMAIN={domain}' in env_content
 
     def test_apply_domain_overrides_handles_invalid_compose_file(self, env_manager, temp_project):
         """Test error handling when compose file has invalid YAML."""
@@ -357,7 +357,7 @@ DEBUG=True
         
         # Verify env.ilha was updated
         env_content = env_file.read_text()
-        assert f'SITE_DOMAIN=https://{domain}' in env_content
+        assert f'SITE_DOMAIN={domain}' in env_content
 
     def test_apply_domain_overrides_handles_missing_services(self, env_manager, temp_project):
         """Test error handling when compose file has no services section."""
@@ -383,7 +383,7 @@ DEBUG=True
         
         # Verify env.ilha was updated
         env_content = env_file.read_text()
-        assert f'SITE_DOMAIN=https://{domain}' in env_content
+        assert f'SITE_DOMAIN={domain}' in env_content
 
     def test_apply_domain_overrides_handles_missing_labels(self, env_manager, temp_project):
         """Test error handling when services have no labels."""
@@ -416,7 +416,7 @@ DEBUG=True
         
         # Verify env.ilha was updated
         env_content = env_file.read_text()
-        assert f'SITE_DOMAIN=https://{domain}' in env_content
+        assert f'SITE_DOMAIN={domain}' in env_content
 
     def test_localhost_worktree_keeps_localhost_labels(self, env_manager, temp_project):
         """Test that worktree created with localhost keeps localhost labels (no override)."""

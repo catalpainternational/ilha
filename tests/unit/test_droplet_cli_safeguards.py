@@ -1,0 +1,175 @@
+import json
+
+import pytest
+from click.testing import CliRunner
+
+from ilha.cli import cli
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
+
+
+def _extract_json(output: str) -> dict:
+    start = output.find("{")
+    end = output.rfind("}")
+    assert start != -1 and end != -1 and end > start
+    return json.loads(output[start : end + 1])
+
+
+def test_droplet_put_json_includes_safeguard_report(monkeypatch, runner):
+    class FakeDeployManager:
+        def put(self, **kwargs):
+            return True
+
+        def get_last_deploy_report(self):
+            return {
+                "source_manifest": {"source_path": "/tmp/worktrees/demo", "branch_name": "demo"},
+                "drift_report": {"status": "warning", "differences": []},
+                "smoke_checks": {"success": True, "path": "/api/health/", "checks": []},
+                "stage_timings": {"smoke_checks": 1.2},
+                "recovery_attempted": False,
+                "recovery_succeeded": False,
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr(
+        "ilha.cli_commands.droplets._resolve_existing_remote_target",
+        lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
+    )
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
+
+    result = runner.invoke(cli, ["droplet", "put", "demo", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = _extract_json(result.output)
+    assert payload["success"] is True
+    assert payload["data"]["url"] == "https://demo.example.com"
+    assert payload["data"]["source_manifest"]["branch_name"] == "demo"
+    assert payload["data"]["drift_report"]["status"] == "warning"
+    assert payload["data"]["smoke_checks"]["success"] is True
+
+
+def test_droplet_doctor_json_reports_checks(monkeypatch, runner):
+    class FakeDeployManager:
+        def doctor(self, **kwargs):
+            return {
+                "branch": kwargs["branch_name"],
+                "target": kwargs["scp_target"],
+                "smoke_path": "/api/health/",
+                "checks": [
+                    {"title": "docker_compose_ps", "success": True, "stdout": "ok", "stderr": ""},
+                ],
+                "success": True,
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr(
+        "ilha.cli_commands.droplets._resolve_existing_remote_target",
+        lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
+    )
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
+
+    result = runner.invoke(cli, ["droplet", "doctor", "demo", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = _extract_json(result.output)
+    assert payload["success"] is True
+    assert payload["data"]["branch"] == "demo"
+    assert payload["data"]["smoke_path"] == "/api/health/"
+    assert payload["data"]["checks"][0]["title"] == "docker_compose_ps"
+
+
+def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
+    deploy_kwargs = {}
+
+    class FakeDeployManager:
+        def deploy(self, **kwargs):
+            deploy_kwargs.update(kwargs)
+            return True
+
+        def get_last_deploy_report(self):
+            return {
+                "source_manifest": {"source_path": "/tmp/worktrees/demo", "branch_name": "demo"},
+                "drift_report": {"status": "ok", "differences": []},
+                "smoke_checks": {"success": True, "path": "/", "checks": []},
+                "stage_timings": {"transfer": 2.1},
+                "failure_category": None,
+                "recovery_attempted": False,
+                "recovery_succeeded": False,
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_setup_or_prompt", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets._parse_rsync_target_or_droplet", lambda target, token=None: target)
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
+
+    result = runner.invoke(
+        cli,
+        ["droplet", "deploy", "demo", "--no-create", "--scp-target", "root@1.2.3.4:/root", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = _extract_json(result.output)
+    assert payload["success"] is True
+    assert payload["data"]["branch"] == "demo"
+    assert payload["data"]["source_manifest"]["branch_name"] == "demo"
+    assert payload["data"]["smoke_checks"]["success"] is True
+    assert deploy_kwargs["strict_deploy_drift"] is False
+
+
+def test_droplet_deploy_passes_strict_deploy_drift_flag(monkeypatch, runner):
+    deploy_kwargs = {}
+
+    class FakeDeployManager:
+        def deploy(self, **kwargs):
+            deploy_kwargs.update(kwargs)
+            return True
+
+        def get_last_deploy_report(self):
+            return {
+                "source_manifest": {"source_path": "/tmp/worktrees/demo", "branch_name": "demo"},
+                "drift_report": {"status": "ok", "differences": []},
+                "smoke_checks": {"success": True, "path": "/", "checks": []},
+                "stage_timings": {},
+                "failure_category": None,
+                "recovery_attempted": False,
+                "recovery_succeeded": False,
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_setup_or_prompt", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites", lambda: None)
+    monkeypatch.setattr("ilha.cli_commands.droplets._parse_rsync_target_or_droplet", lambda target, token=None: target)
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
+
+    result = runner.invoke(
+        cli,
+        [
+            "droplet",
+            "deploy",
+            "demo",
+            "--no-create",
+            "--scp-target",
+            "root@1.2.3.4:/root",
+            "--strict-deploy-drift",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert deploy_kwargs["strict_deploy_drift"] is True

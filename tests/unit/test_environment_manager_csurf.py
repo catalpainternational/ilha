@@ -23,7 +23,17 @@ def test_domain_overrides_add_csrf_and_proxy(tmp_path: Path):
     text = env_dt.read_text()
     assert "USE_X_FORWARDED_HOST=True" in text
     assert "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https" in text
-    assert "CSRF_TRUSTED_ORIGINS=https://app.example.com http://app.example.com https://*.example.com" in text
+    assert "CSRF_TRUSTED_ORIGINS=https://app.example.com,http://app.example.com,https://*.example.com" in text
+
+
+def test_production_domain_values_strip_scheme_and_path(tmp_path: Path):
+    em = EnvironmentManager(project_root=tmp_path)
+    values = em._production_domain_env_values("https://app.example.com/login/")
+
+    assert values["site_domain"] == "app.example.com"
+    assert values["csrf_trusted_origins"] == (
+        "https://app.example.com,http://app.example.com,https://*.example.com"
+    )
 
 
 def test_ip_overrides_add_csrf_and_proxy(tmp_path: Path):

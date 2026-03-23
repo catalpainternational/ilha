@@ -31,6 +31,7 @@ class TestEnvironmentManager:
             "postgres": "test-project-test-branch_postgres_data",
             "redis": "test-project-test-branch_redis_data",
             "media": "test-project-test-branch_media_files",
+            "sqlite": "test-project-test-branch_sqlite_data",
         }
         assert volume_names == expected
     

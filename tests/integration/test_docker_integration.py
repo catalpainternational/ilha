@@ -96,12 +96,12 @@ services:
 """)
         
         # Test compose command execution
-        result = docker_manager.run_compose_command(
+        success, _ = docker_manager.run_compose_command(
             compose_file, 
             ["config"], 
             project_name="test-project"
         )
-        assert result, "Failed to execute compose command"
+        assert success, "Failed to execute compose command"
     
     def test_volume_backup_restore(self, docker_manager, temp_project_dir):
         """Test volume backup and restore functionality."""

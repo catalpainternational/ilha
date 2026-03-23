@@ -104,7 +104,7 @@ class TestBuildContextResolution:
         
         mock_run.side_effect = capture_env
         
-        result = docker_manager.run_compose_command(
+        success, _ = docker_manager.run_compose_command(
             compose_file=compose_file,
             command=["up", "-d"],
             env_file=env_file,
@@ -112,7 +112,7 @@ class TestBuildContextResolution:
             working_dir=mock_worktree
         )
         
-        assert result == True
+        assert success is True
         assert mock_run.called
         
         # Check that PROJECT_ROOT is set to the worktree path
@@ -175,7 +175,7 @@ class TestBuildContextResolution:
             compose_file.parent.mkdir(parents=True, exist_ok=True)
             compose_file.write_text("version: '3.8'")
             
-            result = docker_manager.run_compose_command(
+            success, _ = docker_manager.run_compose_command(
                 compose_file=compose_file,
                 command=["up", "-d"],
                 working_dir=relative_worktree

@@ -35,7 +35,7 @@ def test_create_command_reports_success(monkeypatch, runner):
         def __init__(self):
             pass
 
-        def create_worktree(self, branch_name, interactive=True):
+        def create_worktree(self, branch_name, interactive=True, force=False):
             self.branch_name = branch_name
             return True, {"data": {"status": "created", "worktree_path": "/tmp/worktrees/feature/foo"}}
 
@@ -99,7 +99,7 @@ def test_command_wrapper_reports_errors(monkeypatch, runner):
         def __init__(self):
             pass
 
-        def create_worktree(self, branch_name, interactive=True):
+        def create_worktree(self, branch_name, interactive=True, force=False):
             return False, {"error": "boom"}
 
     monkeypatch.setattr("ilha.cli_commands.worktrees.WorktreeManager", lambda: FailingManager())
@@ -123,29 +123,17 @@ def test_bare_up_resolves_from_worktree_context(monkeypatch, runner):
 
     manager = FakeWorktreeManager()
     monkeypatch.setattr("ilha.cli_commands.worktrees.WorktreeManager", lambda: manager)
-    
-    # Mock detect_execution_context - need to patch the actual function object
-    # The import happens inside parse_args, so we need to ensure the mock is in place
-    # when the import happens (which is when parse_args is called)
-    original_detect = None
-    try:
-        from ilha.utils import path_utils
-        original_detect = path_utils.detect_execution_context
-    except ImportError:
-        pass
-    
-    def mock_detect_execution_context():
-        return (None, "feature-auth", True)  # (worktree_path, branch_name, is_worktree)
-    
-    # Mock at the module level - this should work since the import happens at runtime
-    monkeypatch.setattr("ilha.utils.path_utils.detect_execution_context", mock_detect_execution_context)
 
-    result = runner.invoke(cli, ["up", "--json"])
+    # Mock detect_execution_context at the module level
+    monkeypatch.setattr(
+        "ilha.utils.path_utils.detect_execution_context",
+        lambda: (None, "feature-auth", True),  # (worktree_path, branch_name, is_worktree)
+    )
+
+    # Bare 'up' only works without extra flags (--json would be captured by compose passthrough)
+    result = runner.invoke(cli, ["up"])
     assert result.exit_code == 0, f"Command failed with output: {result.output}"
     assert manager.started_branch == "feature-auth"
-    payload = _extract_json(result.output)
-    assert payload["success"] is True
-    assert payload["data"]["branch_name"] == "feature-auth"
 
 
 def test_bare_up_resolves_from_current_git_branch(monkeypatch, runner):
@@ -171,22 +159,21 @@ def test_bare_up_resolves_from_current_git_branch(monkeypatch, runner):
 
     manager = FakeWorktreeManager()
     monkeypatch.setattr("ilha.cli_commands.worktrees.WorktreeManager", lambda: manager)
-    
+
     # Mock detect_execution_context to return project root (no worktree context)
     monkeypatch.setattr(
         "ilha.utils.path_utils.detect_execution_context",
-        lambda: (None, None, False)  # (worktree_path, branch_name, is_worktree)
+        lambda: (None, None, False),  # (worktree_path, branch_name, is_worktree)
     )
-    
-    # Mock GitManager to return current branch and validate worktree exists
+
+    # Mock get_project_root and GitManager for the fallback branch resolution
+    monkeypatch.setattr("ilha.config.settings.get_project_root", lambda: "/tmp/fake-project")
     monkeypatch.setattr("ilha.core.git_manager.GitManager", FakeGitManager)
 
-    result = runner.invoke(cli, ["up", "--json"])
+    # Bare 'up' only works without extra flags (--json would be captured by compose passthrough)
+    result = runner.invoke(cli, ["up"])
     assert result.exit_code == 0
     assert manager.started_branch == "feature-branch"
-    payload = _extract_json(result.output)
-    assert payload["success"] is True
-    assert payload["data"]["branch_name"] == "feature-branch"
 def test_bare_up_fails_when_no_worktree_resolved(monkeypatch, runner):
     """Test that 'ilha up' fails with helpful error when worktree cannot be resolved."""
     # Mock detect_execution_context to return no worktree context
@@ -206,7 +193,8 @@ def test_bare_up_fails_when_no_worktree_resolved(monkeypatch, runner):
         def validate_worktree_exists(self, branch_name):
             return False
 
-    monkeypatch.setattr("ilha.core.git_manager.GitManager", FakeGitManager)    result = runner.invoke(cli, ["up"])
+    monkeypatch.setattr("ilha.core.git_manager.GitManager", FakeGitManager)
+    result = runner.invoke(cli, ["up"])
     assert result.exit_code != 0
     assert "Could not determine worktree" in result.output
     assert "ilha <worktree_name> up" in result.output
@@ -233,7 +221,8 @@ def test_bare_up_includes_d_flag(monkeypatch, runner):
     )
 
     # Test that bare 'ilha up' works (should include -d automatically)
-    result = runner.invoke(cli, ["up", "--json"])
+    # Bare 'up' only works without extra flags (--json would be captured by compose passthrough)
+    result = runner.invoke(cli, ["up"])
     assert result.exit_code == 0
     assert manager.started_branch == "feature-auth"
 
@@ -257,9 +246,7 @@ def test_bare_down_resolves_from_worktree_context(monkeypatch, runner):
         lambda: (None, "feature-auth", True)
     )
 
-    result = runner.invoke(cli, ["down", "--json"])
+    # Bare 'down' only works without extra flags (--json would be captured by compose passthrough)
+    result = runner.invoke(cli, ["down"])
     assert result.exit_code == 0
     assert manager.stopped_branch == "feature-auth"
-    payload = _extract_json(result.output)
-    assert payload["success"] is True
-    assert payload["data"]["branch_name"] == "feature-auth"

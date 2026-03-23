@@ -200,34 +200,32 @@ class TestDockerManager:
         assert mock_validate.call_count == 3
         assert mock_run.call_count == 3
     
-    @patch('ilha.core.docker_manager.get_volume_names')
+    @patch('ilha.core.docker_manager.get_volume_names_for_project_root')
     @patch('subprocess.run')
     def test_backup_volumes_success(self, mock_run, mock_get_volume_names, docker_manager):
         """Test successful volume backup."""
         branch_name = "test-branch"
         backup_dir = Path("/test/backups")
-        
+
         mock_get_volume_names.return_value = {
             "postgres": "test-branch_postgres_data",
             "redis": "test-branch_redis_data",
             "media": "test-branch_media_files",
         }
         mock_run.return_value = Mock(returncode=0)
-        
+
         # Mock the backup file creation
         with patch('pathlib.Path.mkdir'), \
              patch('pathlib.Path.exists', return_value=True), \
              patch('pathlib.Path.unlink'), \
              patch('shutil.rmtree'):
-            
+
             result = docker_manager.backup_volumes(branch_name, backup_dir)
-        
+
         assert result is not None
-        # The backup filename format is backup_<branch>.tar
         assert result.name.startswith("backup_test-branch")
         assert result.name.endswith(".tar")
         assert result.suffix == ".tar"
-        mock_get_volume_names.assert_called_once_with(branch_name)
     
     @patch('ilha.core.docker_manager.get_volume_names_for_project_root')
     @patch('subprocess.run')
@@ -371,9 +369,10 @@ class TestDockerManager:
         
         mock_run.return_value = Mock(returncode=0)
         
-        result = docker_manager.run_compose_command(compose_file, command, None, project_name)
+        success, stderr = docker_manager.run_compose_command(compose_file, command, None, project_name)
         
-        assert result == True
+        assert success is True
+        assert stderr is None
         mock_run.assert_called_once()
         call_args = mock_run.call_args[0][0]
         assert "docker" in call_args
@@ -389,11 +388,12 @@ class TestDockerManager:
         command = ["config"]
         project_name = "test-project"
         
-        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", "Compose command failed")
+        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", stderr="Compose command failed")
         
-        result = docker_manager.run_compose_command(compose_file, command, None, project_name)
+        success, stderr = docker_manager.run_compose_command(compose_file, command, None, project_name)
         
-        assert result == False
+        assert success is False
+        assert stderr == "Compose command failed"
         mock_run.assert_called_once()
     
     @patch('subprocess.run')

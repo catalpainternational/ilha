@@ -32,7 +32,7 @@ class TestConfiguration:
     
     def test_protected_branches(self):
         """Test protected branches list."""
-        expected_branches = {"main", "master", "develop", "production", "staging"}
+        expected_branches = {"main", "master"}
         assert PROTECTED_BRANCHES == expected_branches
     
     def test_default_env_vars(self):
@@ -77,9 +77,12 @@ class TestConfiguration:
         content = generate_env_compose_content("test-branch")
         
         assert "COMPOSE_PROJECT_NAME=test-project-test-branch" in content
-        assert "SITE_DOMAIN=test-project-test-branch.localhost" in content
+        assert "SITE_DOMAIN=http://test-project-test-branch.localhost" in content
         assert "ALLOWED_HOSTS=localhost,127.0.0.1,test-project-test-branch.localhost,*.localhost" in content
         assert "# ilha environment configuration for test-branch" in content
+        assert "ILHA_SUBNET_INTERNAL=" in content
+        assert "ILHA_SUBNET_WEB=" in content
+        assert ".0/24" in content
     
     def test_sanitize_project_name(self):
         """Test project name sanitization."""
