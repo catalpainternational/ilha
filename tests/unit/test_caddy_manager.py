@@ -149,6 +149,7 @@ class TestCaddyManager:
         
         expected = {
             "running": True,
+            "on_network": True,
             "compose_file_exists": True,
             "caddyfile_exists": True,
             "network_exists": True
@@ -160,10 +161,12 @@ class TestCaddyManager:
         caddy_manager.caddyfile.exists.assert_called_once()
         caddy_manager.docker_manager.create_network.assert_called_once()
     
+    @patch('ilha.commands.caddy.validate_container_exists')
     @patch('ilha.commands.caddy.validate_container_running')
-    def test_get_caddy_status_not_running(self, mock_validate, caddy_manager):
+    def test_get_caddy_status_not_running(self, mock_validate, mock_exists, caddy_manager):
         """Test getting Caddy status when not running."""
         mock_validate.return_value = False
+        mock_exists.return_value = False  # container not present, so on_network stays False
         caddy_manager.compose_file.exists.return_value = False
         caddy_manager.caddyfile.exists.return_value = False
         caddy_manager.docker_manager.create_network.return_value = False
@@ -172,6 +175,7 @@ class TestCaddyManager:
         
         expected = {
             "running": False,
+            "on_network": False,
             "compose_file_exists": False,
             "caddyfile_exists": False,
             "network_exists": False

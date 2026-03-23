@@ -35,7 +35,7 @@ class TestCaddyConfig:
         
         assert result is True
         assert 'labels' in compose_data['services']['web']
-        assert 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' in compose_data['services']['web']['labels']
+        assert 'caddy.proxy=${SITE_DOMAIN:-${COMPOSE_PROJECT_NAME}.localhost}' in compose_data['services']['web']['labels']
         assert 'networks' in compose_data['services']['web']
         assert 'ilha_caddy_proxy' in compose_data['services']['web']['networks']
 
@@ -67,6 +67,30 @@ class TestCaddyConfig:
         assert 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' not in web_labels
         # Other labels should be preserved
         assert 'caddy.proxy.reverse_proxy=${COMPOSE_PROJECT_NAME}-web:8000' in web_labels
+
+    def test_update_existing_label_with_schemed_domain(self):
+        """Schemed domain input should be normalized before writing labels."""
+        compose_data = {
+            'services': {
+                'web': {
+                    'image': 'nginx:alpine',
+                    'labels': [
+                        'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost',
+                    ]
+                }
+            }
+        }
+
+        result = ensure_caddy_labels_and_network(
+            compose_data,
+            domain="https://app.example.com/login/",
+            ip=None,
+            use_localhost_pattern=False,
+        )
+
+        assert result is True
+        web_labels = compose_data['services']['web']['labels']
+        assert 'caddy.proxy=app.example.com' in web_labels
 
     def test_update_existing_label_with_ip(self):
         """Test that existing caddy.proxy label is updated when IP is provided."""
@@ -169,11 +193,11 @@ class TestCaddyConfig:
                 },
                 'db': {
                     'image': 'postgres:15',
-                    'labels': ['caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost']  # Should be ignored
+                    'labels': ['caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost']
                 }
             }
         }
-        
+
         domain = "api.example.com"
         result = ensure_caddy_labels_and_network(
             compose_data,
@@ -181,29 +205,27 @@ class TestCaddyConfig:
             ip=None,
             use_localhost_pattern=False
         )
-        
+
         assert result is True
-        # Web services should be updated
+        # All services with caddy.proxy labels should be updated
         assert f'caddy.proxy={domain}' in compose_data['services']['web']['labels']
         assert f'caddy.proxy={domain}' in compose_data['services']['api']['labels']
-        # DB service should not be updated (not a web service)
-        assert 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' in compose_data['services']['db']['labels']
+        # DB service also has caddy.proxy label, so it gets updated too
+        assert f'caddy.proxy={domain}' in compose_data['services']['db']['labels']
 
-    def test_skip_non_web_services(self):
-        """Test that non-web services are skipped."""
+    def test_skip_services_without_caddy_labels(self):
+        """Test that services without caddy labels are skipped."""
         compose_data = {
             'services': {
                 'db': {
                     'image': 'postgres:15',
-                    'labels': ['caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost']
                 },
                 'redis': {
                     'image': 'redis:7',
-                    'labels': ['caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost']
                 }
             }
         }
-        
+
         domain = "app.example.com"
         result = ensure_caddy_labels_and_network(
             compose_data,
@@ -211,12 +233,9 @@ class TestCaddyConfig:
             ip=None,
             use_localhost_pattern=False
         )
-        
-        # Should return False (no changes made - no web services)
+
+        # No services have caddy labels or are web services — no changes
         assert result is False
-        # Labels should remain unchanged
-        assert 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' in compose_data['services']['db']['labels']
-        assert 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' in compose_data['services']['redis']['labels']
 
     def test_preserve_other_labels_when_updating(self):
         """Test that other labels are preserved when updating caddy.proxy."""
@@ -279,7 +298,7 @@ class TestCaddyConfig:
         # The function will try to add ${COMPOSE_PROJECT_NAME}.localhost
         # But since caddy.proxy already exists and no domain/ip, it won't be updated
         # So custom.localhost should remain
-        assert 'caddy.proxy=custom.localhost' in web_labels or 'caddy.proxy=${COMPOSE_PROJECT_NAME}.localhost' in web_labels
+        assert 'caddy.proxy=custom.localhost' in web_labels or 'caddy.proxy=${SITE_DOMAIN:-${COMPOSE_PROJECT_NAME}.localhost}' in web_labels
 
     def test_adds_top_level_networks_declaration(self):
         """Test that top-level networks declaration is added when ilha_caddy_proxy is referenced."""

@@ -28,6 +28,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - {MONITOR_SCRIPT_PATH}:/app/monitor.py
+      - {HELPER_UTILS_PATH}:/app/caddy_admin_utils.py
     command: ["sh", "-c", "pip install --no-cache-dir docker requests && python /app/monitor.py"]
     depends_on:
       - caddy

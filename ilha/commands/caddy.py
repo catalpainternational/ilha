@@ -67,8 +67,12 @@ class CaddyManager:
                 if not self._ensure_network_attachment("ilha_caddy_proxy"):
                     log_error("Failed to reconnect Caddy to network")
                     return False
-            log_success("Global Caddy container is already running and on network")
-            return True
+            # Ensure caddy_monitor is also running so routes stay up to date
+            if not validate_container_running("caddy_monitor"):
+                log_info("Caddy is running but caddy_monitor is not; starting full proxy stack")
+            else:
+                log_success("Global Caddy container is already running and on network")
+                return True
         
         # Create temporary compose file with substituted paths
         compose_content = self._get_compose_content_with_paths()

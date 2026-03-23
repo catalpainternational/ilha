@@ -14,6 +14,11 @@ import logging
 import re
 from typing import Dict, List, Optional, Any
 
+try:
+    from .caddy_admin_utils import default_caddy_admin_url, resolve_caddy_admin_url
+except ImportError:
+    from caddy_admin_utils import default_caddy_admin_url, resolve_caddy_admin_url
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,9 +26,9 @@ logger = logging.getLogger(__name__)
 class CaddyDockerMonitor:
     """Monitor Docker containers and update Caddy configuration."""
     
-    def __init__(self, caddy_admin_url: str = "http://ilha_caddy_proxy:2019"):
+    def __init__(self, caddy_admin_url: Optional[str] = None):
         """Initialize the monitor."""
-        self.caddy_admin_url = caddy_admin_url
+        self.caddy_admin_url = caddy_admin_url or default_caddy_admin_url(in_container=True)
         self.known_containers = set()
         try:
             self.docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock')
@@ -32,7 +37,7 @@ class CaddyDockerMonitor:
             self.docker_client = None
         
         # Resolve Caddy admin URL with DNS fallback
-        self.caddy_admin_url = self._resolve_caddy_url(caddy_admin_url)
+        self.caddy_admin_url = self._resolve_caddy_url(self.caddy_admin_url)
     
     def _resolve_caddy_url(self, url: str) -> str:
         """Resolve Caddy admin URL with DNS fallback to container IP.
@@ -45,63 +50,10 @@ class CaddyDockerMonitor:
         Returns:
             Resolved URL (may be original or IP-based fallback)
         """
-        import re
-        from urllib.parse import urlparse
-        
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-        
-        if not hostname or hostname == 'localhost' or re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname):
-            # Already an IP or localhost, use as-is
-            return url
-        
-        # Try DNS resolution first
-        try:
-            import socket
-            socket.gethostbyname(hostname)
-            logger.debug(f"DNS resolution successful for {hostname}")
-            return url
-        except socket.gaierror:
-            logger.warning(f"DNS resolution failed for {hostname}, attempting Docker API fallback...")
-        
-        # DNS failed, try to get container IP from Docker
-        if not self.docker_client:
-            logger.error("Docker client not available for IP fallback")
-            return url
-        
-        try:
-            container = self.docker_client.containers.get("ilha_caddy_proxy")
-            networks = container.attrs.get('NetworkSettings', {}).get('Networks', {})
-            
-            # Look for ilha_caddy_proxy network
-            for network_name, network_info in networks.items():
-                if 'ilha_caddy_proxy' in network_name or network_name == 'ilha_caddy_proxy':
-                    ip_address = network_info.get('IPAddress', '')
-                    if ip_address:
-                        # Replace hostname with IP
-                        new_url = url.replace(hostname, ip_address)
-                        logger.info(f"Using IP fallback: {new_url} (original: {url})")
-                        return new_url
-            
-            # Fallback: try to get gateway IP (Docker bridge gateway)
-            # This is typically 172.x.x.1 for Docker networks
-            if networks:
-                # Get first network's gateway
-                first_network = list(networks.values())[0]
-                gateway = first_network.get('Gateway', '')
-                if gateway:
-                    new_url = url.replace(hostname, gateway)
-                    logger.info(f"Using gateway IP fallback: {new_url} (original: {url})")
-                    return new_url
-            
-            logger.warning(f"Could not determine Caddy IP, using original URL: {url}")
-            return url
-        except docker.errors.NotFound:
-            logger.error("Caddy container 'ilha_caddy_proxy' not found")
-            return url
-        except Exception as e:
-            logger.error(f"Failed to get Caddy container IP: {e}")
-            return url
+        resolved_url = resolve_caddy_admin_url(url, docker_client=self.docker_client)
+        if resolved_url != url:
+            logger.info(f"Using resolved Caddy admin URL: {resolved_url} (original: {url})")
+        return resolved_url
     
     def get_docker_containers(self) -> List[Dict]:
         """Get Docker containers with caddy.proxy labels."""
@@ -202,6 +154,13 @@ class CaddyDockerMonitor:
             http_listen.append(":443")
             logger.info(f"HTTPS enabled for domains: {', '.join(domains)}")
         
+        srv0 = {
+            "listen": http_listen,
+            "routes": []
+        }
+        # Keep .localhost and IP-only setups HTTP-only (no redirect to HTTPS)
+        if not has_domains:
+            srv0["automatic_https"] = {"disable_redirects": True}
         config = {
             "admin": {
                 "listen": "0.0.0.0:2019",
@@ -211,10 +170,7 @@ class CaddyDockerMonitor:
             "apps": {
                 "http": {
                     "servers": {
-                        "srv0": {
-                            "listen": http_listen,
-                            "routes": []
-                        }
+                        "srv0": srv0
                     }
                 }
             }

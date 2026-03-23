@@ -6,6 +6,7 @@ configuration logic, used by SetupManager, EnvironmentManager, and PackageManage
 """
 
 from typing import Optional, Dict, Any, List
+from ..utils.deploy_hosts import normalize_deploy_host
 from ..utils.logging import log_info, log_warning
 
 
@@ -142,13 +143,15 @@ def ensure_caddy_labels_and_network(
         
         # Determine proxy domain
         if domain:
-            proxy_domain = domain
-            log_info(f"Using production domain for {service_name}: {domain}")
+            proxy_domain = normalize_deploy_host(domain)
+            log_info(f"Using production domain for {service_name}: {proxy_domain}")
         elif ip:
-            proxy_domain = ip
+            proxy_domain = normalize_deploy_host(ip)
             log_warning("IP deployments are HTTP-only. Let's Encrypt requires a domain name.")
         elif use_localhost_pattern:
-            proxy_domain = "${COMPOSE_PROJECT_NAME}.localhost"
+            # Prefer SITE_DOMAIN at compose interpolation time so public hostnames match
+            # Django env (bare domain); fall back to per-project *.localhost.
+            proxy_domain = "${SITE_DOMAIN:-${COMPOSE_PROJECT_NAME}.localhost}"
         else:
             # Skip if no domain/IP and localhost pattern disabled
             continue

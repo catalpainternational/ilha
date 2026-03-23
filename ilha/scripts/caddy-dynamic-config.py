@@ -15,6 +15,19 @@ import docker
 import logging
 from typing import Dict, List, Optional
 
+try:
+    from .caddy_admin_utils import (
+        default_caddy_admin_url,
+        resolve_caddy_admin_url,
+        running_in_container,
+    )
+except ImportError:
+    from caddy_admin_utils import (
+        default_caddy_admin_url,
+        resolve_caddy_admin_url,
+        running_in_container,
+    )
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,14 +38,9 @@ class CaddyDynamicConfig:
     def __init__(self, caddy_admin_url: str = None):
         """Initialize the configuration manager."""
         # Auto-detect the correct Caddy admin URL based on execution context
-        if caddy_admin_url is None:
-            # Check if we're running inside a Docker container
-            if self._is_running_in_container():
-                self.caddy_admin_url = "http://ilha_caddy_proxy:2019"
-            else:
-                self.caddy_admin_url = "http://localhost:2019"
-        else:
-            self.caddy_admin_url = caddy_admin_url
+        self.caddy_admin_url = caddy_admin_url or default_caddy_admin_url(
+            in_container=self._is_running_in_container()
+        )
         
         self.known_containers = set()
         
@@ -61,16 +69,15 @@ class CaddyDynamicConfig:
         
         if not self.docker_client:
             logger.error("Failed to connect to Docker daemon. Please ensure Docker is running.")
+        else:
+            self.caddy_admin_url = resolve_caddy_admin_url(
+                self.caddy_admin_url,
+                docker_client=self.docker_client,
+            )
     
     def _is_running_in_container(self) -> bool:
         """Check if we're running inside a Docker container."""
-        try:
-            # Check for common container indicators
-            with open('/proc/1/cgroup', 'r') as f:
-                return 'docker' in f.read() or 'containerd' in f.read()
-        except (FileNotFoundError, PermissionError):
-            # If we can't read /proc/1/cgroup, we're likely not in a container
-            return False
+        return running_in_container()
     
     def get_docker_containers(self) -> List[Dict]:
         """Get Docker containers with caddy.proxy labels."""
@@ -112,7 +119,7 @@ class CaddyDynamicConfig:
         Returns:
             True if host is a domain, False if IP or localhost
         """
-        if host.startswith('localhost') or host.startswith('127.0.0.1'):
+        if host == 'localhost' or host.endswith('.localhost') or host.startswith('127.0.0.1'):
             return False
         
         # IP pattern: \d+\.\d+\.\d+\.\d+
