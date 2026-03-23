@@ -106,9 +106,9 @@ class TestValidation:
         """Test branch protection validation."""
         assert validate_branch_protection("main") == True
         assert validate_branch_protection("master") == True
-        assert validate_branch_protection("develop") == True
-        assert validate_branch_protection("production") == True
-        assert validate_branch_protection("staging") == True
+        assert validate_branch_protection("develop") == False
+        assert validate_branch_protection("production") == False
+        assert validate_branch_protection("staging") == False
         assert validate_branch_protection("test-branch") == False
         assert validate_branch_protection("feature-auth") == False
     

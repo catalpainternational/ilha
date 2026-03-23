@@ -18,13 +18,13 @@ from .ssh_utils import add_ssh_host_key
 
 class SSHConnectionManager:
     """Manages SSH connections with reuse and caching."""
-    
+
     def __init__(self):
         """Initialize SSH connection manager."""
         self._host_keys_added: set = set()
         self._control_paths: Dict[str, str] = {}
         self._temp_dir: Optional[Path] = None
-    
+
     def _get_temp_dir(self) -> Path:
         """Get or create temporary directory for SSH control sockets.
         
@@ -96,11 +96,11 @@ class SSHConnectionManager:
         
         # Add connection timeout
         cmd.extend([
-            "-o", "ConnectTimeout=10",
+            "-o", "ConnectTimeout=30",
             "-o", "ServerAliveInterval=60",
             "-o", "ServerAliveCountMax=3",
         ])
-        
+
         # Add target
         cmd.append(f"{username}@{server}")
         
@@ -112,7 +112,22 @@ class SSHConnectionManager:
             cmd.append("bash -lc " + shlex.quote(command))
         
         return cmd
-    
+
+    def get_rsync_ssh_command(self, username: str, server: str) -> str:
+        """Return the ssh command string for rsync -e, reusing the same ControlPath as build_ssh_command.
+        Call after mkdir (or any SSH) so rsync reuses that connection instead of opening a new one.
+        """
+        control_path = self._get_control_path(username, server)
+        parts = [
+            "ssh",
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={control_path}",
+            "-o", "ControlPersist=300",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=30",
+        ]
+        return " ".join(shlex.quote(p) for p in parts)
+
     def execute_remote(self, username: str, server: str, command: str,
                       timeout: Optional[int] = None,
                       check: bool = True,
@@ -213,7 +228,7 @@ class SSHConnectionManager:
                 ])
         
         cmd.extend([
-            "-o", "ConnectTimeout=10",
+            "-o", "ConnectTimeout=30",
             source,
             target
         ])

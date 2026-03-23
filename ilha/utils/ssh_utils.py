@@ -8,7 +8,6 @@ automatic host key management.
 import subprocess
 import os
 from pathlib import Path
-from typing import Optional
 
 from .logging import log_info, log_warning
 
@@ -35,17 +34,18 @@ def add_ssh_host_key(host: str, port: int = 22) -> bool:
         # Create .ssh directory if it doesn't exist
         ssh_dir.mkdir(mode=0o700, exist_ok=True)
         
-        # Check if host key already exists
+        # Check if host key already exists using ssh-keygen -F (exact match)
         if known_hosts.exists():
             try:
-                with open(known_hosts, 'r') as f:
-                    content = f.read()
-                    # Check if host (with or without port) is already in known_hosts
-                    if host in content or f'[{host}]:{port}' in content:
-                        log_info(f"SSH host key for {host} already in known_hosts")
-                        return True
+                lookup = subprocess.run(
+                    ['ssh-keygen', '-F', host, '-f', str(known_hosts)],
+                    capture_output=True, text=True, timeout=5, check=False
+                )
+                if lookup.returncode == 0 and lookup.stdout.strip():
+                    log_info(f"SSH host key for {host} already in known_hosts")
+                    return True
             except Exception:
-                # If we can't read the file, continue to add the key
+                # If ssh-keygen lookup fails, continue to add the key
                 pass
         
         # Use ssh-keyscan to fetch host key
@@ -86,4 +86,3 @@ def add_ssh_host_key(host: str, port: int = 22) -> bool:
     except Exception as e:
         log_warning(f"Error adding SSH host key for {host}: {e}")
         return False
-

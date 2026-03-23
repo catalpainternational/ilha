@@ -308,13 +308,16 @@ def get_postgres_container_for_volume(volume_name: str, project_name: str) -> Op
             "--format", "{{.Names}}|{{.Image}}"
         ], capture_output=True, text=True, check=True)
         
+        # Main compose often uses directory name (e.g. business_intelligence-db); we may have sanitized (business-intelligence)
+        project_name_alt = project_name.replace("-", "_") if "-" in project_name else project_name.replace("_", "-")
         for line in result.stdout.strip().split('\n'):
             if line:
                 parts = line.split('|')
                 if len(parts) >= 2:
                     container_name, image = parts[0], parts[1]
-                    # Check if it's a postgres container and matches project
-                    if ('postgres' in image.lower() or 'postgres' in container_name.lower()) and project_name in container_name:
+                    is_postgres = 'postgres' in image.lower() or 'postgres' in container_name.lower()
+                    matches = project_name in container_name or project_name_alt in container_name
+                    if is_postgres and matches:
                         return container_name
         return None
     except (subprocess.CalledProcessError, Exception):
