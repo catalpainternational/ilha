@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 from ..config.settings import (
-    generate_env_compose_content, 
+    generate_env_compose_content,
+    get_worktree_network_subnets,
     get_volume_names,
     DEFAULT_ENV_VARS,
     get_project_root,
@@ -25,6 +26,7 @@ from ..utils.path_utils import (
     copy_env_file
 )
 from ..utils.caddy_config import ensure_caddy_labels_and_network, update_allowed_hosts_in_compose, update_vite_allowed_hosts_in_compose
+from ..utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ..core.dns_manager import is_domain
 
 HOST_PORT_RANGES: Dict[str, tuple[int, int]] = {
@@ -44,7 +46,6 @@ class EnvironmentManager:
             project_root: Project root directory. If None, uses get_project_root().
         """
         # Use the provided project_root directly, don't fall back to get_project_root()
-        # This ensures MCP server uses the correct working directory
         if project_root is None:
             self.project_root = get_project_root()
         else:
@@ -242,7 +243,13 @@ class EnvironmentManager:
             branch_name: Branch name
             domain: Optional domain override (subdomain.domain.tld)
         """
-        from ..config.settings import ilha_DIR, sanitize_project_name, get_allowed_hosts_for_worktree, DEFAULT_ENV_VARS
+        from ..config.settings import (
+            ilha_DIR,
+            sanitize_project_name,
+            get_allowed_hosts_for_worktree,
+            build_allowed_hosts_with_container,
+            DEFAULT_ENV_VARS,
+        )
         import yaml
         
         env_file = worktree_path / ".env"
@@ -273,12 +280,18 @@ class EnvironmentManager:
         # Use domain override if provided, otherwise use localhost
         if domain:
             from ..core.dns_manager import get_base_domain
-            site_domain = f"https://{domain}"
-            base_domain = get_base_domain(domain)
-            allowed_hosts = f"localhost,127.0.0.1,{domain},*.{base_domain},web"
+            normalized_domain = normalize_deploy_host(domain)
+            base_domain = get_base_domain(normalized_domain)
+            site_domain = normalized_domain
+            allowed_hosts = build_allowed_hosts_with_container(
+                branch_name,
+                [normalized_domain, f"*.{base_domain}"] if base_domain else [normalized_domain],
+            )
+            csrf_trusted_origins = build_csrf_trusted_origins(normalized_domain, base_domain=base_domain)
         else:
             site_domain = f"{project_name}-{branch_name}.localhost"
             allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
+            csrf_trusted_origins = ""
         
         default_env_content = f"""# Default environment configuration for {branch_name}
 # This file was automatically created by ilha
@@ -296,6 +309,14 @@ DEBUG=True
 DJANGO_SECRET_KEY=django-insecure-secret-key
 ALLOWED_HOSTS={allowed_hosts}
 SITE_DOMAIN={site_domain}
+"""
+        if csrf_trusted_origins:
+            default_env_content += (
+                "USE_X_FORWARDED_HOST=True\n"
+                "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https\n"
+                f"CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}\n"
+            )
+        default_env_content += f"""
 
 # Redis configuration
 REDIS_HOST={compose_project_name}-redis
@@ -339,6 +360,7 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
         site_domain = f"http://{compose_project_name}.localhost"  # RFC-compliant hostname with protocol
         allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
         
+        internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
         base_content = f"""# ilha environment configuration for {branch_name}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={self.project_root}
@@ -347,12 +369,34 @@ ALLOWED_HOSTS={allowed_hosts}
 DEBUG=True
 USE_X_FORWARDED_HOST=True
 CSRF_TRUSTED_ORIGINS={site_domain}
+
+# Per-worktree network subnets (avoid pool overlap; use in docker-compose.worktree.yml)
+ILHA_SUBNET_INTERNAL={internal_subnet}
+ILHA_SUBNET_WEB={web_subnet}
 """
         host_port_section = self._build_host_port_section(branch_name)
         if host_port_section:
             base_content = f"{base_content}\n{host_port_section}"
         return base_content
-    
+
+    def ensure_worktree_env_has_subnet_vars(self, worktree_path: Path, branch_name: str) -> None:
+        """Append ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB to env.ilha if missing.
+
+        Allows existing worktrees created before per-worktree subnets to get the vars on next up.
+        """
+        env_file = worktree_path / ".ilha" / "env.ilha"
+        if not env_file.exists():
+            return
+        try:
+            content = env_file.read_text()
+            if "ILHA_SUBNET_INTERNAL" in content:
+                return
+            internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
+            append = f"\n# Per-worktree network subnets (avoid pool overlap)\nILHA_SUBNET_INTERNAL={internal_subnet}\nILHA_SUBNET_WEB={web_subnet}\n"
+            env_file.write_text(content.rstrip() + append)
+        except Exception:
+            pass
+
     def get_worktree_volume_names(self, branch_name: str) -> Dict[str, str]:
         """Get worktree-specific volume names."""
         return get_volume_names(branch_name)
@@ -414,14 +458,27 @@ CSRF_TRUSTED_ORIGINS={site_domain}
         # This handles cases where SITE_DOMAIN is just the domain without protocol
         return is_domain(domain)
     
+    def _production_domain_env_values(self, domain: str) -> Dict[str, str]:
+        """Return SITE_DOMAIN and CSRF_TRUSTED_ORIGINS for production/staging domain.
+        
+        DRY: Django expects SITE_DOMAIN as bare host (no protocol) and
+        CSRF_TRUSTED_ORIGINS as comma-separated (settings use .split(',')).
+        Used by _generate_env_compose_with_domain and apply_domain_overrides.
+        """
+        from ..core.dns_manager import get_base_domain
+        normalized_domain = normalize_deploy_host(domain)
+        base_domain = get_base_domain(normalized_domain)
+        csrf_origins = build_csrf_trusted_origins(normalized_domain, base_domain=base_domain)
+        return {"site_domain": normalized_domain, "csrf_trusted_origins": csrf_origins}
+    
     def _update_env_var_in_content(self, content: str, var_name: str, value: str) -> str:
         """Update or add an environment variable in content string.
-        
+
         Args:
             content: Environment file content
             var_name: Variable name (e.g., 'SITE_DOMAIN')
             value: Variable value
-            
+
         Returns:
             Updated content string
         """
@@ -431,6 +488,52 @@ CSRF_TRUSTED_ORIGINS={site_domain}
             content = re.sub(pattern, f'{var_name}={value}', content, flags=re.MULTILINE)
         else:
             content += f"\n{var_name}={value}\n"
+        return content
+
+    def _resolve_branch_name_from_worktree(self, worktree_path: Path) -> Optional[str]:
+        """Extract branch name from worktree path or COMPOSE_PROJECT_NAME fallback."""
+        from ..utils.path_utils import get_worktree_branch_name, get_env_compose_file_path
+
+        branch_name = get_worktree_branch_name(worktree_path)
+        if not branch_name:
+            env_ilha = get_env_compose_file_path(worktree_path)
+            if env_ilha.exists():
+                for line in env_ilha.read_text().splitlines():
+                    if line.startswith('COMPOSE_PROJECT_NAME='):
+                        compose_project_name = line.split('=', 1)[1].strip().strip('"\'')
+                        parts = compose_project_name.rsplit('-', 1)
+                        if len(parts) == 2:
+                            branch_name = parts[1]
+                            break
+        if not branch_name:
+            log_warning(f"Could not determine branch name for worktree at {worktree_path}, using existing ALLOWED_HOSTS format without container name")
+        return branch_name
+
+    def _apply_common_env_overrides(
+        self,
+        content: str,
+        *,
+        site_domain: str,
+        allowed_hosts: str,
+        csrf_trusted_origins: str,
+        debug: bool,
+    ) -> str:
+        """Apply the shared env variable overrides used by both domain and IP deployments."""
+        import re
+        content = self._update_env_var_in_content(content, 'SITE_DOMAIN', site_domain)
+        content = self._update_env_var_in_content(content, 'ALLOWED_HOSTS', allowed_hosts)
+        debug_value = 'True' if debug else 'False'
+        # DEBUG uses case-insensitive matching for legacy compat
+        pattern = r'^DEBUG=.*$'
+        if re.search(pattern, content, flags=re.MULTILINE | re.IGNORECASE):
+            content = re.sub(pattern, f'DEBUG={debug_value}', content, flags=re.MULTILINE | re.IGNORECASE)
+        else:
+            content += f"\nDEBUG={debug_value}\n"
+        use_secure_cookies = self._should_use_secure_cookies(site_domain)
+        content = self._update_env_var_in_content(content, 'USE_SECURE_COOKIES', str(use_secure_cookies))
+        content = self._update_env_var_in_content(content, 'USE_X_FORWARDED_HOST', 'True')
+        content = self._update_env_var_in_content(content, 'CSRF_TRUSTED_ORIGINS', csrf_trusted_origins)
+        content = self._update_env_var_in_content(content, 'BUILD_MODE', 'prod')
         return content
     
     def get_domain_name(self, branch_name: str) -> str:
@@ -676,14 +779,16 @@ CSRF_TRUSTED_ORIGINS={site_domain}
         project_name = sanitize_project_name(project_name)
         compose_project_name = f"{project_name}-{branch_name}"
         
-        # Construct URLs from domain
-        site_domain = f"https://{domain}"
+        # Use DRY production domain values (bare SITE_DOMAIN, comma-separated CSRF)
+        domain_vars = self._production_domain_env_values(domain)
+        site_domain = domain_vars["site_domain"]
+        csrf_trusted_origins = domain_vars["csrf_trusted_origins"]
         from ..core.dns_manager import get_base_domain
-        base_domain = get_base_domain(domain)
-        allowed_hosts = f"localhost,127.0.0.1,{domain},*.{base_domain},web"
+        base_domain = get_base_domain(site_domain)
+        allowed_hosts = f"localhost,127.0.0.1,{site_domain},*.{base_domain},web" if base_domain else f"localhost,127.0.0.1,{site_domain},web"
         
         # Determine CADDY_EMAIL: check if already set in env.ilha, otherwise use default
-        default_caddy_email = f"admin@{domain}"
+        default_caddy_email = f"admin@{site_domain}"
         caddy_email = default_caddy_email
         
         # Check if env.ilha exists and has CADDY_EMAIL
@@ -703,18 +808,19 @@ CSRF_TRUSTED_ORIGINS={site_domain}
             log_warning("This email is used for Let's Encrypt certificate notifications.")
             log_warning("To customize, add CADDY_EMAIL=your-email@example.com to .ilha/env.ilha")
         
-        # Determine secure cookie setting
+        # Determine secure cookie setting (bare domain is fine)
         use_secure_cookies = self._should_use_secure_cookies(site_domain)
         
         base_content = f"""# ilha environment configuration for {branch_name}
-# Domain override: {domain}
+# Domain override: {site_domain}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
 SITE_DOMAIN={site_domain}
 ALLOWED_HOSTS={allowed_hosts}
 DEBUG=False
 USE_X_FORWARDED_HOST=True
-CSRF_TRUSTED_ORIGINS=https://{domain} http://{domain} https://*.{base_domain}
+SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
 USE_SECURE_COOKIES={str(use_secure_cookies)}
 BUILD_MODE=prod
 CADDY_EMAIL={caddy_email}
@@ -802,138 +908,63 @@ CADDY_EMAIL={caddy_email}
     
     def apply_domain_overrides(self, worktree_path: Path, domain: str, debug: bool = False) -> bool:
         """Apply domain overrides to existing environment files.
-        
+
         This method modifies .env files to replace localhost references
         with production/staging domain values.
-        
-        Args:
-            worktree_path: Path to worktree directory
-            domain: Domain override (subdomain.domain.tld)
-            debug: Whether to enable DEBUG mode (default: False for production)
-            
-        Returns:
-            True if successful, False otherwise
         """
         try:
             from ..config.settings import build_allowed_hosts_with_container
-            from ..utils.path_utils import get_worktree_branch_name, get_env_compose_file_path
-            import re
-            
-            # Extract branch name from worktree path
-            branch_name = get_worktree_branch_name(worktree_path)
-            
-            # Fallback: Try to extract from COMPOSE_PROJECT_NAME in env.ilha
-            if not branch_name:
-                env_ilha = get_env_compose_file_path(worktree_path)
-                if env_ilha.exists():
-                    content = env_ilha.read_text()
-                    for line in content.splitlines():
-                        if line.startswith('COMPOSE_PROJECT_NAME='):
-                            compose_project_name = line.split('=', 1)[1].strip().strip('"\'')
-                            # Extract branch name: {project-name}-{branch} -> {branch}
-                            parts = compose_project_name.rsplit('-', 1)
-                            if len(parts) == 2:
-                                branch_name = parts[1]
-                                break
-            
-            # If still no branch name, log warning and use existing behavior
-            if not branch_name:
-                log_warning(f"Could not determine branch name for worktree at {worktree_path}, using existing ALLOWED_HOSTS format without container name")
-                branch_name = None
-            
-            # Construct URLs from domain
-            http_url = f"http://{domain}"
-            https_url = f"https://{domain}"
-            
-            # Extract base domain
+            from ..utils.path_utils import get_env_compose_file_path
+
+            branch_name = self._resolve_branch_name_from_worktree(worktree_path)
+
+            # Use DRY production domain values (bare SITE_DOMAIN, comma-separated CSRF)
+            domain_vars = self._production_domain_env_values(domain)
+            site_domain_bare = domain_vars["site_domain"]
+            csrf_trusted_origins = domain_vars["csrf_trusted_origins"]
+
+            # Extract base domain for ALLOWED_HOSTS
             from ..core.dns_manager import get_base_domain
-            base_domain = get_base_domain(domain)
-            
-            # Build ALLOWED_HOSTS with container name if branch_name is available
+            base_domain = get_base_domain(site_domain_bare)
+
             if branch_name:
-                allowed_hosts = build_allowed_hosts_with_container(branch_name, [domain, f"*.{base_domain}"])
+                additional_hosts = [site_domain_bare]
+                if base_domain:
+                    additional_hosts.append(f"*.{base_domain}")
+                allowed_hosts = build_allowed_hosts_with_container(branch_name, additional_hosts)
             else:
-                # Fallback to existing format
-                allowed_hosts = f"localhost,127.0.0.1,{domain},*.{base_domain},web"
-            
+                allowed_hosts = f"localhost,127.0.0.1,{site_domain_bare},*.{base_domain},web" if base_domain else f"localhost,127.0.0.1,{site_domain_bare},web"
+
             # Update env.ilha file
             env_ilha = get_env_compose_file_path(worktree_path)
             if env_ilha.exists():
                 from ..utils.env_loader import load_env_file
                 existing_env = load_env_file(env_ilha)
                 content = env_ilha.read_text()
-                
-                # Check if CADDY_EMAIL is already set
+
+                # CADDY_EMAIL default (domain-only)
                 if 'CADDY_EMAIL' not in existing_env:
-                    # Set default CADDY_EMAIL based on domain
-                    default_caddy_email = f"admin@{domain}"
+                    default_caddy_email = f"admin@{site_domain_bare}"
                     log_warning(f"CADDY_EMAIL not set in env.ilha. Using default: {default_caddy_email}")
                     log_warning("This email is used for Let's Encrypt certificate notifications.")
                     log_warning("To customize, add CADDY_EMAIL=your-email@example.com to .ilha/env.ilha")
-                    
-                    # Add CADDY_EMAIL to content if not present
                     if 'CADDY_EMAIL=' not in content:
                         content += f"\nCADDY_EMAIL={default_caddy_email}\n"
-                
-                # Replace SITE_DOMAIN
-                content = re.sub(
-                    r'SITE_DOMAIN=.*',
-                    f'SITE_DOMAIN={https_url}',
+
+                # Shared env var updates
+                content = self._apply_common_env_overrides(
                     content,
-                    flags=re.MULTILINE
-                )
-                
-                # Update ALLOWED_HOSTS (use same allowed_hosts variable from above)
-                content = re.sub(
-                    r'ALLOWED_HOSTS=.*',
-                    f'ALLOWED_HOSTS={allowed_hosts}',
-                    content,
-                    flags=re.MULTILINE
-                )
-                
-                # Set DEBUG based on debug parameter
-                debug_value = 'True' if debug else 'False'
-                content = re.sub(
-                    r'DEBUG=.*',
-                    f'DEBUG={debug_value}',
-                    content,
-                    flags=re.MULTILINE | re.IGNORECASE
+                    site_domain=site_domain_bare,
+                    allowed_hosts=allowed_hosts,
+                    csrf_trusted_origins=csrf_trusted_origins,
+                    debug=debug,
                 )
 
-                # Ensure proxy/CSRF headers in env.ilha
-                if 'USE_X_FORWARDED_HOST=' in content:
-                    content = re.sub(r'USE_X_FORWARDED_HOST=.*', 'USE_X_FORWARDED_HOST=True', content, flags=re.MULTILINE)
-                else:
-                    content += "\nUSE_X_FORWARDED_HOST=True\n"
+                # Domain-specific: SECURE_PROXY_SSL_HEADER (HTTPS only)
+                content = self._update_env_var_in_content(content, 'SECURE_PROXY_SSL_HEADER', 'HTTP_X_FORWARDED_PROTO,https')
 
-                if 'SECURE_PROXY_SSL_HEADER=' in content:
-                    content = re.sub(r'SECURE_PROXY_SSL_HEADER=.*', 'SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https', content, flags=re.MULTILINE)
-                else:
-                    content += "\nSECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https\n"
-
-                csrf_value = f"https://{domain} http://{domain}"
-                if base_domain:
-                    csrf_value += f" https://*.{base_domain}"
-                if 'CSRF_TRUSTED_ORIGINS=' in content:
-                    content = re.sub(r'CSRF_TRUSTED_ORIGINS=.*', f'CSRF_TRUSTED_ORIGINS={csrf_value}', content, flags=re.MULTILINE)
-                else:
-                    content += f"\nCSRF_TRUSTED_ORIGINS={csrf_value}\n"
-                
-                # USE_SECURE_COOKIES (HTTPS domain deployments require secure cookies)
-                use_secure_cookies = self._should_use_secure_cookies(https_url)
-                if 'USE_SECURE_COOKIES=' in content:
-                    content = re.sub(r'USE_SECURE_COOKIES=.*', f'USE_SECURE_COOKIES={str(use_secure_cookies)}', content, flags=re.MULTILINE)
-                else:
-                    content += f"\nUSE_SECURE_COOKIES={str(use_secure_cookies)}\n"
-                
-                # Set BUILD_MODE=prod for production deployments
-                if 'BUILD_MODE=' in content:
-                    content = re.sub(r'BUILD_MODE=.*', 'BUILD_MODE=prod', content, flags=re.MULTILINE)
-                else:
-                    content += "\nBUILD_MODE=prod\n"
-                
                 env_ilha.write_text(content)
-                log_info(f"Applied domain overrides to env.ilha: {domain}")
+                log_info(f"Applied domain overrides to env.ilha: {site_domain_bare}")
             
             # Update docker-compose override file to add/update Caddy labels and ALLOWED_HOSTS
             # IMPORTANT: Only modify the .ilha/docker-compose.worktree.yml override file,
@@ -963,7 +994,7 @@ CADDY_EMAIL={caddy_email}
                         # This will ADD labels if missing, or update them if they exist
                         caddy_updated = ensure_caddy_labels_and_network(
                             compose_data, 
-                            domain=domain, 
+                            domain=site_domain_bare, 
                             ip=None, 
                             use_localhost_pattern=False  # Don't use localhost pattern, use domain
                         )
@@ -973,11 +1004,11 @@ CADDY_EMAIL={caddy_email}
                         vite_allowed_hosts_updated = False
                         volumes_updated = False
                         for service_name, service_config in compose_data['services'].items():
-                            if update_allowed_hosts_in_compose(service_config, domain):
+                            if update_allowed_hosts_in_compose(service_config, site_domain_bare):
                                 allowed_hosts_updated = True
                                 log_info(f"Updated ALLOWED_HOSTS for {service_name} in override file")
                             # Update VITE_ALLOWED_HOSTS for frontend services (Vite dev server)
-                            if update_vite_allowed_hosts_in_compose(service_config, domain, service_name):
+                            if update_vite_allowed_hosts_in_compose(service_config, site_domain_bare, service_name):
                                 vite_allowed_hosts_updated = True
                                 log_info(f"Updated VITE_ALLOWED_HOSTS for {service_name} in override file")
                         
@@ -1005,7 +1036,7 @@ CADDY_EMAIL={caddy_email}
                             # Write YAML with proper formatting
                             yaml_content = yaml.dump(compose_data, default_flow_style=False, sort_keys=False, allow_unicode=True)
                             compose_file.write_text(yaml_content)
-                            log_info(f"Updated override file {compose_file.name} with domain: {domain}")
+                            log_info(f"Updated override file {compose_file.name} with domain: {site_domain_bare}")
                             log_info(f"Caddy will route {domain} to containers when they start")
                         else:
                             log_info(f"No updates needed for override file (labels and ALLOWED_HOSTS already configured)")
@@ -1206,91 +1237,31 @@ CADDY_EMAIL={caddy_email}
 
         Sets SITE_DOMAIN to http://{ip}, updates ALLOWED_HOSTS to include
         the IP, and sets DEBUG based on debug parameter (default: False for production).
-        
-        Args:
-            worktree_path: Path to worktree directory
-            ip: IP address override
-            debug: Whether to enable DEBUG mode (default: False for production)
-            
-        Returns:
-            True if successful, False otherwise
         """
         try:
             from ..config.settings import build_allowed_hosts_with_container
             from ..utils.path_utils import get_env_compose_file_path
-            from ..utils.path_utils import get_worktree_branch_name
-            import re
 
-            # Extract branch name from worktree path
-            branch_name = get_worktree_branch_name(worktree_path)
-            
-            # Fallback: Try to extract from COMPOSE_PROJECT_NAME in env.ilha
-            if not branch_name:
-                env_ilha = get_env_compose_file_path(worktree_path)
-                if env_ilha.exists():
-                    content = env_ilha.read_text()
-                    for line in content.splitlines():
-                        if line.startswith('COMPOSE_PROJECT_NAME='):
-                            compose_project_name = line.split('=', 1)[1].strip().strip('"\'')
-                            # Extract branch name: {project-name}-{branch} -> {branch}
-                            parts = compose_project_name.rsplit('-', 1)
-                            if len(parts) == 2:
-                                branch_name = parts[1]
-                                break
-            
-            # If still no branch name, log warning and use existing behavior
-            if not branch_name:
-                log_warning(f"Could not determine branch name for worktree at {worktree_path}, using existing ALLOWED_HOSTS format without container name")
-                branch_name = None
+            branch_name = self._resolve_branch_name_from_worktree(worktree_path)
 
             http_url = f"http://{ip}"
-            
-            # Build ALLOWED_HOSTS with container name if branch_name is available
+
             if branch_name:
                 allowed_hosts = build_allowed_hosts_with_container(branch_name, [ip])
             else:
-                # Fallback to existing format
                 allowed_hosts = f"localhost,127.0.0.1,{ip},web"
 
             # Update env.ilha
             env_ilha = get_env_compose_file_path(worktree_path)
             if env_ilha.exists():
                 content = env_ilha.read_text()
-                content = re.sub(r'SITE_DOMAIN=.*', f'SITE_DOMAIN={http_url}', content, flags=re.MULTILINE)
-                content = re.sub(r'ALLOWED_HOSTS=.*', f'ALLOWED_HOSTS={allowed_hosts}', content, flags=re.MULTILINE)
-                # Set DEBUG based on debug parameter
-                debug_value = 'True' if debug else 'False'
-                content = re.sub(r'DEBUG=.*', f'DEBUG={debug_value}', content, flags=re.MULTILINE | re.IGNORECASE)
-                
-                # USE_SECURE_COOKIES (IP deployments are HTTP-only, no secure cookies)
-                use_secure_cookies = self._should_use_secure_cookies(http_url)
-                if 'USE_SECURE_COOKIES=' in content:
-                    content = re.sub(r'USE_SECURE_COOKIES=.*', f'USE_SECURE_COOKIES={str(use_secure_cookies)}', content, flags=re.MULTILINE)
-                else:
-                    content += f"\nUSE_SECURE_COOKIES={str(use_secure_cookies)}\n"
-                if 'USE_X_FORWARDED_HOST=' in content:
-                    content = re.sub(r'USE_X_FORWARDED_HOST=.*', 'USE_X_FORWARDED_HOST=True', content, flags=re.MULTILINE)
-                else:
-                    content += "\nUSE_X_FORWARDED_HOST=True\n"
-                csrf_value = f"http://{ip}"
-                if 'CSRF_TRUSTED_ORIGINS=' in content:
-                    content = re.sub(r'CSRF_TRUSTED_ORIGINS=.*', f'CSRF_TRUSTED_ORIGINS={csrf_value}', content, flags=re.MULTILINE)
-                else:
-                    content += f"\nCSRF_TRUSTED_ORIGINS={csrf_value}\n"
-                
-                # USE_SECURE_COOKIES (IP deployments are HTTP-only, no secure cookies)
-                use_secure_cookies = self._should_use_secure_cookies(http_url)
-                if 'USE_SECURE_COOKIES=' in content:
-                    content = re.sub(r'USE_SECURE_COOKIES=.*', f'USE_SECURE_COOKIES={str(use_secure_cookies)}', content, flags=re.MULTILINE)
-                else:
-                    content += f"\nUSE_SECURE_COOKIES={str(use_secure_cookies)}\n"
-                
-                # Set BUILD_MODE=prod for production deployments
-                if 'BUILD_MODE=' in content:
-                    content = re.sub(r'BUILD_MODE=.*', 'BUILD_MODE=prod', content, flags=re.MULTILINE)
-                else:
-                    content += "\nBUILD_MODE=prod\n"
-                
+                content = self._apply_common_env_overrides(
+                    content,
+                    site_domain=http_url,
+                    allowed_hosts=allowed_hosts,
+                    csrf_trusted_origins=f"http://{ip}",
+                    debug=debug,
+                )
                 env_ilha.write_text(content)
                 log_info(f"Applied IP overrides to env.ilha: {ip}")
             

@@ -1,8 +1,7 @@
 """
 JSON output utilities for ilha CLI.
 
-This module provides standardized JSON output formatting for CLI commands
-to support MCP server integration.
+This module provides standardized JSON output formatting for CLI commands.
 """
 
 import json

@@ -5,11 +5,14 @@ This module provides colored output and logging functionality that matches
 the bash script's output format.
 """
 
+import time
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 # Initialize console for colored output
@@ -18,8 +21,8 @@ console = Console()
 # Global verbose mode flag
 _verbose_mode = False
 
-# Global MCP mode flag - when True, don't print to stdout
-_mcp_mode = False
+# Global quiet mode flag - when True, suppress stdout output
+_quiet_mode = False
 
 # Color constants (matching bash script)
 class Colors:
@@ -35,14 +38,18 @@ def set_verbose(enabled: bool) -> None:
     global _verbose_mode
     _verbose_mode = enabled
 
-def set_mcp_mode(enabled: bool) -> None:
-    """Set MCP mode - when enabled, don't print to stdout."""
-    global _mcp_mode
-    _mcp_mode = enabled
+def set_quiet_mode(enabled: bool) -> None:
+    """Set quiet mode - when enabled, suppress stdout output."""
+    global _quiet_mode
+    _quiet_mode = enabled
 
-def is_mcp_mode() -> bool:
-    """Check if MCP mode is enabled."""
-    return _mcp_mode
+set_mcp_mode = set_quiet_mode  # backwards compat alias
+
+def is_quiet_mode() -> bool:
+    """Check if quiet mode is enabled."""
+    return _quiet_mode
+
+is_mcp_mode = is_quiet_mode  # backwards compat alias
 
 def is_verbose() -> bool:
     """Check if verbose mode is enabled."""
@@ -56,7 +63,7 @@ def log_info(message: str) -> None:
 
 def log_success(message: str) -> None:
     """Log a success message."""
-    if not _mcp_mode:
+    if not _quiet_mode:
         console.print(f"[{Colors.GREEN}][SUCCESS][/{Colors.GREEN}] {message}")
 
 def log_warning(message: str) -> None:
@@ -67,22 +74,22 @@ def log_warning(message: str) -> None:
 
 def log_error(message: str) -> None:
     """Log an error message."""
-    if not _mcp_mode:
+    if not _quiet_mode:
         console.print(f"[{Colors.RED}][ERROR][/{Colors.RED}] {message}")
 
 def log_phase(message: str) -> None:
     """Log a phase message."""
-    if not _mcp_mode:
+    if not _quiet_mode:
         console.print(f"[{Colors.PURPLE}][PHASE][/{Colors.PURPLE}] {message}")
 
 def log_test(message: str) -> None:
     """Log a test message."""
-    if not _mcp_mode:
+    if not _quiet_mode:
         console.print(f"[{Colors.CYAN}][TEST][/{Colors.CYAN}] {message}")
 
 def print_plain(message: str) -> None:
     """Print plain text without any prefix."""
-    if not _mcp_mode:
+    if not _quiet_mode:
         console.print(message)
 
 def show_version() -> None:
@@ -200,3 +207,196 @@ def error_exit(message: str, exit_code: int = 1) -> None:
     """Log an error and exit."""
     log_error(message)
     raise SystemExit(exit_code)
+
+
+def log_step(message: str) -> None:
+    """Log a step message (always shown in non-quiet mode).
+
+    Use this for major operation milestones that the user should see
+    regardless of verbose mode.
+    """
+    if not _quiet_mode:
+        console.print(f"  [{Colors.BLUE}]●[/{Colors.BLUE}] {message}...", highlight=False)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Option 2: Multi-stage progress tracker
+# ──────────────────────────────────────────────────────────────────
+
+class StageTracker:
+    """Track and display multi-stage operation progress with timing.
+
+    Usage::
+
+        with StageTracker("Deploying feature-auth → 1.2.3.4") as tracker:
+            with tracker.stage("Preflight checks"):
+                run_preflight()
+            # parallel stages — record results manually
+            tracker.record("DNS configuration", elapsed=4.1)
+            tracker.record("Server preparation", elapsed=72.3)
+    """
+
+    def __init__(self, title: str):
+        self._title = title
+        self._stages: List[Tuple[str, str, float]] = []  # (name, status, duration)
+        self._start_time: Optional[float] = None
+
+    def __enter__(self):
+        self._start_time = time.time()
+        if not _quiet_mode:
+            console.print(f"\n[bold]{self._title}[/bold]")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    @contextmanager
+    def stage(self, name: str):
+        """Context manager for a sequential stage with spinner."""
+        started = time.time()
+        if _quiet_mode:
+            yield
+            elapsed = time.time() - started
+            self._stages.append((name, "done", elapsed))
+            return
+
+        status = console.status(f"  [blue]●[/blue] {name}...")
+        status.start()
+        try:
+            yield
+        except Exception:
+            status.stop()
+            elapsed = time.time() - started
+            self._stages.append((name, "failed", elapsed))
+            console.print(
+                f"  [{Colors.RED}]✗[/{Colors.RED}] {name}"
+                f"  [dim]{format_elapsed_time(elapsed)}[/dim]",
+                highlight=False,
+            )
+            raise
+        else:
+            status.stop()
+            elapsed = time.time() - started
+            self._stages.append((name, "done", elapsed))
+            console.print(
+                f"  [{Colors.GREEN}]✓[/{Colors.GREEN}] {name}"
+                f"  [dim]{format_elapsed_time(elapsed)}[/dim]",
+                highlight=False,
+            )
+
+    def record(self, name: str, elapsed: float, status: str = "done") -> None:
+        """Record a completed stage (for parallel stages managed externally)."""
+        self._stages.append((name, status, elapsed))
+        if _quiet_mode:
+            return
+        if status == "done":
+            console.print(
+                f"  [{Colors.GREEN}]✓[/{Colors.GREEN}] {name}"
+                f"  [dim]{format_elapsed_time(elapsed)}[/dim]",
+                highlight=False,
+            )
+        elif status == "failed":
+            console.print(
+                f"  [{Colors.RED}]✗[/{Colors.RED}] {name}"
+                f"  [dim]{format_elapsed_time(elapsed)}[/dim]",
+                highlight=False,
+            )
+        elif status == "skipped":
+            console.print(f"  [dim]–[/dim] [dim]{name} (skipped)[/dim]", highlight=False)
+
+    @property
+    def total_elapsed(self) -> float:
+        if self._start_time is None:
+            return 0.0
+        return time.time() - self._start_time
+
+    @property
+    def stages(self) -> List[Tuple[str, str, float]]:
+        return list(self._stages)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Option 3: Post-operation deploy report
+# ──────────────────────────────────────────────────────────────────
+
+_STAGE_DISPLAY_NAMES = {
+    "preflight": "Preflight",
+    "assemble_prepare_dns": "Server prep + assembly",
+    "disk_check": "Disk check",
+    "volume_backup": "Volume backup",
+    "transfer": "Code sync",
+    "remote_prepare": "Remote services",
+    "app_start": "App start",
+    "smoke_checks": "Smoke checks",
+}
+
+
+def render_deploy_report(report: Dict[str, Any]) -> None:
+    """Render a structured deploy report table after a deploy operation."""
+    if _quiet_mode:
+        return
+
+    stage_timings: Dict[str, float] = report.get("stage_timings", {})
+    error_info: Optional[Dict[str, Any]] = report.get("error")
+    success: bool = report.get("success", False)
+
+    if not stage_timings and not error_info:
+        return
+
+    table = Table(border_style="dim", show_header=True, pad_edge=False, box=None)
+    table.add_column("Stage", min_width=28)
+    table.add_column("Duration", justify="right", min_width=8)
+    table.add_column("Status", min_width=8)
+
+    failed_stage_key = error_info.get("stage") if error_info else None
+    total_seconds = 0.0
+
+    for key, duration in stage_timings.items():
+        name = _STAGE_DISPLAY_NAMES.get(key, key)
+        total_seconds += duration
+        if key == failed_stage_key:
+            table.add_row(
+                f"[red]{name}[/red]",
+                format_elapsed_time(duration),
+                "[red]✗ failed[/red]",
+            )
+        else:
+            table.add_row(name, format_elapsed_time(duration), "[green]✓[/green]")
+
+    # If the failed stage has no timing yet, add it separately
+    if failed_stage_key and failed_stage_key not in stage_timings:
+        name = _STAGE_DISPLAY_NAMES.get(failed_stage_key, failed_stage_key)
+        table.add_row(f"[red]{name}[/red]", "", "[red]✗ failed[/red]")
+
+    console.print()
+    title_style = "[bold green]" if success else "[bold red]"
+    title_label = "Deploy Report" if success else "Deploy Report (failed)"
+    console.print(f"  {title_style}{title_label}[/]")
+    console.print()
+    console.print(table)
+    if total_seconds > 0:
+        console.print(f"\n  [bold]Total: {format_elapsed_time(total_seconds)}[/bold]")
+
+    # Disk usage warning
+    disk_check = report.get("disk_check")
+    if disk_check:
+        usage = disk_check.get("usage_percent") or disk_check.get("app_usage_percent")
+        if usage and usage > 70:
+            console.print(f"  [yellow]⚠ Disk usage on server: {usage}%[/yellow]")
+
+    # URL on success
+    url = report.get("url")
+    if url and success:
+        console.print(f"\n  [bold green]🌐 {url}[/bold green]")
+
+    # Suggested actions on failure
+    if error_info:
+        root_cause = error_info.get("root_cause")
+        if root_cause:
+            console.print(f"\n  [red]Cause:[/red] {root_cause}")
+        actions = error_info.get("suggested_actions", [])
+        if actions:
+            console.print(f"  [yellow]Suggested actions:[/yellow]")
+            for action in actions:
+                console.print(f"    • {action}")
+    console.print()

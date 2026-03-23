@@ -1,12 +1,12 @@
 """
 Core worktree orchestration for ilha.
 
-This module provides the core orchestration logic that both CLI and MCP interfaces use.
-It contains all the business logic for worktree operations without any interface-specific
-formatting or presentation concerns.
+This module provides the core orchestration logic for worktree operations
+without any interface-specific formatting or presentation concerns.
 """
 
 import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -14,45 +14,51 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..config.settings import get_project_root, get_script_dir, get_project_name, sanitize_project_name
+from ..config.settings import (
+    get_project_root,
+    get_script_dir,
+    get_project_name,
+    get_volume_names,
+    sanitize_project_name,
+)
 from ..core.docker_manager import DockerManager
 from ..core.git_manager import GitManager
 from ..core.environment_manager import EnvironmentManager
 from ..utils.path_utils import (
-    get_compose_override_path, 
+    get_compose_override_path,
     get_worktree_branch_name,
-    ensure_main_repo
+    ensure_main_repo,
 )
-from ..utils.validation import validate_branch_exists, validate_worktree_name_not_reserved
+from ..utils.validation import validate_branch_exists, validate_worktree_name_not_reserved, validate_volume_exists
 from ..utils.pattern_matcher import get_matching_branches
 from ..utils.confirmation import confirm_batch_operation
-from ..utils.logging import set_mcp_mode, log_info, log_success, log_warning, log_error
+from ..utils.logging import set_quiet_mode, log_info, log_success, log_warning, log_error
 
 
 class WorktreeOrchestrator:
-    """Core worktree orchestration - used by both CLI and MCP."""
-    
+    """Core worktree orchestration."""
+
     def __init__(self, project_root: Optional[Path] = None, mcp_mode: bool = False):
-        """Initialize worktree orchestrator."""
+        """Initialize worktree orchestrator.
+
+        Args:
+            project_root: Project root path (auto-detected if None)
+            mcp_mode: If True, suppress stdout logging (quiet mode)
+        """
         if project_root is None:
-            # Detect if we're in a worktree context for fractal operation
             from ..utils.path_utils import detect_execution_context
             worktree_path, branch_name, is_worktree = detect_execution_context()
-            
+
             if is_worktree and worktree_path:
-                # Use worktree as project root for fractal operation
                 self.project_root = worktree_path
             else:
-                # Use standard project root detection
                 self.project_root = get_project_root()
         else:
             self.project_root = Path(project_root).resolve()
-        
-        # Enable MCP mode to suppress stdout logging
+
         if mcp_mode:
-            set_mcp_mode(True)
-        
-        # Store mcp_mode as instance attribute for use in methods
+            set_quiet_mode(True)
+
         self.mcp_mode = mcp_mode
         
         self.git_manager = GitManager(project_root=self.project_root, validate=False)
@@ -199,8 +205,107 @@ class WorktreeOrchestrator:
         except Exception:
             return False
     
-    def create_worktree(self, branch_name: str) -> Dict[str, Any]:
-        """Create a new worktree with complete orchestration."""
+    def _worktree_env_exists(self, worktree_path: Path, branch_name: str) -> bool:
+        """Return True if ilha environment exists (env file and volumes)."""
+        env_file = worktree_path / ".ilha" / "env.ilha"
+        if not env_file.exists():
+            return False
+        volume_names = get_volume_names(branch_name)
+        all_exist = all(validate_volume_exists(vol_name) for vol_name in volume_names.values())
+        return all_exist
+
+    def _create_worktree_environment(self, worktree_path: Path, branch_name: str, force_volumes: bool) -> Dict[str, Any]:
+        """Create or recreate ilha environment for a worktree (volumes, env files, network)."""
+        ilha_copied = self._copy_ilha_to_worktree(worktree_path)
+        if not self.docker_manager.create_network():
+            log_warning("Failed to create Docker network (may already exist)")
+        volumes_created = self.docker_manager.create_worktree_volumes(
+            branch_name, project_name=None, force_copy=force_volumes
+        )
+        env_created = self.env_manager.create_worktree_env(branch_name, worktree_path)
+        return {
+            "ilha_copied": ilha_copied,
+            "volumes_created": volumes_created,
+            "env_created": env_created,
+        }
+
+    def _rmtree_writable(self, path: Path) -> None:
+        """Remove a directory tree (best-effort; never raises)."""
+        path = Path(path).resolve()
+        if not path.exists():
+            return
+        try:
+            subprocess.run(
+                ["rm", "-rf", str(path)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+            return
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        try:
+            for root, dirs, files in os.walk(str(path), topdown=False):
+                for name in files:
+                    p = Path(root) / name
+                    try:
+                        p.chmod(stat.S_IRUSR | stat.S_IWUSR)
+                    except OSError:
+                        pass
+                for name in dirs:
+                    p = Path(root) / name
+                    try:
+                        p.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+                    except OSError:
+                        pass
+            try:
+                path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            except OSError:
+                pass
+            shutil.rmtree(path, ignore_errors=False)
+        except OSError:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _create_result(
+        self,
+        worktree_path: Path,
+        branch_name: str,
+        status: str,
+        env_data: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a successful create_worktree result (DRY)."""
+        messages = {
+            "env_already_exists": f"Environment already exists for {branch_name}. Use --force to recreate.",
+            "env_created": f"Environment created for {branch_name}",
+            "env_recreated": f"Environment recreated for {branch_name}",
+            "created": f"Worktree created for {branch_name}",
+        }
+        data = {
+            "branch": branch_name,
+            "worktree_path": str(worktree_path),
+            "status": status,
+        }
+        if env_data:
+            data.update(env_data)
+        return {
+            "success": True,
+            "data": data,
+            "message": message or messages.get(status, f"Worktree ready for {branch_name}"),
+        }
+
+    def create_worktree(self, branch_name: str, force: bool = False) -> Dict[str, Any]:
+        """Create a new worktree or ilha environment for an existing worktree.
+        
+        When the worktree already exists: creates ilha environment (database volumes,
+        env files, caddy network) if missing; if env already exists, warns unless --force.
+        With --force, recreates the environment (volumes re-copied from main, env files regenerated).
+        """
         try:
             if not branch_name:
                 return {
@@ -225,22 +330,30 @@ class WorktreeOrchestrator:
             if worktree_path:
                 worktree_dir_exists = worktree_path.exists()
             
-            # If worktree exists in git or directory exists, treat as existing
+            # If worktree exists in git or directory exists, set up or recreate environment
             if worktree_exists or (worktree_path and worktree_dir_exists):
-                if worktree_path and worktree_path.exists():
-                    return {
-                        "success": True,
-                        "data": {
-                            "branch": branch_name,
-                            "worktree_path": str(worktree_path),
-                            "status": "already_exists"
-                        }
-                    }
-                else:
+                if not worktree_path or not worktree_path.exists():
                     return {
                         "success": False,
                         "error": f"Worktree directory not found for branch '{branch_name}'. The worktree may be corrupted."
                     }
+                env_exists = self._worktree_env_exists(worktree_path, branch_name)
+                if env_exists and not force:
+                    log_warning(
+                        f"Worktree and ilha environment already exist for '{branch_name}'. "
+                        "Use --force to recreate the environment (volumes and env files)."
+                    )
+                    return self._create_result(worktree_path, branch_name, "env_already_exists")
+                # Recreate or create environment (single path)
+                status = "env_recreated" if (env_exists and force) else "env_created"
+                if env_exists and force:
+                    log_info(f"Recreating ilha environment for existing worktree '{branch_name}' (--force)")
+                else:
+                    log_info(f"Creating ilha environment for existing worktree '{branch_name}'")
+                env_data = self._create_worktree_environment(worktree_path, branch_name, force_volumes=True)
+                return self._create_result(
+                    worktree_path, branch_name, status, env_data=env_data
+                )
             
             # Create branch if it doesn't exist
             if not self.git_manager.create_branch(branch_name):
@@ -263,32 +376,47 @@ class WorktreeOrchestrator:
             # Create worktree
             success, error_type = self.git_manager.create_worktree(branch_name, new_path)
             if not success:
-                return self._handle_worktree_creation_error(branch_name, error_type)
+                if error_type == "already_exists":
+                    # Worktree registered in git but path missing or not found: prune and re-resolve or retry
+                    worktree_path = self.git_manager.find_worktree_path(branch_name)
+                    if worktree_path and worktree_path.exists():
+                        log_info(f"Worktree path found for '{branch_name}', creating ilha environment")
+                        env_data = self._create_worktree_environment(worktree_path, branch_name, force_volumes=True)
+                        return self._create_result(worktree_path, branch_name, "env_created", env_data=env_data)
+                    self.git_manager.worktree_prune_silent()
+                    worktree_path = self.git_manager.find_worktree_path(branch_name)
+                    if worktree_path and worktree_path.exists():
+                        log_info(f"After prune: worktree path found for '{branch_name}', creating ilha environment")
+                        env_data = self._create_worktree_environment(worktree_path, branch_name, force_volumes=True)
+                        return self._create_result(worktree_path, branch_name, "env_created", env_data=env_data)
+                    # Stale entry pruned; remove leftover directory if present so retry can succeed
+                    if new_path.exists():
+                        log_info(f"Removing stale worktree directory for '{branch_name}' before retry")
+                        try:
+                            shutil.rmtree(new_path, ignore_errors=False)
+                        except OSError as e:
+                            if e.errno == 13:  # Permission denied
+                                self._rmtree_writable(new_path)
+                            else:
+                                raise
+                        if new_path.exists():
+                            return {
+                                "success": False,
+                                "error": (
+                                    f"Stale worktree directory could not be removed (permission denied): {new_path}\n"
+                                    "Remove it manually and run create again, e.g.: rm -rf \"{}\"".format(new_path)
+                                ),
+                            }
+                    success, error_type = self.git_manager.create_worktree(branch_name, new_path)
+                    if not success:
+                        return self._handle_worktree_creation_error(branch_name, error_type)
+                else:
+                    return self._handle_worktree_creation_error(branch_name, error_type)
             
-            # Copy .ilha configuration to worktree for fractal design
-            ilha_copied = self._copy_ilha_to_worktree(new_path)
-            
-            # Create worktree-specific volumes
-            volumes_created = self.docker_manager.create_worktree_volumes(branch_name, project_name=None, force_copy=True)
-            
-            # Create environment file
-            env_created = self.env_manager.create_worktree_env(branch_name, new_path)
-            
-            # Get worktree path for return data
-            worktree_path = self.git_manager.find_worktree_path(branch_name)
-            
-            return {
-                "success": True,
-                "data": {
-                    "branch": branch_name,
-                    "worktree_path": str(worktree_path) if worktree_path else str(new_path),
-                    "ilha_copied": ilha_copied,
-                    "volumes_created": volumes_created,
-                    "env_created": env_created,
-                    "status": "created"
-                },
-                "message": f"Worktree created for {branch_name}"
-            }
+            # Create ilha environment (volumes, env files, network)
+            env_data = self._create_worktree_environment(new_path, branch_name, force_volumes=True)
+            worktree_path = self.git_manager.find_worktree_path(branch_name) or new_path
+            return self._create_result(worktree_path, branch_name, "created", env_data=env_data)
             
         except Exception as e:
             # Catch and return any exceptions
@@ -359,6 +487,9 @@ class WorktreeOrchestrator:
         env_file = worktree_path / ".ilha" / "env.ilha"
         main_env_file = worktree_path / ".env"
 
+        # Ensure env.ilha has per-worktree subnet vars (Option 3; patches older worktrees)
+        self.env_manager.ensure_worktree_env_has_subnet_vars(worktree_path, resolved_branch_name)
+
         if not env_file.exists() or not main_env_file.exists():
             # Try to create missing environment files
             if not self.env_manager.create_worktree_env(resolved_branch_name, worktree_path):
@@ -385,11 +516,18 @@ class WorktreeOrchestrator:
 
         # Get the full compose project name (project-branch format)
         project_name = sanitize_project_name(self._get_project_name())
-        compose_project_name = f"{project_name}-{resolved_branch_name}"
+        compose_project_name = f"{project_name}-{sanitize_project_name(resolved_branch_name)}"
         
-        success = self.docker_manager.run_compose_command(
+        success, stderr = self.docker_manager.run_compose_command(
             compose_file, ["up", "-d"], env_file, compose_project_name, worktree_path, profile=profile
         )
+        # Option 2: on pool overlap, remove project networks and retry once
+        if not success and stderr and ("overlaps" in stderr or "invalid pool request" in stderr):
+            log_info("Pool overlap detected, removing project networks and retrying...")
+            self.docker_manager.remove_project_networks(compose_project_name)
+            success, _ = self.docker_manager.run_compose_command(
+                compose_file, ["up", "-d"], env_file, compose_project_name, worktree_path, profile=profile
+            )
         
         if not success:
             return {
@@ -405,7 +543,10 @@ class WorktreeOrchestrator:
 
         # Get the correct domain name with project prefix
         domain_name = self.env_manager.get_domain_name(resolved_branch_name)
-        
+
+        # Smoke check: verify the app is reachable through Caddy
+        smoke_ok = self._smoke_check_url(f"http://{domain_name}/")
+
         return {
             "success": True,
             "data": {
@@ -413,10 +554,49 @@ class WorktreeOrchestrator:
                 "worktree_path": str(worktree_path),
                 "compose_project_name": compose_project_name,
                 "domain_name": domain_name,
-                "caddy_configured": caddy_success
+                "caddy_configured": caddy_success,
+                "smoke_ok": smoke_ok,
             }
         }
     
+    @staticmethod
+    def _smoke_check_url(url: str, timeout: int = 30) -> bool:
+        """Probe *url* with retries to verify the app is reachable.
+
+        Returns True if the URL responds with any HTTP status (even an error
+        page or a redirect to HTTPS means the stack is up).  Returns False
+        only when every attempt fails to connect.  This is intentionally
+        non-fatal — the worktree start still succeeds so the user can debug
+        a running container.
+        """
+        import http.client
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+
+        delays = [0, 1, 2, 4, 8]
+        deadline = time.time() + timeout
+
+        for attempt, delay in enumerate(delays, 1):
+            if delay:
+                time.sleep(delay)
+            if time.time() > deadline:
+                break
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request("HEAD", path)
+                conn.getresponse()
+                conn.close()
+                # Any HTTP response (2xx, 3xx, 4xx, 5xx) means the stack is up
+                return True
+            except (OSError, http.client.HTTPException):
+                pass
+
+        return False
+
     def _configure_caddy_routes(self) -> bool:
         """Configure Caddy routes for dynamic routing."""
         try:
@@ -490,11 +670,13 @@ class WorktreeOrchestrator:
         
         # Get the full compose project name (project-branch format)
         project_name = sanitize_project_name(self._get_project_name())
-        compose_project_name = f"{project_name}-{branch_name}"
+        compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
         
-        success = self.docker_manager.run_compose_command(
+        success, _ = self.docker_manager.run_compose_command(
             compose_file, ["down"], env_file, compose_project_name, worktree_path, extra_flags
         )
+        # Remove any leftover project networks to avoid pool-overlap on next up (Option 1)
+        self.docker_manager.remove_project_networks(compose_project_name)
         
         return {
             "success": True,
@@ -508,9 +690,6 @@ class WorktreeOrchestrator:
     
     def _check_volumes_exist(self, branch_name: str) -> List[str]:
         """Check which volumes exist for this exact branch name."""
-        from ..config.settings import get_volume_names
-        from ..utils.validation import validate_volume_exists
-        
         volume_names = get_volume_names(branch_name)
         existing = []
         for volume_type, volume_name in volume_names.items():
@@ -644,7 +823,29 @@ class WorktreeOrchestrator:
             "success": True,
             "data": worktree_data
         }
-    
+
+    def get_worktree_status(
+        self, branch_name: str, containers: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """Return 'running' if any worktree container is up, else 'stopped'.
+
+        Args:
+            branch_name: Branch name for the worktree.
+            containers: Optional pre-fetched container list (avoids second sync when
+                called from get_worktree_info).
+
+        Returns:
+            'running' or 'stopped'. On Docker/API failure, returns 'stopped'.
+        """
+        if containers is None:
+            try:
+                containers = self.docker_manager.get_worktree_containers_sync(branch_name)
+            except Exception:
+                return "stopped"
+        if not containers:
+            return "stopped"
+        return "running" if any(c.get("state") == "running" for c in containers) else "stopped"
+
     def get_worktree_info(self, branch_name: str) -> Dict[str, Any]:
         """Get detailed worktree information."""
         worktree_exists = self.git_manager.validate_worktree_exists(branch_name)
@@ -667,11 +868,7 @@ class WorktreeOrchestrator:
         except Exception:
             pass
         
-        # Determine overall status
-        running_containers = [c for c in containers if c.get("state") == "running"]
-        is_running = len(running_containers) > 0
-        
-        # Get domain name
+        status = self.get_worktree_status(branch_name, containers=containers)
         domain_name = self.env_manager.get_domain_name(branch_name)
         
         return {
@@ -679,7 +876,7 @@ class WorktreeOrchestrator:
             "data": {
                 "branch": branch_name,
                 "worktree_path": str(worktree_path) if worktree_path else None,
-                "status": "running" if is_running else "stopped",
+                "status": status,
                 "containers": containers,
                 "volumes": volumes,
                 "domain_name": domain_name,

@@ -32,7 +32,6 @@ class GitManager:
             validate: If True, raise exception if not in git repo. If False, just log warning.
         """
         # Use the provided project_root directly, don't fall back to get_project_root()
-        # This ensures MCP server uses the correct working directory
         if project_root is None:
             self.project_root = get_project_root()
         else:
@@ -151,31 +150,62 @@ class GitManager:
                 # First, prune the worktree from git's tracking
                 subprocess.run(["git", "worktree", "prune"], cwd=self.project_root, capture_output=True)
                 
-                # Then try to remove the directory manually
+                # Then try to remove the directory: shutil then rm -rf fallback
                 import shutil
                 try:
                     shutil.rmtree(worktree_path, ignore_errors=True)
-                    
-                    # Verify it's actually gone
-                    if not worktree_path.exists():
-                        log_success(f"Manually removed worktree directory: {worktree_path}")
-                        return True
-                    else:
-                        # Directory still exists (probably has root-owned files)
-                        log_warning(f"Could not completely remove {worktree_path}")
-                        log_info("This usually happens when Docker created files owned by root")
-                        log_info("To fix manually:")
-                        log_info(f"  1. sudo rm -rf {worktree_path}")
-                        log_info(f"  2. git worktree prune")
-                        return False
                 except Exception as cleanup_error:
                     log_error(f"Error during cleanup: {cleanup_error}")
-                    log_info("This usually happens when Docker created files owned by root")
-                    log_info("To fix manually:")
-                    log_info(f"  1. sudo rm -rf {worktree_path}")
-                    log_info(f"  2. git worktree prune")
-                    return False
+                if not worktree_path.exists():
+                    log_success(f"Manually removed worktree directory: {worktree_path}")
+                    return True
+                try:
+                    subprocess.run(
+                        ["rm", "-rf", str(worktree_path)],
+                        check=True,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+                if not worktree_path.exists():
+                    log_success(f"Manually removed worktree directory: {worktree_path}")
+                    return True
+                # Directory still exists (e.g. root-owned files)
+                log_warning(f"Could not completely remove {worktree_path}")
+                log_info("This usually happens when Docker created files owned by root")
+                log_info("To fix manually:")
+                log_info(f"  1. sudo rm -rf {worktree_path}")
+                log_info(f"  2. git worktree prune")
+                return False
             
+            # Stale worktree (e.g. "is not a working tree"): prune and remove dir if present
+            stderr_lower = (result.stderr or "").lower()
+            if "not a working tree" in stderr_lower or "no longer exists" in stderr_lower:
+                subprocess.run(["git", "worktree", "prune"], cwd=self.project_root, capture_output=True)
+                if worktree_path.exists():
+                    log_warning("Removing stale worktree directory...")
+                    try:
+                        import shutil
+                        shutil.rmtree(worktree_path, ignore_errors=True)
+                    except Exception:
+                        pass
+                    if worktree_path.exists():
+                        try:
+                            subprocess.run(
+                                ["rm", "-rf", str(worktree_path)],
+                                check=True,
+                                capture_output=True,
+                                timeout=30,
+                            )
+                        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                            pass
+                    if not worktree_path.exists():
+                        log_success(f"Removed stale worktree directory: {worktree_path}")
+                        return True
+                else:
+                    return True
+
             log_error(f"Failed to remove git worktree {worktree_path}: {result.stderr}")
             return False
             
@@ -208,6 +238,19 @@ class GitManager:
         
         return worktrees
     
+    def worktree_prune_silent(self) -> bool:
+        """Run git worktree prune (no logging). Returns True if prune succeeded."""
+        try:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                capture_output=True,
+                check=True,
+                cwd=self.project_root,
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
     def prune_worktrees(self) -> int:
         """Prune worktrees and return count of pruned worktrees."""
         try:

@@ -12,17 +12,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config.settings import (
-    CADDY_NETWORK, 
-    get_compose_command, 
+    CADDY_NETWORK,
+    get_compose_command,
     get_volume_names,
     get_volume_names_for_project_root,
     get_source_volume_names,
+    get_source_volume_names_for_project_root,
     DEFAULT_ENV_VARS,
     get_project_root,
     get_project_name,
-    sanitize_project_name
+    sanitize_project_name,
+    POSTGRES_VOLUME_SUFFIX,
 )
 from ..utils.logging import log_info, log_success, log_warning, log_error, show_progress
+from ..utils.file_utils import ensure_entrypoint_executable
 from ..utils.validation import (
     validate_docker_running, validate_network_exists, validate_volume_exists,
     get_containers_using_volume, are_containers_running, get_postgres_container_for_volume
@@ -41,7 +44,6 @@ class DockerManager:
             validate: If True, raise exception if Docker not running. If False, just log warning.
         """
         # Use the provided project_root directly, don't fall back to get_project_root()
-        # This ensures MCP server uses the correct working directory
         if project_root is None:
             self.project_root = get_project_root()
         else:
@@ -80,7 +82,46 @@ class DockerManager:
         except Exception as e:
             log_error(f"Failed to create network {network_name}: {e}")
             return False
-    
+
+    def remove_project_networks(self, compose_project_name: str) -> None:
+        """Remove Docker networks for a compose project (prefix match).
+
+        Used after down or on pool-overlap to avoid stale networks causing
+        'Pool overlaps with other one on this address space' on next up.
+
+        Args:
+            compose_project_name: Project name (e.g. business-intelligence-ainaro).
+        """
+        prefix = f"{compose_project_name}_"
+        try:
+            result = subprocess.run(
+                ["docker", "network", "ls", "--format", "{{.Name}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            names = [n.strip() for n in (result.stdout or "").splitlines() if n.strip()]
+            for name in names:
+                if name.startswith(prefix):
+                    try:
+                        subprocess.run(
+                            ["docker", "network", "rm", name],
+                            capture_output=True,
+                            check=True,
+                            timeout=30,
+                        )
+                        log_info(f"Removed network {name}")
+                    except subprocess.CalledProcessError as e:
+                        if "has active endpoints" in (e.stderr or ""):
+                            log_info(f"Network {name} in use, skipping")
+                        else:
+                            log_warning(f"Could not remove network {name}: {e.stderr or e}")
+                    except Exception as e:
+                        log_warning(f"Could not remove network {name}: {e}")
+        except Exception as e:
+            log_warning(f"Could not list networks for cleanup: {e}")
+
     def copy_volume(self, source_volume: str, target_volume: str, source_project_name: str = None) -> bool:
         """Copy volume data from source to target using file-level copy.
         
@@ -271,13 +312,14 @@ class DockerManager:
         # Get target volumes using centralized function (worktree volumes use sanitized names)
         volume_names = get_volume_names(branch_name)
         
-        # Get source volumes using centralized function (master volumes use original format)
-        project_volumes = get_source_volume_names()
+        # Get source volumes from this project root (not cwd) so we use the correct main DB
+        project_volumes = get_source_volume_names_for_project_root(self.project_root)
         
-        # Determine sanitized project name for container name matching
+        # Derive sanitized project name from same project root (for container matching)
         if project_name is None:
-            project_name = sanitize_project_name(get_project_name())
-        # If project_name is provided, use it as-is (assumed to be sanitized)
+            source_postgres = project_volumes.get("postgres", "")
+            unsanitized = source_postgres.replace(f"_{POSTGRES_VOLUME_SUFFIX}", "") if source_postgres else self.project_root.name
+            project_name = sanitize_project_name(unsanitized)
         
         # Check if all volumes already exist
         all_volumes_exist = all(validate_volume_exists(vol_name) for vol_name in volume_names.values())
@@ -375,32 +417,39 @@ class DockerManager:
         temp_backup_dir.mkdir(exist_ok=True)
         
         try:
-            # Backup each volume using file-level copy (all volumes, including PostgreSQL)
-            for volume_type, volume_name in volume_names.items():
+            # Backup each volume in parallel (uncompressed tar per volume,
+            # single gzip pass on the combined archive to avoid triple compression)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _backup_one_volume(volume_type, volume_name):
                 if not validate_volume_exists(volume_name):
                     log_warning(f"Volume {volume_name} not found, skipping")
-                    continue
-                
+                    return False
                 log_info(f"Backing up volume: {volume_name} ({volume_type})")
-                
-                # Use file-level backup for all volumes
-                volume_backup = temp_backup_dir / f"{volume_name}.tar.gz"
-                
                 try:
                     subprocess.run([
                         "docker", "run", "--rm",
                         "-v", f"{volume_name}:/data",
                         "-v", f"{temp_backup_dir.absolute()}:/backup",
-                        "alpine", "tar", "czf", f"/backup/{volume_name}.tar.gz", "-C", "/data", "."
+                        "alpine", "tar", "cf", f"/backup/{volume_name}.tar", "-C", "/data", "."
                     ], check=True, capture_output=True, text=True)
-                    log_success(f"Volume backup created: {volume_name}.tar.gz")
+                    log_success(f"Volume backup created: {volume_name}.tar")
+                    return True
                 except subprocess.CalledProcessError as e:
                     log_error(f"Failed to backup volume {volume_name}: {e}")
                     if e.stderr:
                         log_error(f"Error details: {e.stderr}")
-                    continue
-            
-            # Create combined backup
+                    return False
+
+            with ThreadPoolExecutor(max_workers=min(4, len(volume_names))) as executor:
+                futures = {
+                    executor.submit(_backup_one_volume, vtype, vname): vname
+                    for vtype, vname in volume_names.items()
+                }
+                for future in as_completed(futures):
+                    future.result()  # propagate exceptions
+
+            # Single compression pass on the combined archive
             subprocess.run([
                 "tar", "czf", str(backup_file), "-C", str(temp_backup_dir), "."
             ], check=True, capture_output=True)
@@ -502,7 +551,7 @@ class DockerManager:
             project_name = self.project_root.name
         
         project_name = sanitize_project_name(project_name)
-        compose_project_name = f"{project_name}-{branch_name}"
+        compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
         
         # Extract volumes from service
         volumes = []
@@ -591,7 +640,7 @@ class DockerManager:
                 project_name = project_root.name
             
             project_name = sanitize_project_name(project_name)
-            compose_project_name = f"{project_name}-{branch_name}"
+            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
             
             result = subprocess.run(
                 ["docker", "compose", "-f", str(compose_file), "-p", compose_project_name, "down"],
@@ -1074,9 +1123,9 @@ class DockerManager:
                           project_name: Optional[str] = None,
                           working_dir: Optional[Path] = None,
                           extra_flags: Optional[List[str]] = None,
-                          profile: Optional[str] = None) -> bool:
+                          profile: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """Run a docker compose command.
-        
+
         Args:
             compose_file: Path to the compose file
             command: Command to run (e.g., ["up", "-d"])
@@ -1085,12 +1134,16 @@ class DockerManager:
             working_dir: Optional working directory
             extra_flags: Optional list of additional flags to append to the command
             profile: Optional Docker Compose profile to use
+
+        Returns:
+            (True, None) on success; (False, stderr_text) on failure.
         """
         # Build base command
         cmd = self._build_compose_base_command()
         
         # Resolve working directory
         working_dir = self._resolve_working_directory(working_dir)
+        ensure_entrypoint_executable(compose_file, working_dir)
 
         # Explicitly load .env from the working directory first, if it exists
         main_env_file = working_dir / ".env"
@@ -1128,10 +1181,10 @@ class DockerManager:
         
         try:
             result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=working_dir, env=env)
-            return True
+            return (True, None)
         except subprocess.CalledProcessError as e:
             self._handle_compose_error(e)
-            return False
+            return (False, e.stderr or "")
 
     def run_compose_command_with_profile(self, compose_file: Path, compose_override: Path,
                                        command: List[str], env_file: Optional[Path] = None,
@@ -1155,6 +1208,7 @@ class DockerManager:
 
         # Resolve working directory
         working_dir = self._resolve_working_directory(working_dir)
+        ensure_entrypoint_executable(compose_file, working_dir)
 
         # Prepare environment variables
         env = self._prepare_compose_environment(working_dir, project_name)
@@ -1179,7 +1233,8 @@ class DockerManager:
     def start_services(self, compose_file: Path, env_file: Optional[Path] = None,
                       project_name: Optional[str] = None, working_dir: Optional[Path] = None) -> bool:
         """Start services using docker compose."""
-        return self.run_compose_command(compose_file, ["up", "-d"], env_file, project_name, working_dir)
+        success, _ = self.run_compose_command(compose_file, ["up", "-d"], env_file, project_name, working_dir)
+        return success
 
     def start_services_with_override(self, compose_file: Path, compose_override: Path,
                                    env_file: Optional[Path] = None, project_name: Optional[str] = None,
@@ -1191,7 +1246,8 @@ class DockerManager:
     def stop_services(self, compose_file: Path, env_file: Optional[Path] = None,
                      project_name: Optional[str] = None, working_dir: Optional[Path] = None) -> bool:
         """Stop services using docker compose."""
-        return self.run_compose_command(compose_file, ["down"], env_file, project_name, working_dir)
+        success, _ = self.run_compose_command(compose_file, ["down"], env_file, project_name, working_dir)
+        return success
     
     def get_volume_sizes(self) -> Dict[str, str]:
         """Get sizes of all worktree volumes."""
@@ -1301,7 +1357,7 @@ class DockerManager:
             project_name = project_root_from_worktree.name
         
         project_name = sanitize_project_name(project_name)
-        compose_project_name = f"{project_name}-{branch_name}"
+        compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
         
         # Build base command
         cmd = self._build_compose_base_command()
@@ -1355,10 +1411,10 @@ class DockerManager:
             
             # Get project name
             project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{branch_name}"
+            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
             
             # Start services
-            success = self.run_compose_command(
+            success, _ = self.run_compose_command(
                 compose_override, 
                 ["up", "-d"], 
                 env_file=env_file,
@@ -1393,7 +1449,7 @@ class DockerManager:
             
             # Get project name
             project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{branch_name}"
+            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
             
             # Stop services
             success = self.stop_services(
@@ -1423,7 +1479,7 @@ class DockerManager:
             from ..config.settings import get_project_name, sanitize_project_name
             
             project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{branch_name}"
+            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
             
             # Get running containers for this project
             result = subprocess.run([
@@ -1449,7 +1505,7 @@ class DockerManager:
             from ..config.settings import get_project_name, sanitize_project_name
             
             project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{branch_name}"
+            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
             
             # Get containers for this project
             result = subprocess.run([
