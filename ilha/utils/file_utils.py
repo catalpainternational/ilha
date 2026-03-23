@@ -5,8 +5,10 @@ This module provides utilities for file operations including .gitignore manageme
 """
 
 import os
+import stat
+import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from .logging import log_info, log_success, log_warning, log_error
 
@@ -184,92 +186,50 @@ def remove_gitignore_entry(project_root: Path, entry: str) -> bool:
         return False
 
 
-def add_to_cursorignore(project_root: Path, entry: str) -> bool:
-    """Add entry to .cursorignore file if not already present."""
-    cursorignore_path = project_root / ".cursorignore"
-    
-    # Read existing file or create new
+def _add_to_ignore_file(filepath: Path, entry: str, file_label: str) -> bool:
+    """Add entry to an ignore file if not already present.
+
+    Shared implementation for .gitignore, .cursorignore, .cursorindexignore, etc.
+    """
     try:
-        if cursorignore_path.exists():
-            with open(cursorignore_path, 'r', encoding='utf-8') as f:
+        if filepath.exists():
+            with open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
         else:
             lines = []
     except Exception as e:
-        log_error(f"Failed to read .cursorignore file: {e}")
+        log_error(f"Failed to read {file_label} file: {e}")
         return False
-    
-    # Check if entry already exists
+
     entry_stripped = entry.strip()
     for line in lines:
         if line.strip() == entry_stripped:
-            log_info(f"Entry '{entry_stripped}' already exists in .cursorignore")
+            log_info(f"Entry '{entry_stripped}' already exists in {file_label}")
             return True
-    
-    # Add ilha comment header if not already present anywhere in file
-    ilha_comment_exists = any(line.strip() == '# ilha' for line in lines)
-    if not ilha_comment_exists:
+
+    if not any(line.strip() == '# ilha' for line in lines):
         lines.append('# ilha\n')
-    
-    # Add entry
-    if not entry_stripped.endswith('\n'):
-        entry_stripped += '\n'
-    
-    lines.append(entry_stripped)
-    
-    # Write back to file
+
+    lines.append(entry_stripped + '\n' if not entry_stripped.endswith('\n') else entry_stripped)
+
     try:
-        with open(cursorignore_path, 'w', encoding='utf-8') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.writelines(lines)
-        log_success(f"Added '{entry_stripped.strip()}' to .cursorignore")
+        log_success(f"Added '{entry_stripped.strip()}' to {file_label}")
         return True
     except Exception as e:
-        log_error(f"Failed to add '{entry_stripped.strip()}' to .cursorignore: {e}")
+        log_error(f"Failed to add '{entry_stripped.strip()}' to {file_label}: {e}")
         return False
+
+
+def add_to_cursorignore(project_root: Path, entry: str) -> bool:
+    """Add entry to .cursorignore file if not already present."""
+    return _add_to_ignore_file(project_root / ".cursorignore", entry, ".cursorignore")
 
 
 def add_to_cursorindexignore(project_root: Path, entry: str) -> bool:
     """Add entry to .cursorindexignore file if not already present."""
-    cursorindexignore_path = project_root / ".cursorindexignore"
-    
-    # Read existing file or create new
-    try:
-        if cursorindexignore_path.exists():
-            with open(cursorindexignore_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-        else:
-            lines = []
-    except Exception as e:
-        log_error(f"Failed to read .cursorindexignore file: {e}")
-        return False
-    
-    # Check if entry already exists
-    entry_stripped = entry.strip()
-    for line in lines:
-        if line.strip() == entry_stripped:
-            log_info(f"Entry '{entry_stripped}' already exists in .cursorindexignore")
-            return True
-    
-    # Add ilha comment header if not already present anywhere in file
-    ilha_comment_exists = any(line.strip() == '# ilha' for line in lines)
-    if not ilha_comment_exists:
-        lines.append('# ilha\n')
-    
-    # Add entry
-    if not entry_stripped.endswith('\n'):
-        entry_stripped += '\n'
-    
-    lines.append(entry_stripped)
-    
-    # Write back to file
-    try:
-        with open(cursorindexignore_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        log_success(f"Added '{entry_stripped.strip()}' to .cursorindexignore")
-        return True
-    except Exception as e:
-        log_error(f"Failed to add '{entry_stripped.strip()}' to .cursorindexignore: {e}")
-        return False
+    return _add_to_ignore_file(project_root / ".cursorindexignore", entry, ".cursorindexignore")
 
 
 def find_compose_files(project_root: Path) -> list[Path]:
@@ -325,3 +285,75 @@ def clean_compose_version_field(compose_data: Dict[str, Any]) -> None:
     """
     if 'version' in compose_data:
         compose_data.pop('version', None)
+
+
+# Script names under /app that are commonly used as container entrypoints
+_ENTRYPOINT_SCRIPT_NAMES = ("entrypoint.sh", "endpoint.sh")
+
+
+def _volumes_mount_app(volumes: Any) -> List[str]:
+    """Return relative paths (under PROJECT_ROOT) for volumes that mount to /app.
+    
+    Handles list of strings like '${PROJECT_ROOT}:/app' or '${PROJECT_ROOT}/ambulancia/ambulancia:/app'.
+    Returns the source path suffix after ${PROJECT_ROOT}/, or '' for ${PROJECT_ROOT}:/app.
+    """
+    if not volumes:
+        return []
+    paths: List[str] = []
+    for vol in volumes if isinstance(volumes, list) else []:
+        if not isinstance(vol, str) or ":/app" not in vol:
+            continue
+        # Format is "source:target"; target must be exactly /app (not /app/...)
+        parts = vol.split(":", 1)
+        if len(parts) != 2 or parts[1].rstrip("/") != "/app":
+            continue
+        source = parts[0].strip()
+        if not source or "${PROJECT_ROOT}" not in source:
+            continue
+        # Normalize: ${PROJECT_ROOT} or ${PROJECT_ROOT}/path
+        suffix = source.replace("${PROJECT_ROOT}", "").strip("/")
+        if suffix not in paths:
+            paths.append(suffix)
+    return paths
+
+
+def ensure_entrypoint_executable(compose_path: Path, project_root: Path) -> None:
+    """Ensure entrypoint scripts under paths mounted to /app are executable on the host.
+    
+    Parses the compose file, finds services with volume mounts to /app, and runs
+    chmod +x on entrypoint.sh (and endpoint.sh) under those paths so container
+    entrypoints work when the host directory is mounted over /app.
+    
+    Args:
+        compose_path: Path to docker-compose.worktree.yml (or similar).
+        project_root: Resolved directory used as PROJECT_ROOT when running compose.
+    """
+    if not compose_path.exists():
+        return
+    project_root = Path(project_root).resolve()
+    try:
+        with open(compose_path, encoding="utf-8") as f:
+            compose_data = yaml.safe_load(f)
+    except Exception:
+        return
+    if not compose_data or "services" not in compose_data:
+        return
+    seen: set = set()
+    for service_config in compose_data.get("services", {}).values():
+        if not isinstance(service_config, dict):
+            continue
+        volumes = service_config.get("volumes") or []
+        for rel in _volumes_mount_app(volumes):
+            dir_path = project_root / rel if rel else project_root
+            for name in _ENTRYPOINT_SCRIPT_NAMES:
+                script = dir_path / name
+                if script in seen or not script.is_file():
+                    continue
+                seen.add(script)
+                try:
+                    mode = script.stat().st_mode
+                    if not (mode & stat.S_IXUSR):
+                        script.chmod(mode | stat.S_IXUSR | stat.S_IRUSR | stat.S_IWUSR)
+                        log_info(f"Set executable bit on {script} (mounted at /app)")
+                except OSError:
+                    pass

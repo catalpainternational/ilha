@@ -11,18 +11,21 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from ..config.settings import get_project_root, ilha_DIR, get_worktree_dir
-from ..utils.logging import log_info, log_success, log_warning, log_error
+from ..utils.logging import log_info, log_success, log_warning, log_error, log_step
 from ..utils.validation import check_prerequisites
 from ..utils.caddy_config import ensure_caddy_labels_and_network
 from ..utils.file_utils import (
-    prompt_yes_no, 
-    add_to_gitignore, 
+    prompt_yes_no,
+    add_to_gitignore,
     add_to_cursorignore,
     add_to_cursorindexignore,
     check_gitignore_entry,
     replace_gitignore_entry,
     remove_gitignore_entry,
-    clean_compose_version_field
+    clean_compose_version_field,
+    ensure_entrypoint_executable,
+    _volumes_mount_app,
+    _ENTRYPOINT_SCRIPT_NAMES,
 )
 
 
@@ -158,7 +161,7 @@ class SetupManager:
             monkey_patch: Auto-patch Django settings.py if detected
             force: Force overwrite existing .ilha configuration files
         """
-        log_info("Setting up ilha for this project...")
+        log_step("Setting up ilha for this project")
         if domain:
             log_info(f"Using domain override: {domain}")
         
@@ -173,11 +176,12 @@ class SetupManager:
                 return False
             else:
                 log_warning(f"The directory {self.ilha_dir} already exists.")
-                if not prompt_yes_no("Do you want to overwrite the settings?", default=False):
-                    log_info("Setup cancelled by user.")
-                    return False
-                force_overwrite = True
-                log_info("Proceeding with overwrite...")
+                if not prompt_yes_no("Overwrite existing .ilha config (config.yml) and env override (env.ilha)?", default=False):
+                    log_info("Keeping existing config.yml and env.ilha; updating worktree compose only.")
+                    force_overwrite = False
+                else:
+                    force_overwrite = True
+                    log_info("Overwriting .ilha config and env.ilha...")
         
         # 0. Check prerequisites first
         check_prerequisites(project_root=self.project_root)
@@ -809,6 +813,33 @@ services:
                 
                 # Resolve relative paths in volumes and other configurations
                 self._resolve_relative_paths(service_config)
+                
+                # If service mounts host path to /app and has an entrypoint script on the host,
+                # add wrapper so /app/entrypoint.sh is chmod +x before exec (avoids permission denied when host lacks +x).
+                # Do not inject the wrapper when the project has no entrypoint.sh (e.g. uses CMD only).
+                app_mount_rels = _volumes_mount_app(service_config.get('volumes') or [])
+                has_entrypoint_script = False
+                if app_mount_rels and service_config.get('build'):
+                    for rel in app_mount_rels:
+                        dir_path = self.project_root / rel if rel else self.project_root
+                        for name in _ENTRYPOINT_SCRIPT_NAMES:
+                            if (dir_path / name).is_file():
+                                has_entrypoint_script = True
+                                break
+                        if has_entrypoint_script:
+                            break
+                if (
+                    'entrypoint' not in service_config
+                    and service_config.get('build')
+                    and app_mount_rels
+                    and has_entrypoint_script
+                ):
+                    service_config['entrypoint'] = [
+                        '/bin/sh', '-c',
+                        'chmod +x /app/entrypoint.sh 2>/dev/null || true; exec /app/entrypoint.sh "$@"',
+                        '_',
+                    ]
+                    log_info(f"Added entrypoint wrapper for service '{service_name}' (mount to /app)")
             
             # Ensure volumes section exists so we can add sqlite_data named volume
             compose_data.setdefault('volumes', {})
@@ -871,6 +902,7 @@ services:
                 yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False)
             
             log_success(f"Created worktree compose file: {target_compose}")
+            ensure_entrypoint_executable(target_compose, self.project_root)
             return True
             
         except Exception as e:

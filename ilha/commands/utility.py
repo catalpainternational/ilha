@@ -4,7 +4,11 @@ Utility commands for ilha CLI.
 This module provides utility commands like listing worktrees, pruning, and showing help.
 """
 
+from rich.console import Console
+from rich.table import Table
+
 from ..core.git_manager import GitManager
+from ..core.worktree_orchestrator import WorktreeOrchestrator
 from ..utils.logging import log_info, log_success, print_plain, show_version, show_help
 
 
@@ -16,15 +20,39 @@ class UtilityManager:
         self.git_manager = GitManager()
     
     def list_worktrees(self) -> None:
-        """List active worktrees."""
+        """List active worktrees in a table with name, localhost URL, and container status."""
         worktrees = self.git_manager.list_worktrees()
         
         if not worktrees:
             print_plain("No worktrees found")
             return
         
-        for path, commit, branch in worktrees:
-            print_plain(f"{branch}")
+        orchestrator = WorktreeOrchestrator()
+        rows = []
+        for _path, _commit, branch in worktrees:
+            url = orchestrator.env_manager.get_access_url(branch)
+            status = orchestrator.get_worktree_status(branch)
+            rows.append((branch, url, status))
+        
+        console = Console()
+        table = Table(
+            title=f"Worktrees ({len(rows)})",
+            show_header=True,
+            header_style="bold",
+            box=None,
+            padding=(0, 1),
+        )
+        table.add_column("Worktree", style="green", min_width=12)
+        table.add_column("Localhost URL", style="cyan", min_width=30, overflow="ellipsis")
+        table.add_column("Status", style="magenta", min_width=8)
+        
+        for branch, url, status in rows:
+            status_cell = (
+                f"[green]{status}[/green]" if status == "running" else f"[red]{status}[/red]"
+            )
+            table.add_row(branch, url, status_cell)
+        
+        console.print(table)
     
     def list_worktrees_json(self) -> list:
         """List active worktrees as JSON."""

@@ -13,7 +13,7 @@ from ..core.worktree_orchestrator import WorktreeOrchestrator
 from ..core.docker_manager import DockerManager as CoreDockerManager
 from ..core.git_manager import GitManager as CoreGitManager
 from ..core.environment_manager import EnvironmentManager as CoreEnvironmentManager
-from ..utils.logging import log_info, log_success, log_warning, log_error
+from ..utils.logging import log_info, log_success, log_warning, log_error, log_step
 from ..utils.path_utils import (
     get_compose_override_path, 
     get_worktree_branch_name,
@@ -65,46 +65,47 @@ class WorktreeManager:
         self.env_manager = self.orchestrator.env_manager
 
     
-    def create_worktree(self, branch_name: str, interactive: bool = True) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """Create a new worktree - CLI interface."""
+    def _handle_create_success(
+        self, result: Dict[str, Any], branch_name: str, interactive: bool
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Handle successful create_worktree result (DRY logging and prompts)."""
+        data = result.get("data", {})
+        worktree_path = Path(data.get("worktree_path", ""))
+        status = data.get("status", "created")
+        if status == "env_already_exists":
+            log_success(f"Worktree for {branch_name} is ready at: {worktree_path}")
+            return True, result
+        if status in ("env_created", "env_recreated"):
+            log_success(result.get("message", f"Environment ready for {branch_name}"))
+            log_info(f"Next: ilha {branch_name} up")
+            return True, result
+        if status == "already_exists":
+            if interactive and not confirm_use_existing_worktree(branch_name):
+                log_info("Please use a different name for your worktree.")
+                log_info(f"Example: ilha create {branch_name}-v2")
+                return False, result
+            log_success(f"Worktree for {branch_name} is ready at: {worktree_path}")
+            return True, result
+        # status == "created"
+        log_success(f"Worktree created for {branch_name}")
+        try:
+            relative_path = worktree_path.relative_to(self.project_root)
+            log_info(f"📁 Location: {relative_path}")
+            log_info(f"💡 Navigate: cd {relative_path}")
+        except ValueError:
+            log_info(f"📁 Location: {worktree_path}")
+        log_info(f"🚀 Next: ilha {branch_name} up")
+        return True, result
+
+    def create_worktree(self, branch_name: str, interactive: bool = True, force: bool = False) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Create a new worktree or ilha environment for an existing worktree - CLI interface."""
         self._ensure_orchestrator()
-        log_info(f"Creating worktree for branch: {branch_name}")
-        
-        result = self.orchestrator.create_worktree(branch_name)
+        log_step(f"Creating worktree for {branch_name}")
+
+        result = self.orchestrator.create_worktree(branch_name, force=force)
         
         if result['success']:
-            data = result['data']
-            worktree_path = Path(data['worktree_path'])
-            
-            # CLI-specific: Pretty logging and output formatting
-            if data.get('status') == 'already_exists':
-                if interactive:
-                    # Ask user if they want to use the existing worktree
-                    if confirm_use_existing_worktree(branch_name):
-                        log_success(f"Worktree for {branch_name} is ready at: {worktree_path}")
-                        return True, result
-                    else:
-                        log_info("Please use a different name for your worktree.")
-                        log_info(f"Example: ilha create {branch_name}-v2")
-                        return False, result
-                else:
-                    # Non-interactive mode (e.g., JSON mode)
-                    log_success(f"Worktree for {branch_name} is ready at: {worktree_path}")
-                    return True, result
-            else:
-                # Calculate relative path for user-friendly display
-                try:
-                    relative_path = worktree_path.relative_to(self.project_root)
-                    log_success(f"Worktree created for {branch_name}")
-                    log_info(f"📁 Location: {relative_path}")
-                    log_info(f"💡 Navigate: cd {relative_path}")
-                    log_info(f"🚀 Next: ilha {branch_name} up")
-                except ValueError:
-                    # Fallback if relative path calculation fails
-                    log_success(f"Worktree created for {branch_name}")
-                    log_info(f"📁 Location: {worktree_path}")
-            
-            return True, result
+            return self._handle_create_success(result, branch_name, interactive)
         else:
             log_error(result['error'])
             return False, result
@@ -117,11 +118,9 @@ class WorktreeManager:
             profile: Optional Docker Compose profile to use
         """
         self._ensure_orchestrator()
-        if profile:
-            log_info(f"Starting worktree environment for branch: {branch_name} with profile: {profile}")
-        else:
-            log_info(f"Starting worktree environment for branch: {branch_name}")
-        
+        extra = f" (profile: {profile})" if profile else ""
+        log_step(f"Starting worktree {branch_name}{extra}")
+
         result = self.orchestrator.start_worktree(branch_name, profile=profile)
         
         if result['success']:
@@ -129,16 +128,17 @@ class WorktreeManager:
             domain_name = data['domain_name']
             
             # CLI-specific: Pretty logging and output formatting
-            log_success("Worktree environment started successfully")
-            log_success(f"🌐 Application available at: http://{domain_name}/")
-            log_info(f"📋 Domain: {domain_name}")
-            log_info(f"🔗 Full URL: http://{domain_name}/")
-            
             if data.get('caddy_configured'):
                 log_info("✅ Caddy routing configuration completed")
             else:
                 log_warning("⚠️ Caddy routing configuration may have failed")
-            
+
+            if data.get('smoke_ok'):
+                log_success(f"🌐 Application available at: http://{domain_name}/")
+            else:
+                log_warning(f"⚠️ Smoke check failed: http://{domain_name}/ is not responding yet")
+                log_info(f"🔗 URL: http://{domain_name}/")
+
             return True
         else:
             log_error(result['error'])
@@ -148,8 +148,8 @@ class WorktreeManager:
     def stop_worktree(self, branch_name: str, remove_images: bool = False) -> bool:
         """Stop worktree environment - CLI interface."""
         self._ensure_orchestrator()
-        log_info(f"Stopping worktree environment for branch: {branch_name}")
-        
+        log_step(f"Stopping worktree {branch_name}")
+
         result = self.orchestrator.stop_worktree(branch_name, remove_images)
         
         # CLI-specific: Pretty logging and output formatting
@@ -177,8 +177,8 @@ class WorktreeManager:
         # Ensure we're in the main repository directory
         ensure_main_repo()
         
-        log_info(f"Removing worktree for branch: {branch_name}")
-        
+        log_step(f"Removing worktree {branch_name}")
+
         result = self.orchestrator.remove_worktree(branch_name, force, delete_branch)
         
         # CLI-specific: Pretty logging and output formatting

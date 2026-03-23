@@ -5,10 +5,11 @@ This module contains all configuration constants and settings used throughout
 the ilha CLI application.
 """
 
+import hashlib
 import os
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # Version information
 VERSION = "0.9.4"
@@ -47,7 +48,7 @@ def get_volume_names_for_project_root(project_root: Path, branch_name: str) -> d
     if not project_name:
         project_name = Path(project_root).name
     project_name = sanitize_project_name(project_name)
-    prefix = f"{project_name}-{branch_name}_"
+    prefix = f"{project_name}-{sanitize_project_name(branch_name)}_"
     return {
         "postgres": prefix + POSTGRES_VOLUME_SUFFIX,
         "redis": prefix + REDIS_VOLUME_SUFFIX,
@@ -367,14 +368,31 @@ def extract_domain_from_site_domain(site_domain: str) -> str:
     return domain
 
 # Environment file generation
+def get_worktree_network_subnets(branch_name: str) -> Tuple[str, str]:
+    """Return unique /24 subnets for a worktree (internal, web) to avoid pool overlap.
+
+    Uses deterministic hash of compose project name so each worktree gets distinct
+    subnets. Use ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB in docker-compose.worktree.yml
+    networks section (e.g. subnet: ${ILHA_SUBNET_INTERNAL}).
+    """
+    project_name = sanitize_project_name(get_project_name())
+    compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+    seed = int(hashlib.sha256(compose_project_name.encode()).hexdigest()[:8], 16)
+    # 127 pairs (internal_octet, internal_octet+1) in 10.201.x.0/24 to avoid overlap
+    internal_octet = (seed % 127) * 2 + 1
+    web_octet = internal_octet + 1
+    return f"10.201.{internal_octet}.0/24", f"10.201.{web_octet}.0/24"
+
+
 def generate_env_compose_content(branch_name: str) -> str:
     """Generate env.ilha content for a worktree."""
     project_root = get_project_root()
     project_name = sanitize_project_name(get_project_name())  # Converts underscores to hyphens
-    compose_project_name = f"{project_name}-{branch_name}"
+    compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
     site_domain = f"http://{compose_project_name}.localhost"  # RFC-compliant hostname with protocol
     allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
-    
+    internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
+
     return f"""# ilha environment configuration for {branch_name}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
@@ -384,13 +402,20 @@ DEBUG=True
 USE_X_FORWARDED_HOST=True
 CSRF_TRUSTED_ORIGINS={site_domain}
 USE_SECURE_COOKIES=False
+
+# Per-worktree network subnets (avoid pool overlap; use in docker-compose.worktree.yml)
+ILHA_SUBNET_INTERNAL={internal_subnet}
+ILHA_SUBNET_WEB={web_subnet}
 """
 
 # Volume naming
 def get_volume_name(branch_name: str, volume_type: str) -> str:
-    """Get worktree-specific volume name."""
+    """Get worktree-specific volume name.
+    Uses sanitized branch name so the volume name matches COMPOSE_PROJECT_NAME
+    (e.g. business-intelligence-testdbcopy_postgres_data) and the worktree DB uses the copied data.
+    """
     project_name = sanitize_project_name(get_project_name())
-    return f"{project_name}-{branch_name}_{volume_type}"
+    return f"{project_name}-{sanitize_project_name(branch_name)}_{volume_type}"
 
 def get_volume_names(branch_name: str) -> dict[str, str]:
     """Get all volume names for a worktree.
@@ -426,6 +451,7 @@ def get_source_volume_names() -> dict[str, str]:
     
     Returns volume names for the project root (master branch) volumes
     that are used as sources when copying to new worktrees.
+    Uses get_project_root() (cwd-based); for a specific path use get_source_volume_names_for_project_root().
     
     Returns:
         Dictionary mapping volume types to volume names:
@@ -441,4 +467,36 @@ def get_source_volume_names() -> dict[str, str]:
         "redis": get_source_volume_name(REDIS_VOLUME_SUFFIX),
         "media": get_source_volume_name(MEDIA_VOLUME_SUFFIX),
         "sqlite": get_source_volume_name(SQLITE_VOLUME_SUFFIX),
+    }
+
+
+def get_source_volume_names_for_project_root(project_root: Path) -> dict[str, str]:
+    """Get master/project root volume names using a specific project root (not cwd).
+    
+    Use this when creating worktree volumes so the source is resolved from the
+    same project root as the orchestrator (avoids wrong source when cwd differs).
+    
+    Args:
+        project_root: Path to the project root (must contain .ilha/config.yml).
+        
+    Returns:
+        Same structure as get_source_volume_names().
+    """
+    project_name = None
+    config_path = Path(project_root) / ".ilha" / "config.yml"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = yaml.safe_load(f) or {}
+                project_name = config.get("project_name")
+        except Exception:
+            pass
+    if not project_name:
+        project_name = Path(project_root).name
+    prefix = f"{project_name}_"
+    return {
+        "postgres": prefix + POSTGRES_VOLUME_SUFFIX,
+        "redis": prefix + REDIS_VOLUME_SUFFIX,
+        "media": prefix + MEDIA_VOLUME_SUFFIX,
+        "sqlite": prefix + SQLITE_VOLUME_SUFFIX,
     }

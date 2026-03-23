@@ -36,7 +36,7 @@ class TestWorktreeManager:
 
         assert ok is True
         assert payload["data"]["branch"] == "feature/foo"
-        manager.orchestrator.create_worktree.assert_called_once_with("feature/foo")
+        manager.orchestrator.create_worktree.assert_called_once_with("feature/foo", force=False)
 
     def test_create_worktree_already_exists_interactive_confirm(self, manager):
         manager.orchestrator.create_worktree.return_value = {
