@@ -14,16 +14,10 @@ A comprehensive Python CLI tool that creates isolated development environments u
 # Install via pip
 pip install ilha
 
-# Install with MCP server support
-pip install ilha[mcp]
-
 # Or install from source
 git clone https://github.com/catalpainternational/ilha.git
 cd ilha
 pip install -e .
-
-# Or install from source with MCP support
-pip install -e .[mcp]
 ```
 
 ### Basic Usage
@@ -712,78 +706,6 @@ ilha completion uninstall
 ilha completion install
 ```
 
-## 🤖 MCP Server Integration
-
-ilha includes a Model Context Protocol (MCP) server that enables AI assistants like Claude and Cursor to manage isolated development environments programmatically.
-
-### Installation with MCP Support
-
-```bash
-# Install with MCP dependencies
-pip install ilha[mcp]
-
-# Or install from source with MCP support
-git clone https://github.com/catalpainternational/ilha.git
-cd ilha
-pip install -e .[mcp]
-```
-
-### Basic Usage
-
-```bash
-# Run the MCP server
-ilha-mcp
-
-# Or run directly
-python -m ilha_mcp.server
-```
-
-### AI Assistant Integration
-
-The MCP server enables AI assistants to:
-
-- **Create and manage worktrees**: `create_worktree`, `start_worktree`, `stop_worktree`
-- **Manage volumes**: `backup_volumes`, `restore_volumes`, `clean_volumes`
-- **Control proxy**: `start_proxy`, `stop_proxy`, `get_proxy_status`
-- **Get information**: `list_worktrees`, `get_worktree_info`, `list_volumes`
-
-### Example with Claude Desktop
-
-Add to your Claude Desktop configuration:
-
-```json
-{
-  "mcpServers": {
-    "ilha": {
-      "command": "ilha-mcp",
-      "args": [],
-      "env": {
-        "ilha_WORKING_DIR": "/path/to/your/project"
-      }
-    }
-  }
-}
-```
-
-### Working Directory Configuration
-
-**Critical**: Always provide the `working_directory` parameter when using MCP tools. This tells ilha which project to operate on.
-
-```python
-# ✅ CORRECT: Always specify working_directory
-create_worktree({
-    "branch_name": "feature-auth",
-    "working_directory": "/Users/ders/kenali/blank"  # Target project directory
-})
-
-# ❌ INCORRECT: Missing working_directory
-create_worktree({"branch_name": "feature-auth"})  # Will use MCP server's directory
-```
-
-### Documentation
-
-For detailed MCP server documentation, see [mcp/README.md](mcp/README.md).
-
 ## 🚀 Advanced Usage
 
 ### Custom Configuration
@@ -902,6 +824,8 @@ ilha delete temp-* --force
 
 ## 📚 Additional Documentation
 
+**Agent skills:** This repo includes an [Agent Skill](https://agentskills.io/) at `ilha/skills/ilha/` (inside the ilha package). Symlinks from `.agents/skills/ilha` and `.claude/skills/ilha` point to it so **Cursor**, **Claude Code**, and **Codex** discover the skill when the repo is open; no installation needed.
+
 - **[📖 Full Documentation Site](https://catalpainternational.github.io/ilha)** - Complete documentation with search and navigation
 - **[Project Setup Guide](documentation/PROJECT_SETUP.md)** - Best practices for configuring your project for ilha
 - **[Architecture Guide](documentation/ARCHITECTURE.md)** - Detailed system architecture and component relationships
@@ -955,7 +879,6 @@ The ilha CLI follows a modular architecture designed for easy extension:
 - ✅ Type safety throughout
 - ✅ Project-agnostic setup
 - ✅ User guide in each .ilha directory
-- ✅ MCP server for AI assistant integration
 - ✅ JSON output mode for programmatic access
  - ✅ Push command for SCP-based deployment with auto-import enabled by default
 

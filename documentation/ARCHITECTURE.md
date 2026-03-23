@@ -55,27 +55,17 @@ User Command → CLI Interface → Command Manager → Core Infrastructure → E
   Output ←    Error Handling ←   Result Processing ←   Status Check ←    System Response
 ```
 
-#### MCP Server Flow
-```
-AI Assistant → MCP Server → CLI Wrapper → WorktreeOrchestrator → Core Infrastructure → External Systems
-     ↓              ↓              ↓              ↓                    ↓                    ↓
-  Tool Call    JSON Parsing    CLI Command    Business Logic      Docker/Git Ops      Containers/Volumes
-     ↓              ↓              ↓              ↓                    ↓                    ↓
-  Response ←   JSON Output ←   CLI Output ←   Result Processing ←   Status Check ←    System Response
-```
+#### Architecture
 
-#### Unified Architecture
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   CLI Interface │    │   MCP Server    │    │  AI Assistants  │
-│                 │    │                 │    │                 │
-│  • Click CLI    │    │  • MCP Tools    │    │  • Claude       │
-│  • Commands     │    │  • Resources    │    │  • Cursor       │
-│  • Validation   │    │  • JSON Output  │    │  • Automation   │
-└─────────┬───────┘    └─────────┬───────┘    └─────────┬───────┘
-          │                      │                      │
-          └──────────────────────┼──────────────────────┘
-                                 │
+┌─────────────────┐
+│   CLI Interface │
+│                 │
+│  • Click CLI    │
+│  • Commands     │
+│  • Validation   │
+└─────────┬───────┘
+          │
                     ┌─────────────▼─────────────┐
                     │   WorktreeOrchestrator    │
                     │                           │
@@ -190,7 +180,7 @@ The system uses a fallback hierarchy:
 
 **Key Features**:
 - **Multi-project Support**: Accepts `project_root` parameter for operation on different projects
-- **MCP Compatibility**: Supports structured output for programmatic access
+- **JSON Output**: Supports structured output for programmatic access
 - **Safe Database Copying**: Prevents PostgreSQL corruption by stopping containers before file operations
 - **Shared Container Management**: Common methods for stopping/starting containers before volume operations
 
@@ -209,7 +199,7 @@ The system uses a fallback hierarchy:
 
 **Key Features**:
 - **Multi-project Support**: Accepts `project_root` parameter for operation on different projects
-- **MCP Compatibility**: Supports structured output for programmatic access
+- **JSON Output**: Supports structured output for programmatic access
 
 **Dependencies**: Git repository, worktree support
 **External Interactions**: Git commands, file system operations
@@ -225,13 +215,13 @@ The system uses a fallback hierarchy:
 
 **Key Features**:
 - **Multi-project Support**: Accepts `project_root` parameter for operation on different projects
-- **MCP Compatibility**: Supports structured output for programmatic access
+- **JSON Output**: Supports structured output for programmatic access
 
 **Dependencies**: Path utilities, configuration settings
 **External Interactions**: File system, environment variables
 
 #### WorktreeOrchestrator (`core/worktree_orchestrator.py`)
-**Responsibility**: Core worktree orchestration used by both CLI and MCP interfaces
+**Responsibility**: Core worktree orchestration
 
 **Key Methods**:
 - `create_worktree()` - Create new worktree with complete orchestration
@@ -244,9 +234,9 @@ The system uses a fallback hierarchy:
 
 **Key Features**:
 - **Multi-project Support**: Accepts `project_root` parameter for operation on different projects
-- **MCP Mode**: Supports `mcp_mode` parameter to suppress stdout logging for programmatic use
+- **Quiet Mode**: Supports `mcp_mode` parameter to suppress stdout logging for programmatic use
 - **Fractal Design**: Implements `_copy_ilha_to_worktree()` for recursive configuration copying
-- **Unified Interface**: Provides business logic for both CLI and MCP server interfaces
+- **Unified Interface**: Provides core business logic independent of CLI layer
 
 **Dependencies**: DockerManager, GitManager, EnvironmentManager
 **External Interactions**: Docker operations, Git operations, file system operations
@@ -351,7 +341,7 @@ def create(..., json: bool):
     if not success:
         raise ilhaCommandError("Failure message", error_code="create_failed")
 ```
-This eliminates duplicated `try/except` blocks and guarantees uniform output for both CLI users and MCP clients.
+This eliminates duplicated `try/except` blocks and guarantees uniform output for CLI users and programmatic consumers.
 
 ### Utilities Layer
 
@@ -381,7 +371,7 @@ This eliminates duplicated `try/except` blocks and guarantees uniform output for
 - `ensure_main_repo()` - Repository validation
 
 #### JSON Output (`utils/json_output.py`)
-**Responsibility**: Standardized JSON output formatting for CLI commands and MCP integration
+**Responsibility**: Standardized JSON output formatting for CLI commands
 
 **Key Classes**:
 - `JSONOutput` - Main formatter class for structured output
@@ -397,7 +387,7 @@ This eliminates duplicated `try/except` blocks and guarantees uniform output for
 
 **Key Features**:
 - **CLI Integration**: `--json` flag support for all CLI commands
-- **MCP Compatibility**: Structured output for programmatic access
+- **JSON Output**: Structured output for programmatic access
 - **Error Handling**: Standardized error codes and details
 - **Timestamping**: Automatic timestamp inclusion
 - **Type Safety**: Structured data types for all output formats
@@ -626,99 +616,6 @@ Project Root/
 - **Documentation**: Each worktree includes its own user guide
 - **Debugging**: Isolated configuration for troubleshooting
 
-## 🔌 MCP Server Architecture
-
-### Model Context Protocol Integration
-
-The ilha MCP server provides programmatic access to ilha functionality through the Model Context Protocol, enabling AI assistants to manage isolated development environments.
-
-#### MCP Server Structure
-
-```
-ilha_mcp/
-├── server.py              # Main MCP server implementation
-├── config.py              # MCP configuration management
-├── tools/                 # MCP tool implementations
-│   ├── worktree_tools.py  # Worktree management tools
-│   ├── volume_tools.py    # Volume management tools
-│   └── caddy_tools.py     # Caddy proxy tools
-├── resources/             # MCP resource implementations
-│   ├── worktree_resources.py
-│   └── documentation.py
-└── utils/                 # MCP utilities
-    ├── cli_wrapper.py     # CLI command wrapper
-    └── response_enrichment.py
-```
-
-#### MCP Tools
-
-**Worktree Management Tools**:
-- `create_worktree` - Create isolated development environment
-- `start_worktree` - Start worktree containers
-- `stop_worktree` - Stop worktree containers
-- `remove_worktree` - Remove worktree (keep branch)
-- `delete_worktree` - Delete worktree and branch
-- `list_worktrees` - List active worktrees
-- `get_worktree_info` - Get detailed worktree information
-
-**Volume Management Tools**:
-- `list_volumes` - List worktree volumes
-- `get_volume_sizes` - Get volume size information
-- `backup_volumes` - Backup worktree volumes
-- `restore_volumes` - Restore from backup
-- `clean_volumes` - Clean up volumes
-
-**Caddy Proxy Tools**:
-- `start_proxy` - Start global Caddy proxy
-- `stop_proxy` - Stop global Caddy proxy
-- `get_proxy_status` - Get proxy status
-
-#### MCP Resources
-
-**Static Documentation Resources**:
-- `ilha://concept` - ilha concept explanation
-- `ilha://architecture` - Technical architecture
-- `ilha://workflows` - Usage patterns
-- `ilha://terminology` - Glossary of terms
-- `ilha://url-patterns` - URL construction patterns
-- `ilha://best-practices` - Best practices guide
-
-**Dynamic Project Resources**:
-- `ilha://project` - Current project context
-- `ilha://worktrees` - Active worktrees with status
-- `ilha://volumes` - Worktree volumes
-- `ilha://proxy` - Caddy proxy status
-- `ilha://state` - Complete system state
-
-#### Working Directory Configuration
-
-**Critical Design**: The MCP server can run from any location but requires a `working_directory` parameter to specify which project to operate on.
-
-**Key Concepts**:
-- **MCP Server Location**: Where the server is installed (e.g., `/Users/ders/projects/ilha`)
-- **Target Project Directory**: The project to manage (e.g., `/Users/ders/kenali/blank`)
-- **Working Directory Parameter**: Tells the server which project to operate on
-
-**Implementation**:
-- All MCP tools require `working_directory` parameter
-- Server validates project directory contains `.ilha/config.yml`
-- Supports operation on multiple projects simultaneously
-- Environment variable fallback: `ilha_WORKING_DIR`
-
-#### CLI Integration
-
-**CLI Wrapper Pattern**:
-- MCP tools invoke ilha CLI commands with `--json` flag
-- Structured output enables programmatic access
-- Error handling and validation through CLI layer
-- Consistent behavior between CLI and MCP interfaces
-
-**Benefits**:
-- **AI Assistant Integration**: Enables Claude, Cursor, and other AI tools
-- **Programmatic Access**: Structured API for automation
-- **Multi-project Support**: Manage multiple projects from single MCP server
-- **Consistent Interface**: Same functionality as CLI with structured output
-
 ## 📦 Package Management Architecture
 
 ### Package Structure
@@ -842,31 +739,17 @@ All logic centralized in `PackageManager` class:
                          ↑
                     Used by both:
                          │
-        ┌────────────────┴────────────────┐
-        │                                  │
-    CLI Layer                          MCP Layer
-    PackageCommands                    PackageTools
-    (thin wrapper)                     (thin wrapper)
+        │
+    CLI Layer
+    PackageCommands
+    (thin wrapper)
 ```
 
-### CLI and MCP Integration
+### CLI Usage
 
-Both interfaces use identical parameters and logic:
-
-**CLI**:
 ```bash
 ilha packages import package.tar.gz --standalone --target-dir ./project
 ilha packages import package.tar.gz --domain app.example.com
-```
-
-**MCP**:
-```json
-{
-  "package_file": "package.tar.gz",
-  "standalone": true,
-  "target_directory": "./project",
-  "domain": "app.example.com"
-}
 ```
 
 ### VPC Deployment Architecture
@@ -1386,6 +1269,38 @@ ilha/
 2. **Error Handling** - Graceful degradation
 3. **Logging** - Comprehensive logging system
 4. **Testing** - Comprehensive test coverage
+
+## Slim deploy: smoke checks and hardening
+
+### Problem this addresses
+
+Slim deploy starts the app stack under Docker Compose on the remote host, often behind **Caddy** with **no host publish** of the app port (`8000` is only bound inside the `web` service network namespace). A smoke check that runs `curl http://127.0.0.1:8000/...` **on the host** then fails with *connection refused* even when containers are `Up` and the app is healthy—because nothing is listening on the host loopback interface.
+
+### Current behavior (implemented in `SlimDeployManager`)
+
+1. **Discover** whether the Compose project has a service named `web`:
+   - Prefer **`docker compose ps -q web`** (non-empty after `up` means we can `exec` into the container). This avoids false negatives when `config --services` fails or omits profiled services even though the stack is running.
+   - Fall back to **`docker compose config --services`** if no container id is listed yet.
+   - Shared helper: `remote_compose_service_known` in `ilha/commands/push/remote_compose_probe.py` (also used by `DeployDoctor` for log collection).
+2. **Probe**
+   - If `web` exists: run curl **inside** that container via `docker compose exec -T web sh -c 'curl … http://127.0.0.1:8000{path}'` (same logical URL as the app binds internally).
+   - If `web` does not exist: fall back to host `curl` (for layouts that publish `8000` on the host).
+3. **Report** smoke results include a `probe` field (`web_container` vs `host_local`) for debugging.
+
+The HTTP path still comes from compose (`caddy.proxy.health_check` label when set) or repository conventions—see `_detect_smoke_path` in `slim_deploy_manager.py`.
+
+### Hardening roadmap (recommended follow-ups)
+
+| Priority | Item | Rationale |
+| -------- | ---- | --------- |
+| 1 | **Configurable smoke service name** (default `web`) | Not every project names the app service `web`. |
+| 2 | **Configurable internal port** (default `8000`) | Matches uvicorn/gunicorn overrides without forking ilha. |
+| 3 | **Fallback when `curl` is missing in the image** | Try `wget -qO-` or a minimal Python one-liner before failing. |
+| 4 | **On failure, capture `docker compose logs --tail N web`** | Implemented: smoke failure attaches `web_logs_tail` and prints the last 40 lines. |
+| 5 | **Respect Compose `healthcheck` before smoke** | Wait until `healthy` (or timeout) to avoid racing a slow Django start. |
+| 6 | **Document contract in project templates** | Ensure images used for slim deploy include a non-interactive HTTP client for exec probes. |
+
+Together, these keep a single DRY implementation in ilha while matching real production topologies (Caddy → container, no host port).
 
 ---
 
