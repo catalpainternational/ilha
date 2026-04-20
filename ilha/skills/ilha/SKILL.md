@@ -1,6 +1,6 @@
 ---
 name: ilha
-description: Manages Git worktrees with isolated Docker environments (Caddy, Compose, volumes). Supports setup, worktree lifecycle, packages, and DigitalOcean droplet create/push/destroy. Use when the user mentions ilha, worktrees, worktree isolation, ilha up, ilha down, droplet push, ilha packages, ilha setup, or when running Django or container commands in an ilha-based project.
+description: Manages Git worktrees with isolated Docker environments (Caddy, Compose, volumes). Supports setup, worktree lifecycle, packages, and DigitalOcean droplet deploy/put/destroy/logs. Use when the user mentions ilha, worktrees, worktree isolation, ilha up, ilha down, droplet deploy, droplet logs, ilha packages, ilha setup, or when running Django or container commands in an ilha-based project.
 ---
 
 # ilha
@@ -11,7 +11,7 @@ Concise guidance for working with the ilha CLI: worktree-isolated Docker environ
 
 - User is in the ilha repo (contributing, debugging, adding commands).
 - User is in a project that uses ilha (e.g. `ilha <branch> up`, `ilha <branch> exec web ...`) and asks about environments, deploy, or worktrees.
-- User mentions: worktree, droplet, push, packages export/import, Caddy, or `.ilha/` config.
+- User mentions: worktree, droplet, deploy, logs, packages export/import, Caddy, or `.ilha/` config.
 
 ## Essential concepts
 
@@ -27,11 +27,11 @@ Concise guidance for working with the ilha CLI: worktree-isolated Docker environ
 | Lifecycle | `ilha create <branch>`, `ilha <branch> up -d`, `ilha <branch> down`, `ilha remove <branch>`, `ilha delete <branch>`, `ilha list` |
 | Compose | `ilha <branch> exec <service> <cmd>`, `ilha <branch> logs <service>`, `ilha <branch> ps`, `ilha <branch> run --rm <service> <cmd>` |
 | Django | `ilha <branch> exec web python manage.py migrate`, `ilha <branch> exec web python manage.py test`, `ilha <branch> exec web python manage.py shell`, `ilha <branch> exec web python manage.py collectstatic` |
-| Droplet | `ilha droplet create [branch] [--create-only]`, `ilha droplet push [branch] <scp_target_or_droplet>`, `ilha droplet list`, `ilha droplet destroy <id>`, `ilha droplet regions` |
+| Droplet | `ilha droplet deploy [branch] --domain <domain>`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy <id>`, `ilha droplet doctor [branch]`, `ilha droplet regions` |
 | Packages | `ilha packages export <branch>`, `ilha packages import <file> [--standalone] [--domain|--ip]` |
 | Proxy | `ilha start-proxy`, `ilha stop-proxy` |
 
-For full options and deployment (push, DNS, VPC, code-only), see [references/commands.md](references/commands.md) or the repo [README](../../../README.md).
+For full options and deployment (DNS, VPC, code-only), see [references/commands.md](references/commands.md) or the repo [README](../../../README.md).
 
 ## Conventions and pitfalls
 

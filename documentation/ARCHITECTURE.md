@@ -309,7 +309,7 @@ The system uses a fallback hierarchy:
 - **Domain Confirmation**: Requires typing domain name for DNS deletion (unless `--force`)
 - **Multiple Output Formats**: Table (default), JSON (`--as-json`), CSV (`--as-csv`)
 - **Domain Display**: Lists associated domains for each droplet in list output
-- **Helper Pipeline**: CLI helpers `_auto_detect_branch_name()`, `_resolve_droplet_name()`, and `_log_creation_context()` keep `droplet create` readable while centralizing branch detection, naming, and logging logic.
+- **Helper Pipeline**: CLI helpers `_auto_detect_branch_name()`, `_resolve_droplet_name()`, and `_log_creation_context()` keep `droplet deploy` readable while centralizing branch detection, naming, and logging logic.
 - **Wrapper Integration**: All droplet CLI commands now use the shared `command_wrapper`, ensuring consistent prerequisite checks and JSON/human output without bespoke `try/except` blocks.
 
 **Dependencies**: DropletManager, DNSManager
@@ -829,8 +829,9 @@ ilha packages import demo-package.tar.gz --standalone
 ilha packages import backup-20240115.tar.gz --standalone
 ```
 
-## 🔌 Extension Architecture
-## 🌐 Deployment Architecture (Push & Import)
+## 🌐 Deployment Architecture (Slim Deploy)
+
+**Note:** The legacy `ilha push` / `ilha worktrees push` command (package export → SCP → remote `ilha packages import`) has been removed. All remote deployment now goes through the **slim deploy** pipeline (`ilha droplet deploy` and `ilha droplet put`), which uses rsync + remote `docker compose` and does not require Python, git, or ilha to be installed on the target server — only Docker.
 
 ### Domain vs IP Deployments
 
@@ -946,26 +947,38 @@ ilha includes a droplet provider abstraction layer for cloud server management:
 - `DROPLET_DEFAULT_IMAGE` (default: `ubuntu-22-04-x64`)
 - `DROPLET_DEFAULT_SSH_KEYS` (comma-separated SSH key names, e.g., `anders,peter` - only names are supported, not numeric IDs or fingerprints)
 
-### Push Command Flow
+### Slim Deploy Command Flow
 
 ```
-Export → (optional) DNS Management → Compress → SCP Transfer → (optional) Server Preparation → (optional) Remote Import → Start Proxy → Up
+Preflight → (parallel) [DNS Management | Server Prep (slim) | Assemble Deploy Dir]
+         → Remote Disk Check → Volume Backup (local) → rsync → (parallel) [Volume Restore | Start Caddy]
+         → (optional) Remote Docker Build → Zero-Downtime App Start (canary → swap) → Smoke Checks
 ```
 
-- DNS management (optional): checks/creates DNS records via Digital Ocean DNS API when `--domain` provided
-- Server preparation (optional): checks presence of git, docker, docker compose, ilha
-- Remote import (optional): runs `ilha packages import` with `--domain` or `--ip`, then starts services
+Implemented by `SlimDeployManager` in [ilha/commands/push/slim_deploy_manager.py](../ilha/commands/push/slim_deploy_manager.py). Key stages:
 
-### Droplet Create Command Flow
+- **Preflight** (`DeployPreflight`): verifies worktree layout, detects smoke path from Caddy labels, reports env-contract drift (e.g. `SITE_DOMAIN` with `https://` prefix).
+- **DNS Management** (optional): creates/updates A records via Digital Ocean DNS API when `--domain` is provided.
+- **Server Prep**: installs only Docker + Compose and opens firewall ports. Runs `ilha/scripts/server_prep.sh` on the target.
+- **Assemble Deploy Dir**: builds a flat local directory (code + compose + `.env` + Caddy config) with domain/IP overrides applied.
+- **Remote Disk Check** (`RemoteDiskManager`): verifies free space on `/app` and `/var/lib/docker` before transfer; can attempt recovery via `--disk-recovery safe|aggressive`.
+- **Volume Backup**: backs up Docker volumes locally (skippable with `--skip-volume-backup`).
+- **rsync**: transfers the assembled directory to the server, reusing an SSH ControlMaster connection.
+- **Volume Restore | Start Caddy**: runs in parallel on the server.
+- **Remote Docker Build** (optional, `--build`): runs `docker compose build` on the server inside a nohup-polled script.
+- **Zero-Downtime App Start**: starts a canary container, health-checks it, swaps Caddy upstream, recreates the compose `web` service, re-swaps to the new container.
+- **Smoke Checks**: probes the app from inside the `web` container and (for domain deploys) from the host via the public URL.
+
+### Droplet Deploy Command Flow
 
 ```
-Create Droplet → Wait for Ready → (default) Push Environment → (optional) DNS Management → Compress → SCP Transfer → (optional) Server Preparation → (optional) Remote Import → Start Proxy → Up
+(optional) Create Droplet → Wait for Ready → Slim Deploy (see above)
 ```
 
-- Droplet creation: creates new Digital Ocean droplet with configurable options
-- Default behavior: automatically pushes environment after droplet creation
-- `--create-only` flag: only creates droplet, skips push
-- When pushing: droplet is always waited for until ready, SCP target defaults to `root@<droplet-ip>:/root`
+- `ilha droplet deploy` optionally creates a new droplet, then invokes the slim deploy pipeline against it.
+- `--create-only` flag: only creates the droplet, skips deploy.
+- `--no-create` flag: deploys to an existing server (requires `--scp-target`, `--domain`, or `--ip`).
+- `ilha droplet put` runs the slim deploy pipeline against a pre-existing server. Supports `--code-only` (no volume sync) and `--db-only` (volumes only).
 
 ### HTTPS Configuration Architecture
 
@@ -989,7 +1002,7 @@ Create Droplet → Wait for Ready → (default) Push Environment → (optional) 
 
 ### Configuration Defaults
 
-The following optional keys in `.ilha/config.yml` influence push/import behavior:
+The following optional keys in `.ilha/config.yml` influence deploy behavior:
 
 ```yaml
 deployment:
@@ -1022,28 +1035,20 @@ These are read via helper functions in `config/settings.py` and are entirely opt
 
 ### Droplet Management Integration
 
-Droplet management is integrated into the create workflow:
+**`ilha droplet deploy`** (create + deploy):
 
-**Droplet Create Command Integration**:
-- Default behavior: creates droplet and automatically pushes environment
-- `--create-only` flag: only creates droplet, skips push
-- When pushing (default): `scp_target` is optional (defaults to `root@<droplet-ip>:/root`)
-- If `scp_target` is provided, only username and path are used (server replaced with droplet IP)
-- Droplet is always waited for until ready before pushing (no option to skip - required for push to work)
-- Droplet IP address automatically updates SCP target
-- Droplet defaults loaded from `.env` or `.ilha/env.ilha`
+- Default behavior: creates a droplet and then runs the slim deploy pipeline against it.
+- `--create-only` flag: only creates the droplet, skips deploy.
+- `--no-create` flag: deploys to a pre-existing server (requires `--scp-target`, `--domain`, or `--ip`).
+- When creating: droplet is always waited until ready (deploy needs IP + SSH); SCP target defaults to `root@<droplet-ip>:/root`.
+- Droplet defaults loaded from `.env` or `.ilha/env.ilha`.
 
-**Workflow**:
-1. Create droplet with specified configuration
-2. Always wait for droplet ready (required - push needs IP address and SSH access)
-3. Extract droplet IP address
-4. If not `--create-only`, update SCP target to use droplet IP (or construct from defaults if scp_target not provided)
-5. Continue with standard push flow (export, transfer, import)
+**`ilha droplet put`** (update an existing deployment):
 
-**Droplet Push Command**:
-- Separate command for pushing to existing servers
-- No droplet creation logic (moved to `droplet create`)
-- Requires `scp_target` to be provided
+- Runs the slim deploy pipeline against a pre-existing server (no droplet creation).
+- Modes: default (full sync), `--code-only` (no volume sync), `--db-only` (volumes only, stops app during restore).
+- Zero-downtime canary swap via Caddy admin API.
+- Requires target from stored config, `--scp-target`, `--domain`, or `--ip`.
 
 ### Adding New Commands
 

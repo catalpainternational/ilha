@@ -2,14 +2,14 @@
 # This file provides dynamic routing for worktree environments using Docker integration
 
 {
-    # Basic configuration
-    # auto_https is controlled by dynamic config script for domain-based deployments
-    # HTTPS is enabled by default in Caddy v2, dynamic config handles TLS automation
-    auto_https off
+    # auto_https left at Caddy default (on) — Caddy automatically provisions
+    # TLS for real domains and ignores localhost/IP-only matchers.
     servers {
         protocols h1 h2
     }
-    # Enable admin API for dynamic configuration
+    # Admin API listens on all interfaces inside the container.
+    # Security: port 2019 is NOT published to the host (see docker-compose).
+    # Only containers on the ilha_caddy_proxy network can reach it.
     admin 0.0.0.0:2019
 }
 

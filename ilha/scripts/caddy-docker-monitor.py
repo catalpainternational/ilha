@@ -7,6 +7,7 @@ updates Caddy configuration via the admin API.
 """
 
 import json
+import os
 import time
 import requests
 import docker
@@ -31,7 +32,13 @@ class CaddyDockerMonitor:
         self.caddy_admin_url = caddy_admin_url or default_caddy_admin_url(in_container=True)
         self.known_containers = set()
         try:
-            self.docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+            # Prefer DOCKER_HOST env var (points to docker-socket-proxy in production),
+            # fall back to raw socket for local dev / backward compatibility.
+            docker_host = os.environ.get("DOCKER_HOST")
+            if docker_host:
+                self.docker_client = docker.DockerClient(base_url=docker_host)
+            else:
+                self.docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock')
         except Exception as e:
             logger.error(f"Failed to connect to Docker: {e}")
             self.docker_client = None

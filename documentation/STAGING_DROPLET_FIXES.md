@@ -1,6 +1,6 @@
 # Staging droplet login 403 and DB fixes – what was required
 
-After creating a staging droplet with `ilha droplet create` (or push + server-import) for `staging.bower.bid` on the groq branch, login returned **403** and the DB container failed to start. Below is what was required to fix it and how ilha should be updated so this does not happen again.
+After creating a staging droplet with `ilha droplet deploy` for `staging.bower.bid` on the groq branch, login returned **403** and the DB container failed to start. Below is what was required to fix it and how ilha should be updated so this does not happen again.
 
 ## 1. 403 on login (Django CSRF)
 
@@ -18,7 +18,7 @@ After creating a staging droplet with `ilha droplet create` (or push + server-im
 
 **Required ilha change**
 
-- When generating or updating env for a **production/staging domain** (push, droplet create, domain overrides):
+- When generating or updating env for a **production/staging domain** (deploy, put, domain overrides):
   - Set **SITE_DOMAIN** to the **bare domain** (e.g. `staging.bower.bid`), no `http://` or `https://`.
   - Set **CSRF_TRUSTED_ORIGINS** to a **comma-separated** list (e.g. `https://staging.bower.bid,http://staging.bower.bid`). Use the same list in both the “generate env with domain” path and the “apply domain overrides” path (DRY).
 

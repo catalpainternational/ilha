@@ -177,9 +177,10 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 ### Droplet Management
 | Command | Description | Example |
 |---------|-------------|---------|
-| `droplet create [branch_name]` | Create a new Digital Ocean droplet and push environment (default). Droplet name auto-detected from domain subdomain or branch name | `ilha droplet create` or `ilha droplet create test` |
-| `droplet create [branch_name] --create-only` | Create a droplet only, do not push | `ilha droplet create test --create-only` |
-| `droplet create --domain app.example.com` | Create droplet using subdomain from domain as name | `ilha droplet create --domain app.example.com` |
+| `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). No Python/git/ilha needed on server | `ilha droplet deploy --domain app.example.com` |
+| `droplet deploy --no-create` | Deploy to an existing server (skip droplet creation) | `ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root` |
+| `droplet put [branch]` | Update an existing deployment (code + config, zero-downtime) | `ilha droplet put staging` |
+| `droplet logs [branch]` | Tail Docker Compose logs from a remote droplet | `ilha droplet logs staging` or `ilha droplet logs -s web -f` |
 | `droplet list` | List all droplets (formatted table) | `ilha droplet list` |
 | `droplet list --as-json` | List droplets as JSON | `ilha droplet list --as-json` |
 | `droplet list --as-csv` | List droplets as CSV | `ilha droplet list --as-csv` |
@@ -189,22 +190,33 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 | `droplet regions --as-csv` | List regions as CSV | `ilha droplet regions --as-csv` |
 | `droplet info <id>` | Get droplet information | `ilha droplet info 12345678` |
 | `droplet destroy <id>` | Destroy a droplet (supports ID or name, comma-separated) | `ilha droplet destroy 12345678` or `ilha droplet destroy my-droplet` or `ilha droplet destroy 123,456,789` |
-| `droplet push [<branch>] <scp_target_or_droplet>` | Push ilha package to remote server (supports progressive SCP patterns) | `ilha droplet push feature-auth user@server:/path` or `ilha droplet push feature-auth my-app` |
+| `droplet doctor [branch]` | Run read-only diagnostics on a remote deployment | `ilha droplet doctor staging` |
 
-**Droplet Creation Options:**
+**Droplet Deploy Options:**
 - `branch_name` (optional argument) - Branch/worktree name (auto-detected from current directory if not provided)
 - `--region <region>` - Droplet region (e.g. nyc1, sfo3). Use `ilha droplet regions` to list available regions (defaults from env or nyc1)
 - `--size <size>` - Droplet size (defaults from env or s-1vcpu-1gb)
 - `--image <image>` - Droplet image (defaults from env or ubuntu-22-04-x64)
-- `--ssh-keys <key>` - SSH key IDs or fingerprints (can be specified multiple times)
+- `--ssh-keys <key>` - SSH key names (comma-separated)
 - `--tags <tag>` - Tags for the droplet (can be specified multiple times)
-- `--wait` - Wait for droplet to be ready
 - `--api-token <token>` - Digital Ocean API token (or use DIGITALOCEAN_API_TOKEN env var)
-- `--create-only` - Only create droplet, do not push environment (default: creates and pushes)
+- `--create-only` - Only create droplet, skip deploy
+- `--no-create` - Skip droplet creation, deploy to existing server (requires --scp-target or --domain/--ip)
 - `--scp-target <target>` - SCP target (optional, defaults to root@<droplet-ip>:/root)
 - `--vpc-uuid <uuid>` - VPC UUID for the droplet (if not provided, uses default VPC for the region)
 - `--central-droplet-name <name>` - Name of central droplet to reuse VPC UUID from (for worker deployments)
-- Push options: `--no-auto-import` (opt-out), `--prepare-server`, `--domain`, `--ip`, `--dns-token`, `--skip-dns-check`, `--resume`, `--code-only`
+- `--domain` - Domain for HTTPS deployment
+- `--ip` - IP for HTTP-only deployment
+- `--dns-token` - DNS API token for domain management
+- `--build` - Rebuild Docker images on server
+- `--debug` - Enable DEBUG mode on server
+- `--use-staging-certificates` - Use Let's Encrypt staging certificates
+
+**Droplet Logs Options:**
+- `--service, -s <name>` - Service name(s) to show logs for (can be repeated, default: all)
+- `--tail, -n <lines>` - Number of lines to show (default: 100)
+- `--follow, -f` - Follow log output (stream, Ctrl+C to stop)
+- `--scp-target` / `--domain` / `--ip` - Target override (falls back to stored config)
 
 **Droplet Name Auto-Detection:**
 - If `--domain` is provided: uses subdomain as droplet name (e.g., `app.example.com` → `app`)
@@ -580,10 +592,10 @@ Error: HTTP 429 urn:ietf:params:acme:error:rateLimited - too many certificates (
    # Option 1: Set in your shell before running ilha commands
    export USE_STAGING_CERTIFICATES=1
    
-   # Option 2: Add to your .ilha/env.ilha file (recommended for droplet create/push)
+   # Option 2: Add to your .ilha/env.ilha file (recommended for droplet deploy/put)
    echo "USE_STAGING_CERTIFICATES=1" >> .ilha/env.ilha
    ```
-   **For `droplet create` and `droplet push`**: Add `USE_STAGING_CERTIFICATES=1` to your `.ilha/env.ilha` file before exporting. This ensures the setting is included in the package and will be used on the remote server. This is perfect for testing environments where you don't want to consume your production certificate quota. Staging certificates don't count against Let's Encrypt's rate limits.
+   **For `droplet deploy` and `droplet put`**: Add `USE_STAGING_CERTIFICATES=1` to your `.ilha/env.ilha` file before deploying. This ensures the setting is included and used on the remote server. Perfect for testing environments where you don't want to consume your production certificate quota. Staging certificates don't count against Let's Encrypt's rate limits.
 
 4. **Staging Certificates**: 
    - Staging certificates work for HTTPS but show browser security warnings
@@ -880,164 +892,66 @@ The ilha CLI follows a modular architecture designed for easy extension:
 - ✅ Project-agnostic setup
 - ✅ User guide in each .ilha directory
 - ✅ JSON output mode for programmatic access
- - ✅ Push command for SCP-based deployment with auto-import enabled by default
+ - ✅ Slim deploy via rsync + remote docker compose (no Python/git/ilha on server)
 
-## 🚀 Deployment (Push)
+## 🚀 Deployment
 
-### Create Droplet and Push (Default)
+### Deploy to a New Droplet
 ```bash
-# Create a new Digital Ocean droplet and automatically push environment to it
-# Branch name auto-detected from current directory, droplet name uses branch name
-# Auto-import is enabled by default
-ilha droplet create \
-  --prepare-server
+# Create a DigitalOcean droplet and deploy via rsync + remote docker compose
+# Branch name auto-detected from current directory
+ilha droplet deploy --domain app.example.com --ssh-keys anders
 
-# With explicit branch name (droplet name = branch name)
-ilha droplet create test \
-  --prepare-server
+# With explicit branch and custom sizing
+ilha droplet deploy staging \
+  --domain staging.example.com \
+  --ssh-keys anders \
+  --region syd1 --size s-1vcpu-2gb
 
-# With domain (droplet name = subdomain from domain)
-ilha droplet create \
-  --domain app.example.com \
-  --prepare-server
-
-# With custom droplet configuration
-ilha droplet create test \
-  --region sfo3 --size s-2vcpu-4gb \
-  --prepare-server \
-  --domain app.example.com
-
-# Create droplet only, do not push
-ilha droplet create test --create-only
+# Create droplet only, deploy later
+ilha droplet deploy staging --create-only --ssh-keys anders
 ```
 
-### Basic Push to Existing Server
+### Deploy to an Existing Server
 ```bash
-# Export and transfer a package to a remote server via SCP
-# Supports progressive SCP target patterns:
-ilha droplet push feature-auth user@server:/var/ilha/packages
-
-# Progressive patterns - Username + domain
-ilha droplet push feature-auth deploy@example.com
-
-# Progressive patterns - Domain + path
-ilha droplet push feature-auth example.com:/var/ilha
-
-# Progressive patterns - Domain only (resolves to IP)
-ilha droplet push feature-auth example.com
-
-# Progressive patterns - IP + path
-ilha droplet push feature-auth 192.168.1.100:/var/ilha
-
-# Progressive patterns - IP only
-ilha droplet push feature-auth 192.168.1.100
-
-# Droplet by name
-ilha droplet push feature-auth my-app
-
-# Droplet by ID
-ilha droplet push feature-auth 12345678
+# Skip droplet creation, deploy to a server you already have
+ilha droplet deploy staging --no-create --domain app.example.com
+ilha droplet deploy staging --no-create --scp-target root@1.2.3.4:/root
 ```
 
-### Auto-Import on Remote with Domain and HTTPS
+### Update an Existing Deployment
 ```bash
-# Push with automatic DNS management and HTTPS deployment
-# Auto-import is enabled by default
-ilha droplet push feature-auth user@server:/var/ilha/packages \
-  --prepare-server \
-  --domain app.example.com \
-  --dns-token $DIGITALOCEAN_API_TOKEN
+# Push code + config updates (zero-downtime canary)
+ilha droplet put staging
 
-# Or use environment variable for token
-export DIGITALOCEAN_API_TOKEN=your_token_here
-ilha droplet push feature-auth user@server:/var/ilha/packages \
-  --domain app.example.com
-
-# Or add to .env file in project root (no export needed)
-# .env file:
-# DIGITALOCEAN_API_TOKEN=your_token_here
-ilha droplet push feature-auth user@server:/var/ilha/packages \
-  --domain app.example.com
-
-# To skip auto-import (only push, don't import/start):
-ilha droplet push feature-auth user@server:/var/ilha/packages \
-  --no-auto-import
-
-# Options:
-#   --domain myapp.example.com        # Domain for HTTPS deployment
-#   --dns-token <token>                 # Digital Ocean API token (or use DIGITALOCEAN_API_TOKEN env var)
-#   --skip-dns-check                    # Skip DNS validation
-#   --ip 203.0.113.10                   # IP-only HTTP mode (no Let's Encrypt for IPs)
+# With explicit target overrides
+ilha droplet put staging --domain app.example.com
+ilha droplet put staging --scp-target root@1.2.3.4:/root
 ```
 
-### Code-Only Push (Fast Updates)
+### View Remote Logs
 ```bash
-# Push code-only update to pre-existing server
-# Uses stored push configuration from env.ilha (saved after first push)
-ilha droplet push --code-only
+# Tail all service logs (default: 100 lines)
+ilha droplet logs staging
 
-# Code-only update with explicit arguments (overrides stored config)
-# Works with all progressive SCP patterns:
-ilha droplet push feature-auth user@server:/var/ilha/packages --code-only
-ilha droplet push feature-auth my-app --code-only
-ilha droplet push feature-auth 192.168.1.100 --code-only
-ilha droplet push feature-auth deploy@example.com --code-only
-ilha droplet push feature-auth example.com:/var/ilha --code-only
+# Follow logs in real-time (Ctrl+C to stop)
+ilha droplet logs staging -f
 
-# Code-only update with domain/IP override
-ilha droplet push --code-only --domain app.example.com
-ilha droplet push --code-only --ip 203.0.113.10
+# Specific services
+ilha droplet logs staging -s web -s db
+
+# More lines
+ilha droplet logs staging -n 500
+
+# With explicit target
+ilha droplet logs --domain app.example.com -s web -f
 ```
 
-**How Code-Only Push Works:**
-- **Automatic Detection**: ilha automatically detects whether your code is stored in Docker volumes or bind mounts
-- **Volume-Based**: If code is in volumes, only code volumes are backed up and transferred
-- **Archive-Based**: If code is in bind mounts, a git archive is created and extracted to the worktree
-- **Configuration Storage**: Push configuration (scp_target, branch_name, domain, ip) is automatically saved to `.ilha/env.ilha` after successful push
-- **Reuse Configuration**: On subsequent pushes, stored configuration is used automatically (CLI arguments override stored config)
-
-**Push Configuration Variables:**
-After a successful push (full or code-only), the following variables are saved to `.ilha/env.ilha`:
+### Run Diagnostics
+```bash
+# Collect read-only diagnostics from the remote server
+ilha droplet doctor staging
 ```
-PUSH_SCP_TARGET=user@server:/path/to/packages
-PUSH_BRANCH_NAME=feature-auth
-PUSH_DOMAIN=app.example.com  # optional
-PUSH_IP=203.0.113.10  # optional (mutually exclusive with domain)
-```
-
-**When to Use Code-Only Push:**
-- Quick code updates on pre-existing servers
-- Deploying minor fixes without full environment redeployment
-- Faster iteration during development
-- When only code changes, not environment configuration
-
-**When to Use Full Push:**
-- Initial deployment
-- Environment configuration changes
-- Database schema migrations
-- Volume data updates
-
-### Progressive SCP Target Patterns
-
-The `droplet push` command supports progressive SCP target patterns, making it easier to deploy without manually constructing SCP targets:
-
-**Supported Patterns:**
-- **Full SCP target**: `user@server:/path` → use as-is (backward compatible)
-- **Username + domain**: `user@example.com` → resolves domain to IP, constructs `user@<ip>:/root`
-- **Domain + path**: `example.com:/path` → resolves domain to IP, constructs `root@<ip>:<path>`
-- **Domain only**: `example.com` → resolves domain to IP, constructs `root@<ip>:/root`
-- **IP + path**: `192.168.1.100:/path` → constructs `root@192.168.1.100:/path`
-- **IP only**: `192.168.1.100` → constructs `root@192.168.1.100:/root`
-- **Droplet ID**: `12345678` → resolves to IP via API, constructs `root@<ip>:/root`
-- **Droplet name**: `my-app` → resolves to IP via API, constructs `root@<ip>:/root`
-
-**Resolution Priority:**
-1. If already an IP address → use directly
-2. Try DNS resolution (domain lookup) → use resolved IP
-3. Try droplet ID/name lookup → use droplet IP
-
-**Domain Setup Fix:**
-When using progressive patterns with `--domain`, the resolved IP from the SCP target is automatically used for DNS management, ensuring DNS records point to the correct server.
 
 ### Multi-Project Deployments
 
@@ -1065,19 +979,16 @@ ilha supports deploying **multiple independent projects** to the same server, ea
 
 ```bash
 # Deploy Project 1 (e.g., Django app) to server
-cd /var/ilha/project1
-ilha droplet push feature-auth user@server:/var/ilha/packages \
-  --domain app1.example.com
+cd /path/to/project1
+ilha droplet deploy --no-create --domain app1.example.com
 
 # Deploy Project 2 (e.g., Flask API) to same server
-cd /var/ilha/project2  
-ilha droplet push api-v2 user@server:/var/ilha/packages \
-  --domain api.example.com
+cd /path/to/project2
+ilha droplet deploy --no-create --domain api.example.com
 
 # Deploy Project 3 (e.g., Node.js app) to same server
-cd /var/ilha/project3
-ilha droplet push main user@server:/var/ilha/packages \
-  --domain app3.example.com
+cd /path/to/project3
+ilha droplet deploy --no-create --domain app3.example.com
 ```
 
 All three projects will:
@@ -1103,7 +1014,7 @@ All three projects will:
    - Each project maintains its own `.ilha/` configuration
 
 4. **Automatic Label Configuration**: ilha automatically adds `caddy.proxy` labels to containers
-   - Labels are set based on `--domain` or `--ip` flags during push
+   - Labels are set based on `--domain` or `--ip` flags during deploy
    - No manual configuration needed
 
 #### Benefits
@@ -1209,18 +1120,15 @@ ilha supports VPC (Virtual Private Cloud) deployments for secure private network
 **Central and Worker Droplet Setup:**
 
 ```bash
-# 1. Create central server droplet with db/redis services
-ilha droplet create test \
+# 1. Deploy central server with db/redis services
+ilha droplet deploy test \
   --domain central.example.com \
-  --containers test.db,test.redis,test.web \
-  --prepare-server
+  --ssh-keys anders
 
-# 2. Create worker droplet in same VPC (reuses VPC UUID from central)
-ilha droplet create test \
+# 2. Deploy worker in same VPC (reuses VPC UUID from central)
+ilha droplet deploy test \
   --central-droplet-name central \
-  --containers test.rq-worker-1 \
-  --exclude-deps db,redis \
-  --prepare-server
+  --ssh-keys anders
 ```
 
 **VPC Features:**

@@ -3,16 +3,36 @@
 # Used by: ilha start/stop commands
 
 services:
+  # Docker socket proxy — exposes only read-only container/network APIs.
+  # caddy-monitor talks to this instead of mounting the raw Docker socket.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: ilha_docker_socket_proxy
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      EVENTS: 1
+      # Everything else defaults to 0 (denied)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - ilha_caddy_proxy
+    restart: unless-stopped
+
   caddy:
     image: caddy:2
     container_name: ilha_caddy_proxy
     ports:
       - "80:80"
       - "443:443"
-      - "2019:2019"  # Caddy admin API
+      # Admin API bound to localhost only — reachable from host scripts (e.g. caddy_swap)
+      # but not from the internet. UFW/iptables don't need to block it.
+      - "127.0.0.1:2019:2019"
     environment:
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.com}
     volumes:
+      # Caddy needs the Docker socket for its built-in Docker integration.
+      # This is read-only but still grants broad Docker API access to the Caddy container.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - caddy_data:/data
       - caddy_config:/config
@@ -25,13 +45,15 @@ services:
     container_name: caddy_monitor
     environment:
       USE_STAGING_CERTIFICATES: ${USE_STAGING_CERTIFICATES:-}
+      # Connect to Docker via the socket proxy, not the raw socket
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - {MONITOR_SCRIPT_PATH}:/app/monitor.py
       - {HELPER_UTILS_PATH}:/app/caddy_admin_utils.py
-    command: ["sh", "-c", "pip install --no-cache-dir docker requests && python /app/monitor.py"]
+    command: ["sh", "-c", "pip install --no-cache-dir docker==7.1.0 requests==2.32.3 && python /app/monitor.py"]
     depends_on:
       - caddy
+      - docker-socket-proxy
     networks:
       - ilha_caddy_proxy
     restart: unless-stopped

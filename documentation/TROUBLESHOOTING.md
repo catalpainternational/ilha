@@ -91,7 +91,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))  # override=False b
 This ensures that Docker environment variables (set from `.ilha/env.ilha`) take precedence over `.env` file values.
 
 #### 3. Verify .ilha/env.ilha Contains Correct Values
-When `ilha droplet create` is run with `--central-droplet-name`, it should write:
+When `ilha droplet deploy` is run with `--central-droplet-name`, it should write:
 
 ```bash
 DB_HOST=10.116.0.13      # VPC IP of central droplet
@@ -169,7 +169,7 @@ frontend:
 ```
 
 #### 3. ilha Automatically Sets `VITE_ALLOWED_HOSTS` on Deployment
-When using `ilha push --domain <domain>`, ilha's `_update_remote_env_file()` function now automatically sets:
+When using `ilha droplet deploy --domain <domain>`, ilha automatically sets:
 
 ```
 VITE_ALLOWED_HOSTS=<domain>,*.<base-domain>,localhost,127.0.0.1
