@@ -34,7 +34,7 @@ def test_disk_preflight_detects_insufficient_space(tmp_path: Path, monkeypatch):
         return 0, "/app:100\n/var/lib/docker:100\n", ""
 
     monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
-    ok, report = mgr.disk._check_remote_disk_capacity(
+    ok, report = mgr.disk.check_remote_disk_capacity(
         username="root",
         server="1.2.3.4",
         deploy_size_bytes=1024 * 1024 * 200,
@@ -51,7 +51,7 @@ def test_disk_preflight_missing_app_path_uses_parent_filesystem(tmp_path: Path, 
         return 0, "/app:2147483648:/\n/var/lib/docker:2147483648:/var/lib/docker\n", ""
 
     monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
-    ok, report = mgr.disk._check_remote_disk_capacity(
+    ok, report = mgr.disk.check_remote_disk_capacity(
         username="root",
         server="1.2.3.4",
         deploy_size_bytes=1024 * 1024 * 200,
@@ -69,7 +69,7 @@ def test_disk_preflight_report_contains_probe_paths(tmp_path: Path, monkeypatch)
         return 0, "/app:2147483648:/\n/var/lib/docker:2147483648:/var/lib/docker\n", ""
 
     monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
-    ok, report = mgr.disk._check_remote_disk_capacity(
+    ok, report = mgr.disk.check_remote_disk_capacity(
         username="root",
         server="1.2.3.4",
         deploy_size_bytes=10,
@@ -88,9 +88,9 @@ def test_disk_recovery_modes(tmp_path: Path, monkeypatch):
         return 0, "", ""
 
     monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
-    assert mgr.disk._attempt_remote_disk_recovery("root", "1.2.3.4", "safe", force=True)
+    assert mgr.disk.attempt_remote_disk_recovery("root", "1.2.3.4", "safe", force=True)
     assert "docker system prune -af --volumes" not in captured["command"]
-    assert mgr.disk._attempt_remote_disk_recovery("root", "1.2.3.4", "aggressive", force=True)
+    assert mgr.disk.attempt_remote_disk_recovery("root", "1.2.3.4", "aggressive", force=True)
     assert "docker system prune -af --volumes" in captured["command"]
 
 
@@ -107,7 +107,7 @@ def test_gather_source_manifest_collects_checksums(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(mgr.preflight, "_get_git_branch", lambda _path: "demo")
     monkeypatch.setattr(mgr.preflight, "_is_git_dirty", lambda _path: True)
 
-    manifest = mgr.preflight._gather_source_manifest("demo", worktree, root)
+    manifest = mgr.preflight.gather_source_manifest("demo", worktree, root)
     assert manifest["branch_name"] == "demo"
     assert manifest["source_path"] == str(worktree)
     assert manifest["comparison_root"] == str(root)
@@ -130,7 +130,7 @@ def test_build_drift_report_warns_for_dockerfile_and_fails_for_compose(tmp_path:
     (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: worktree\n")
 
     mgr = SlimDeployManager(project_root=root)
-    report = mgr.preflight._build_drift_report(worktree, root)
+    report = mgr.preflight.build_drift_report(worktree, root)
 
     assert report["status"] == "error"
     severities = {entry["file"]: entry["severity"] for entry in report["differences"]}
@@ -149,7 +149,7 @@ def test_build_drift_report_skips_cross_tree_drift_when_heads_differ(tmp_path: P
     mgr = SlimDeployManager(project_root=root)
     monkeypatch.setattr(mgr.preflight, "_git_rev_parse_head", lambda path: "root-head" if path == root else "worktree-head")
 
-    report = mgr.preflight._build_drift_report(worktree, root)
+    report = mgr.preflight.build_drift_report(worktree, root)
 
     assert report["status"] == "ok"
     assert report["differences"] == []
@@ -168,7 +168,7 @@ def test_build_drift_report_strict_mode_keeps_drift_enforcement(tmp_path: Path, 
     mgr = SlimDeployManager(project_root=root)
     monkeypatch.setattr(mgr.preflight, "_git_rev_parse_head", lambda _path: "same-head")
 
-    report = mgr.preflight._build_drift_report(worktree, root, strict_deploy_drift=True)
+    report = mgr.preflight.build_drift_report(worktree, root, strict_deploy_drift=True)
 
     assert report["status"] == "error"
     assert report["skipped"] is False
@@ -221,7 +221,7 @@ def test_detect_env_contract_issues_warns_on_schemed_site_domain(tmp_path: Path)
     (worktree / ".ilha" / "env.ilha").write_text("SITE_DOMAIN=https://staging.example.com/login/\n")
 
     mgr = SlimDeployManager(project_root=root)
-    warnings = mgr.preflight._detect_env_contract_issues(worktree)
+    warnings = mgr.preflight.detect_env_contract_issues(worktree)
 
     assert len(warnings) == 1
     assert warnings[0]["variable"] == "SITE_DOMAIN"

@@ -12,10 +12,10 @@ from typing import Optional, Tuple, Dict, Any
 
 import click
 
-from ilha.cli.helpers import add_json_option, add_remote_push_options, add_verbose_option
+from ilha.cli.helpers import add_json_option, add_verbose_option
 from ilha.commands.droplets import DropletCommands
-from ilha.commands.push.push_manager import PushManager
 from ilha.utils.json_output import JSONOutput
+from ilha.utils.network import resolve_server_ip
 from ilha.utils.ssh_manager import SCPTarget
 from ilha.utils.logging import (
     error_exit,
@@ -106,7 +106,7 @@ def _resolve_droplet_name(branch_name: str, domain: Optional[str], json: bool) -
         return branch_name
 
 
-def _resolve_host_to_ip(host: str, push_manager, api_token: Optional[str] = None) -> str:
+def _resolve_host_to_ip(host: str, api_token: Optional[str] = None) -> str:
     """Resolve host to IP: already-IP, domain (via DO when token present), DNS, or droplet id/name."""
     import re
 
@@ -132,9 +132,7 @@ def _resolve_host_to_ip(host: str, push_manager, api_token: Optional[str] = None
 
     # DNS (when no token or not domain-like)
     try:
-        ip = push_manager._resolve_server_ip(host)
-        if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip) and ip != host:
-            return ip
+        ip = resolve_server_ip(host)
         if ip != host:
             return ip
     except Exception as exc:
@@ -167,10 +165,6 @@ def _parse_rsync_target_or_droplet(arg: str, api_token: Optional[str] = None) ->
     - Domain/IP only: `example.com` or `192.168.1.100` → return root@ip:/root
     - Droplet ID or name → resolve to IP, return root@ip:/root
     """
-    from ..commands.push.push_manager import PushManager
-
-    push_manager = PushManager()
-
     # Full target format user@host:path — resolve host so we use current droplet IP
     if '@' in arg and ':' in arg:
         at_pos = arg.index('@')
@@ -179,23 +173,23 @@ def _parse_rsync_target_or_droplet(arg: str, api_token: Optional[str] = None) ->
             username = arg[:at_pos]
             host = arg[at_pos + 1:colon_pos]
             path = arg[colon_pos + 1:]
-            ip = _resolve_host_to_ip(host, push_manager, api_token)
+            ip = _resolve_host_to_ip(host, api_token)
             return f"{username}@{ip}:{path}"
 
     # Username + domain/IP: user@example.com or user@192.168.1.100
     if '@' in arg and ':' not in arg:
         username, host = arg.split('@', 1)
-        ip = _resolve_host_to_ip(host, push_manager, api_token)
+        ip = _resolve_host_to_ip(host, api_token)
         return f"{username}@{ip}:/root"
 
     # Domain/IP + path: example.com:/path or 192.168.1.100:/path
     if ':' in arg and '@' not in arg:
         host, path = arg.rsplit(':', 1)
-        ip = _resolve_host_to_ip(host, push_manager, api_token)
+        ip = _resolve_host_to_ip(host, api_token)
         return f"root@{ip}:{path}"
 
     # Just host (domain, IP, droplet ID, or droplet name)
-    ip = _resolve_host_to_ip(arg, push_manager, api_token)
+    ip = _resolve_host_to_ip(arg, api_token)
     return f"root@{ip}:/root"
 
 
@@ -397,435 +391,6 @@ def register_commands(cli) -> None:
             if candidate_name not in existing_names:
                 return candidate_name
             counter += 1
-
-    @droplet.command("create")
-    @click.argument("branch_name", required=False)
-    @click.option("--region", help='Droplet region (e.g., nyc1, sfo3). Use "ilha droplet regions" to list available regions. Default: nyc1 or from DROPLET_DEFAULT_REGION env var')
-    @click.option(
-        "--size",
-        help='Droplet size slug (e.g., s-1vcpu-1gb, s-2vcpu-4gb). Use "ilha droplet sizes" to list all available sizes. Default: s-1vcpu-1gb or from DIGITALOCEAN_SIZE env var',
-    )
-    @click.option("--image", help="Droplet image (default: ubuntu-22-04-x64 or from DIGITALOCEAN_IMAGE env var)")
-    @click.option("--ssh-keys", type=str, help="SSH key names (comma-separated, e.g., anders,peter)")
-    @click.option("--tags", multiple=True, help="Tags for the droplet (can be specified multiple times)")
-    @click.option("--wait", is_flag=True, default=False, help="Wait for droplet to be ready before returning")
-    @click.option("--api-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
-    @click.option(
-        "--create-only",
-        is_flag=True,
-        default=False,
-        help="Only create droplet, do not push environment (default: creates droplet and pushes environment)",
-    )
-    @click.option("--scp-target", help="SCP target in format username@server:path (optional, defaults to root@<droplet-ip>:/root)")
-    @click.option("--vpc-uuid", help="VPC UUID for the droplet. If not provided, will use the default VPC for the region.")
-    @click.option("--central-droplet-name", help="Name of central droplet to reuse VPC UUID from (for worker deployments)")
-    @add_remote_push_options(include_use_staging_certificates=True)
-    @add_json_option
-    @add_verbose_option
-    def droplet_create(
-        branch_name: Optional[str],
-        region: Optional[str],
-        size: Optional[str],
-        image: Optional[str],
-        ssh_keys: Optional[str],
-        tags: tuple,
-        wait: bool,
-        api_token: Optional[str],
-        json: bool,
-        create_only: bool,
-        scp_target: Optional[str],
-        output_dir: str,
-        keep_package: bool,
-        no_auto_import: bool,
-        prepare_server: bool,
-        domain: str,
-        ip: str,
-        dns_token: str,
-        skip_dns_check: bool,
-        resume: bool,
-        code_only: bool,
-        build: bool,
-        containers: Optional[str],
-        exclude_deps: Optional[str],
-        vpc_uuid: Optional[str],
-        central_droplet_name: Optional[str],
-        use_staging_certificates: bool,
-    ):
-        from ilha.core.droplet_manager import DropletManager
-        from ilha.utils.logging import format_elapsed_time
-
-        start_time = time.time()
-        try:
-            branch_name = _auto_detect_branch_name(branch_name, json)
-            if not branch_name:
-                return
-            
-            # Load stored droplet config and merge with CLI arguments
-            merged, env_manager, stored_config = _load_and_merge_config(
-                branch_name, {
-                    'region': region, 'size': size, 'image': image,
-                    'ssh_keys': ssh_keys, 'tags': tags, 'vpc_uuid': vpc_uuid,
-                    'central_droplet_name': central_droplet_name,
-                    'scp_target': scp_target, 'domain': domain, 'ip': ip,
-                    'dns_token': dns_token, 'output_dir': output_dir,
-                    'keep_package': keep_package, 'prepare_server': prepare_server,
-                    'resume': resume, 'build': build,
-                    'containers': containers, 'exclude_deps': exclude_deps,
-                },
-            )
-            region = merged['region']
-            size = merged['size']
-            image = merged['image']
-            ssh_keys = merged['ssh_keys']
-            tags = merged.get('tags') or ()
-            vpc_uuid = merged['vpc_uuid']
-            central_droplet_name = merged['central_droplet_name']
-            scp_target = merged['scp_target']
-            domain = merged['domain']
-            ip = merged['ip']
-            dns_token = merged['dns_token']
-            output_dir = merged['output_dir']
-            keep_package = merged['keep_package']
-            prepare_server = merged['prepare_server']
-            resume = merged['resume']
-            build = merged['build']
-            containers = merged['containers']
-            exclude_deps = merged['exclude_deps']
-            
-            droplet_name = _resolve_droplet_name(branch_name, domain, json)
-
-            defaults = DropletManager.get_droplet_defaults()
-            resolved_region = region or defaults.get("region", "nyc1")
-            resolved_size = size or defaults.get("size", "s-1vcpu-1gb")
-            resolved_image = image or defaults.get("image", "ubuntu-22-04-x64")
-            _log_creation_context(
-                droplet_name,
-                resolved_region,
-                resolved_size,
-                resolved_image,
-                ssh_keys,
-                tags,
-                containers,
-                exclude_deps,
-                json,
-            )
-
-            check_prerequisites_no_git()
-            droplet_commands = DropletCommands()
-            ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else None
-            tags_list = list(tags) if tags else None
-
-            resolved_vpc_uuid = vpc_uuid
-            central_droplet = None
-            provider = None
-            token = None
-            if central_droplet_name and not vpc_uuid:
-                if not json:
-                    log_info("Resolving VPC configuration...")
-                    log_info(f"Looking up VPC UUID from central droplet: {central_droplet_name}")
-                token = DropletManager.resolve_droplet_token(api_token or dns_token)
-                if token:
-                    provider = DropletManager.create_provider("digitalocean", token)
-                    if provider:
-                        droplets = provider.list_droplets()
-                        for current_droplet in droplets:
-                            if current_droplet.name == central_droplet_name:
-                                central_droplet = current_droplet
-                                break
-                        if central_droplet and central_droplet.vpc_uuid:
-                            resolved_vpc_uuid = central_droplet.vpc_uuid
-                            if central_droplet.region != resolved_region:
-                                msg = (
-                                    f"Region mismatch: central droplet '{central_droplet_name}' "
-                                    f"is in {central_droplet.region}, but worker would be in "
-                                    f"{resolved_region}. Use --region {central_droplet.region}"
-                                )
-                                if json:
-                                    JSONOutput.print_error(msg)
-                                else:
-                                    log_error("Region mismatch detected!")
-                                    log_error(f"   Central droplet '{central_droplet_name}' is in region: {central_droplet.region}")
-                                    log_error(f"   Worker droplet would be created in region: {resolved_region}")
-                                    log_error("   VPCs are region-specific and cannot span regions.")
-                                    log_error(f"   Please use --region {central_droplet.region} to match the central droplet's region.")
-                                    error_exit(msg)
-                                return
-                            if not json:
-                                log_info(f"Found central droplet '{central_droplet_name}' in region {central_droplet.region}")
-                                log_info(f"Using VPC UUID from central droplet: {resolved_vpc_uuid}")
-                                if central_droplet.private_ip_address:
-                                    log_info(f"Central droplet private IP: {central_droplet.private_ip_address}")
-                        elif not json:
-                            log_warning(f"Central droplet '{central_droplet_name}' not found or has no VPC UUID, using default VPC")
-            elif not json and not vpc_uuid:
-                log_info("Resolving VPC configuration...")
-                log_info(f"Using default VPC for region {resolved_region}")
-
-            central_droplet_info = central_droplet if central_droplet_name and central_droplet else None
-
-            if not provider:
-                token = DropletManager.resolve_droplet_token(api_token or dns_token)
-                if token:
-                    provider = DropletManager.create_provider("digitalocean", token)
-
-            if provider:
-                unique_droplet_name = _generate_unique_droplet_name(droplet_name, provider)
-                if unique_droplet_name != droplet_name:
-                    if not json:
-                        log_info(f"Droplet name '{droplet_name}' already exists, using '{unique_droplet_name}' instead")
-                    droplet_name = unique_droplet_name
-
-            wait_for_push = not create_only
-            success = droplet_commands.create_droplet(
-                name=droplet_name,
-                region=resolved_region,
-                size=resolved_size,
-                image=resolved_image,
-                ssh_keys=ssh_keys_list,
-                tags=tags_list,
-                wait=wait or wait_for_push,
-                api_token=api_token,
-                json=json,
-                containers=containers,
-                vpc_uuid=resolved_vpc_uuid,
-            )
-            if not success:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(f"Failed to create droplet: {droplet_name}")
-                else:
-                    error_exit(f"Failed to create droplet: {droplet_name}")
-                return
-
-            if create_only:
-                # Save droplet creation configuration even if not pushing
-                config_to_save = {
-                    'region': resolved_region,
-                    'size': resolved_size,
-                    'image': resolved_image,
-                    'ssh_keys': ssh_keys,
-                    'tags': ','.join(tags) if tags else None,
-                    'vpc_uuid': resolved_vpc_uuid,
-                    'central_droplet_name': central_droplet_name,
-                }
-                env_manager.save_droplet_config(branch_name, config_to_save)
-                
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                return
-
-            if not json:
-                log_info("")
-                log_info("Droplet created successfully. Preparing to push environment...")
-                log_info(f"Will push worktree '{branch_name}' to {droplet_name}")
-                if containers:
-                    log_info(f"Selected containers: {containers}")
-                if exclude_deps:
-                    exclude_deps_preview = [d.strip() for d in exclude_deps.split(",")]
-                    log_info(f"Excluding dependencies: {', '.join(exclude_deps_preview)}")
-                log_info("")
-
-            token = DropletManager.resolve_droplet_token(api_token or dns_token)
-            if not token:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found for push operation")
-                else:
-                    error_exit("Digital Ocean API token not found for push operation")
-                return
-
-            provider = DropletManager.create_provider("digitalocean", token)
-            if not provider:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider for push")
-                else:
-                    error_exit("Failed to create droplet provider for push")
-                return
-
-            droplets = provider.list_droplets()
-            found_droplet = None
-            for droplet_obj in droplets:
-                if droplet_obj.name == droplet_name:
-                    found_droplet = droplet_obj
-                    break
-            droplet_info = found_droplet
-
-            if not droplet_info or not droplet_info.ip_address:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(f"Droplet {droplet_name} created but IP address not available")
-                else:
-                    error_exit(f"Droplet {droplet_name} created but IP address not available")
-                return
-
-            if scp_target:
-                push_manager = PushManager()
-                if not push_manager._validate_scp_target(scp_target):
-                    elapsed_time = time.time() - start_time
-                    if not json:
-                        print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                    if json:
-                        JSONOutput.print_error(f"Invalid SCP target format: {scp_target}")
-                    else:
-                        error_exit(f"Invalid SCP target format: {scp_target}")
-                    return
-                username, _, remote_path = push_manager._parse_scp_target(scp_target)
-            else:
-                username = "root"
-                remote_path = "/root"
-            final_scp_target = f"{username}@{droplet_info.ip_address}:{remote_path}"
-
-            check_setup_or_prompt()
-            check_prerequisites()
-
-            if domain and ip:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Options --domain and --ip are mutually exclusive")
-                else:
-                    error_exit("Options --domain and --ip are mutually exclusive")
-                return
-
-            push_manager = PushManager()
-            droplet_ssh_keys_list = ssh_keys_list if ssh_keys_list else None
-            exclude_deps_list = [d.strip() for d in exclude_deps.split(",")] if exclude_deps else None
-
-            try:
-                success = push_manager.push_package(
-                    branch_name=branch_name,
-                    scp_target=final_scp_target,
-                    output_dir=Path(output_dir),
-                    keep_package=keep_package,
-                    auto_import=not no_auto_import,
-                    containers=containers,
-                    exclude_deps=exclude_deps_list,
-                    domain=domain,
-                    ip=ip,
-                    prepare_server=prepare_server,
-                    dns_token=dns_token or api_token,
-                    skip_dns_check=skip_dns_check,
-                    create_droplet=True,
-                    droplet_name=None,
-                    droplet_region=None,
-                    droplet_size=None,
-                    droplet_image=None,
-                    droplet_ssh_keys=droplet_ssh_keys_list,
-                    resume=resume,
-                    code_only=code_only,
-                    build=build,
-                    droplet_info=droplet_info,
-                    central_droplet_info=central_droplet_info,
-                    use_staging_certificates=use_staging_certificates,
-                )
-            except click.exceptions.ClickException as exc:
-                import traceback
-
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(f"Click error during push: {exc}")
-                else:
-                    error_exit(f"Click error during push: {exc}\n{traceback.format_exc()}")
-                return
-            except Exception as exc:
-                import traceback
-
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(f"Error during push: {exc}")
-                else:
-                    error_exit(f"Error during push: {exc}\n{traceback.format_exc()}")
-                return
-
-            elapsed_time = time.time() - start_time
-            if not success:
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Failed to push package to droplet")
-                else:
-                    error_exit("Failed to push package to droplet")
-            else:
-                # Save droplet configuration for future use
-                config_to_save = {
-                    'region': resolved_region,
-                    'size': resolved_size,
-                    'image': resolved_image,
-                    'ssh_keys': ssh_keys,
-                    'tags': ','.join(tags) if tags else None,
-                    'vpc_uuid': resolved_vpc_uuid,
-                    'central_droplet_name': central_droplet_name,
-                    'scp_target': final_scp_target,
-                    'domain': domain if domain else None,
-                    'ip': ip if ip else None,
-                    'dns_token': dns_token if dns_token else None,
-                    'output_dir': str(output_dir),
-                    'keep_package': keep_package,
-                    'prepare_server': prepare_server,
-                    'resume': resume,
-                    'build': build,
-                    'containers': containers,
-                    'exclude_deps': exclude_deps,
-                }
-                env_manager.save_droplet_config(branch_name, config_to_save)
-                
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                
-                # Determine deployment URL
-                url = None
-                if domain:
-                    url = f"https://{domain}"
-                elif ip:
-                    url = f"http://{ip}"
-                elif droplet_info and droplet_info.ip_address:
-                    url = f"http://{droplet_info.ip_address}"
-                
-                if json:
-                    data = {"droplet_name": droplet_name}
-                    if url:
-                        data["url"] = url
-                    if droplet_info:
-                        data["ip_address"] = droplet_info.ip_address
-                    JSONOutput.print_success("Droplet created and package pushed successfully", data=data)
-                else:
-                    log_success("Droplet created and package pushed successfully")
-                    
-                    # Output deployment URL
-                    if url:
-                        if domain:
-                            log_success(f"🌐 Your site is available at: {url}")
-                        elif ip:
-                            log_success(f"🌐 Your site is available at: {url}")
-                        else:
-                            log_info(f"🌐 Your site is available at: {url}")
-                            log_info("   (Use --domain to enable HTTPS)")
-                        print_plain("")
-        except Exception as exc:
-            from ilha.utils.logging import format_elapsed_time
-
-            elapsed_time = time.time() - start_time
-            if not json:
-                print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-            if json:
-                JSONOutput.print_error(f"Error creating droplet: {exc}")
-            else:
-                error_exit(f"Error creating droplet: {exc}")
 
     @droplet.command("list")
     @click.option("--api-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
@@ -1034,193 +599,6 @@ def register_commands(cli) -> None:
             else:
                 error_exit(f"Error getting droplet info: {exc}")
 
-    @droplet.command("push")
-    @click.argument("branch_name", required=False)
-    @click.argument("target", required=False)
-    @add_remote_push_options(include_debug=True, include_use_staging_certificates=True)
-    @add_json_option
-    @add_verbose_option
-    def droplet_push(
-        branch_name: Optional[str],
-        target: Optional[str],
-        output_dir: str,
-        keep_package: bool,
-        no_auto_import: bool,
-        prepare_server: bool,
-        domain: str,
-        ip: str,
-        dns_token: str,
-        skip_dns_check: bool,
-        resume: bool,
-        code_only: bool,
-        build: bool,
-        debug: bool,
-        containers: Optional[str],
-        exclude_deps: Optional[str],
-        json: bool,
-        use_staging_certificates: bool,
-    ):
-        start_time = time.time()
-        try:
-            check_setup_or_prompt()
-            check_prerequisites()
-            
-            # CLI always wins over env file for rsync/connection target
-            cli_target = target
-            cli_domain = domain or None  # treat '' as not provided
-
-            # Load stored droplet config and merge with CLI arguments
-            merged, env_manager, stored_config = _load_and_merge_config(
-                branch_name, {
-                    'scp_target': target, 'domain': domain, 'ip': ip,
-                    'dns_token': dns_token, 'output_dir': output_dir,
-                    'keep_package': keep_package, 'prepare_server': prepare_server,
-                    'resume': resume, 'build': build, 'debug': debug,
-                    'containers': containers, 'exclude_deps': exclude_deps,
-                },
-            )
-            target = merged['scp_target']
-            domain = merged['domain']
-            ip = merged['ip']
-            dns_token = merged['dns_token']
-            output_dir = merged['output_dir']
-            keep_package = merged['keep_package']
-            prepare_server = merged['prepare_server']
-            resume = merged['resume']
-            build = merged['build']
-            debug = merged['debug']
-            containers = merged['containers']
-            exclude_deps = merged['exclude_deps']
-            
-            if domain and ip:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Options --domain and --ip are mutually exclusive")
-                else:
-                    error_exit("Options --domain and --ip are mutually exclusive")
-                return
-            
-            # Rsync/connection target: CLI target > CLI domain > stored domain > stored target (always set when we have a value; --code-only does not skip this)
-            if cli_target:
-                target = cli_target
-                if not json:
-                    log_info(f"Using rsync target from command line: {cli_target}")
-            elif cli_domain:
-                target = cli_domain
-                if not json:
-                    log_info(f"Using domain from command line: {cli_domain}")
-            elif domain:
-                target = domain
-                if not json:
-                    log_info(f"Using domain from config: {domain}")
-            elif not target:
-                target = stored_config.get('scp_target')
-                if target and not json:
-                    log_info(f"Using rsync target from config: {target}")
-
-            if not code_only and not target:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Rsync target (or --domain) is required")
-                else:
-                    error_exit("Rsync target (or --domain) is required")
-                return
-
-            # Resolve rsync target (domain, IP, or droplet id/name) to user@ip:path
-            try:
-                resolved = _parse_rsync_target_or_droplet(target, dns_token)
-                if resolved != target and not json:
-                    log_info(f"Resolved rsync target: {target} → {resolved}")
-                rsync_target = resolved
-            except ValueError as e:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(str(e))
-                else:
-                    error_exit(str(e))
-                return
-            except Exception as e:
-                elapsed_time = time.time() - start_time
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error(f"Error resolving rsync target: {e}")
-                else:
-                    error_exit(f"Error resolving rsync target: {e}")
-                return
-            
-            push_manager = PushManager()
-            exclude_deps_list = [d.strip() for d in exclude_deps.split(",")] if exclude_deps else None
-            success = push_manager.push_package(
-                branch_name=branch_name,
-                scp_target=rsync_target,
-                output_dir=Path(output_dir),
-                keep_package=keep_package,
-                auto_import=not no_auto_import,
-                domain=domain,
-                ip=ip,
-                prepare_server=prepare_server,
-                dns_token=dns_token,
-                use_staging_certificates=use_staging_certificates,
-                skip_dns_check=skip_dns_check,
-                create_droplet=False,
-                droplet_name=None,
-                droplet_region=None,
-                droplet_size=None,
-                droplet_image=None,
-                droplet_ssh_keys=None,
-                resume=resume,
-                code_only=code_only,
-                build=build,
-                debug=debug,
-                containers=containers,
-                exclude_deps=exclude_deps_list,
-            )
-            elapsed_time = time.time() - start_time
-            if not success:
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_error("Failed to push package")
-                else:
-                    error_exit("Failed to push package")
-            else:
-                # Save droplet configuration for future use (stored key remains scp_target for compatibility)
-                config_to_save = {
-                    'scp_target': rsync_target,
-                    'domain': domain if domain else None,
-                    'ip': ip if ip else None,
-                    'dns_token': dns_token if dns_token else None,
-                    'output_dir': str(output_dir),
-                    'keep_package': keep_package,
-                    'prepare_server': prepare_server,
-                    'resume': resume,
-                    'build': build,
-                    'debug': debug,
-                    'containers': containers,
-                    'exclude_deps': exclude_deps,
-                }
-                env_manager.save_droplet_config(branch_name or '', config_to_save)
-                
-                if not json:
-                    print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-                if json:
-                    JSONOutput.print_success("Package pushed successfully")
-        except Exception as exc:
-            elapsed_time = time.time() - start_time
-            if not json:
-                print_plain(f"Total elapsed time: {format_elapsed_time(elapsed_time)}")
-            if json:
-                JSONOutput.print_error(f"Error pushing package: {exc}")
-            else:
-                error_exit(f"Error pushing package: {exc}")
-
     # ── droplet deploy (slim) ─────────────────────────────────────────
 
     @droplet.command("deploy")
@@ -1261,6 +639,16 @@ def register_commands(cli) -> None:
         default=False,
         help="Fail deploy when critical files differ between comparison root and worktree, even across different commits",
     )
+    @click.option(
+        "--strict-env-contract/--no-strict-env-contract",
+        default=True,
+        show_default=True,
+        help="Block deploy when env values have known-bad shapes (e.g. SITE_DOMAIN with http:// prefix). Prevents the CSRF-breakage class; pass --no-strict-env-contract to bypass.",
+    )
+    @click.option(
+        "--expected-ssh-fingerprint",
+        help="SHA256:… fingerprint of the server's SSH host key. If set, a mismatch aborts the deploy (MITM defense). Without it, the first-seen key is trusted (TOFU) and logged so you can pin it on the next deploy.",
+    )
     @click.option("--smoke-timeout", type=int, default=60, help="Timeout in seconds for post-deploy smoke checks (default: 60)")
     @add_json_option
     @add_verbose_option
@@ -1291,6 +679,8 @@ def register_commands(cli) -> None:
         no_disk_check: bool,
         skip_volume_backup: bool,
         strict_deploy_drift: bool,
+        strict_env_contract: bool,
+        expected_ssh_fingerprint: Optional[str],
         smoke_timeout: int,
         json: bool,
     ):
@@ -1469,7 +859,9 @@ def register_commands(cli) -> None:
                     no_disk_check=no_disk_check,
                     skip_volume_backup=skip_volume_backup,
                     strict_deploy_drift=strict_deploy_drift,
+                    strict_env_contract=strict_env_contract,
                     smoke_timeout=smoke_timeout,
+                    expected_ssh_fingerprint=expected_ssh_fingerprint,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
@@ -1679,6 +1071,117 @@ def register_commands(cli) -> None:
                 )
             else:
                 error_exit(f"Put error: {exc}")
+
+    @droplet.command("logs")
+    @click.argument("branch_name", required=False)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment (e.g., beta.example.com)")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @click.option("--service", "-s", multiple=True, help="Service name(s) to show logs for (default: all services)")
+    @click.option("--tail", "-n", "lines", type=int, default=100, show_default=True, help="Number of lines to show")
+    @click.option("--follow", "-f", is_flag=True, default=False, help="Follow log output (stream)")
+    @add_json_option
+    @add_verbose_option
+    def droplet_logs(
+        branch_name: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+        service: tuple,
+        lines: int,
+        follow: bool,
+        json: bool,
+    ):
+        """Tail Docker Compose logs from a remote droplet.
+
+        \b
+        Examples:
+          ilha droplet logs staging
+          ilha droplet logs --domain app.example.com
+          ilha droplet logs staging -s web -s db -f
+          ilha droplet logs staging -n 200
+        """
+        import shlex
+
+        if domain and ip:
+            if json:
+                JSONOutput.print_error("--domain and --ip are mutually exclusive")
+            else:
+                error_exit("--domain and --ip are mutually exclusive")
+            return
+
+        branch_name = _auto_detect_branch_name(branch_name, json)
+        if not branch_name:
+            return
+
+        check_prerequisites_no_git()
+
+        try:
+            scp_target, domain, ip, _, _ = _resolve_existing_remote_target(
+                branch_name=branch_name,
+                scp_target=scp_target,
+                domain=domain,
+                ip=ip,
+                api_token=api_token,
+                json=json,
+            )
+        except ValueError as exc:
+            if json:
+                JSONOutput.print_error(str(exc))
+            else:
+                error_exit(str(exc))
+            return
+        except Exception as exc:
+            if json:
+                JSONOutput.print_error(f"Error resolving target: {exc}")
+            else:
+                error_exit(f"Error resolving target: {exc}")
+            return
+
+        # Parse scp_target → username, server
+        if "@" not in scp_target:
+            if json:
+                JSONOutput.print_error(f"Cannot parse SCP target: {scp_target}")
+            else:
+                error_exit(f"Cannot parse SCP target: {scp_target}")
+            return
+        user_host, _, _ = scp_target.partition(":")
+        username, _, server = user_host.partition("@")
+
+        from ilha.utils.ssh_manager import SSHManager
+        ssh = SSHManager()
+        remote_app_root = "/root/app"
+
+        # Build docker compose logs command
+        svc_args = " ".join(shlex.quote(s) for s in service) if service else ""
+        tail_arg = f"--tail {max(1, lines)}"
+        follow_arg = "-f" if follow else ""
+        cmd = f"cd {shlex.quote(remote_app_root)} && docker compose --env-file .env logs {tail_arg} {follow_arg} {svc_args} 2>&1"
+
+        if follow:
+            # Stream mode: pipe directly to terminal
+            ssh_cmd = ssh.build_ssh_command(username, server, cmd)
+            try:
+                proc = subprocess.Popen(ssh_cmd, stdout=sys.stdout, stderr=sys.stderr)
+                proc.wait()
+            except KeyboardInterrupt:
+                proc.terminate()
+                proc.wait()
+        else:
+            try:
+                result = ssh.execute_remote(username, server, cmd, timeout=60, check=False)
+                output = (result.stdout or "") + (result.stderr or "")
+                if json:
+                    JSONOutput.print_json({"logs": output})
+                else:
+                    print_plain(output.rstrip())
+            except Exception as exc:
+                if json:
+                    JSONOutput.print_error(f"Error fetching logs: {exc}")
+                else:
+                    error_exit(f"Error fetching logs: {exc}")
 
     @droplet.command("doctor")
     @click.argument("branch_name", required=False)

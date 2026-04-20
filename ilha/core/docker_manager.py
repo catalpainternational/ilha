@@ -441,13 +441,52 @@ class DockerManager:
                         log_error(f"Error details: {e.stderr}")
                     return False
 
+            failed_volumes: list[str] = []
             with ThreadPoolExecutor(max_workers=min(4, len(volume_names))) as executor:
                 futures = {
                     executor.submit(_backup_one_volume, vtype, vname): vname
                     for vtype, vname in volume_names.items()
                 }
                 for future in as_completed(futures):
-                    future.result()  # propagate exceptions
+                    vname = futures[future]
+                    try:
+                        ok = future.result()
+                    except Exception as exc:  # noqa: BLE001 — any failure means the backup is incomplete
+                        log_error(f"Volume backup raised for {vname}: {exc}")
+                        ok = False
+                    if not ok:
+                        failed_volumes.append(vname)
+
+            # Do not emit a partial archive — if any per-volume tar is missing or
+            # failed to produce, abort the whole backup so callers don't mistake
+            # a truncated archive for a successful one (silent data loss on restore).
+            if failed_volumes:
+                log_error(
+                    "Aborting backup: one or more volumes failed "
+                    f"({', '.join(failed_volumes)}). No archive will be produced."
+                )
+                if temp_backup_dir.exists():
+                    shutil.rmtree(temp_backup_dir)
+                if was_running:
+                    log_info("Attempting to restart containers after backup failure...")
+                    try:
+                        from ..core.worktree_orchestrator import WorktreeOrchestrator
+                        orchestrator = WorktreeOrchestrator(project_root=self.project_root)
+                        orchestrator.start_worktree(branch_name)
+                    except Exception as restart_error:
+                        log_error(f"Failed to restart containers: {restart_error}")
+                return None
+
+            # Sanity check: every expected .tar file exists before we combine.
+            missing = [
+                vname for vname in volume_names.values()
+                if not (temp_backup_dir / f"{vname}.tar").exists()
+            ]
+            if missing:
+                log_error(f"Aborting backup: expected per-volume tar files missing: {missing}")
+                if temp_backup_dir.exists():
+                    shutil.rmtree(temp_backup_dir)
+                return None
 
             # Single compression pass on the combined archive
             subprocess.run([
@@ -1333,9 +1372,9 @@ class DockerManager:
         # Find project root from worktree path (search upward for .ilha/config.yml)
         # This ensures we get the correct project name even when command is run from wrong directory
         project_root_from_worktree = worktree_path
-        from ..config.settings import ilha_DIR
+        from ..config.settings import ILHA_DIR
         while project_root_from_worktree != project_root_from_worktree.parent:
-            config_path = project_root_from_worktree / ilha_DIR / "config.yml"
+            config_path = project_root_from_worktree / ILHA_DIR / "config.yml"
             if config_path.exists():
                 break
             project_root_from_worktree = project_root_from_worktree.parent
@@ -1343,7 +1382,7 @@ class DockerManager:
         # Get project name from the project root we found
         import yaml
         project_name = None
-        config_path = project_root_from_worktree / ilha_DIR / "config.yml"
+        config_path = project_root_from_worktree / ILHA_DIR / "config.yml"
         if config_path.exists():
             try:
                 with open(config_path) as f:

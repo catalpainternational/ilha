@@ -20,7 +20,7 @@ class TestDiskRecoveryConfirmation:
 
         monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
         # Without force=True, input() raises OSError in test
-        result = mgr.disk._attempt_remote_disk_recovery("root", "1.2.3.4", "safe")
+        result = mgr.disk.attempt_remote_disk_recovery("root", "1.2.3.4", "safe")
         assert result is False  # Skipped
 
     def test_force_bypasses_confirmation(self, tmp_path, monkeypatch):
@@ -31,7 +31,7 @@ class TestDiskRecoveryConfirmation:
             return 0, "", ""
 
         monkeypatch.setattr(mgr.disk, "_run_remote_text", fake_remote)
-        result = mgr.disk._attempt_remote_disk_recovery("root", "1.2.3.4", "safe", force=True)
+        result = mgr.disk.attempt_remote_disk_recovery("root", "1.2.3.4", "safe", force=True)
         assert result is True
 
 
@@ -110,15 +110,7 @@ class TestSmokeTimeoutThreading:
         assert sig.parameters["smoke_timeout"].default == 60
 
 
-class TestServerPrepTimeout:
-    """S3: server preparation has a timeout."""
-
-    def test_server_preparer_has_timeout(self):
-        """ServerPreparer should pass a timeout to execute_with_streaming."""
-        from ilha.commands.push.server_preparer import ServerPreparer
-        import inspect
-        source = inspect.getsource(ServerPreparer.prepare_server)
-        # Should NOT contain timeout=None
-        assert "timeout=None" not in source
-        # Should contain a numeric timeout
-        assert "timeout=600" in source
+# S3 (ServerPreparer timeout) is no longer enforced here: the legacy push
+# path's ServerPreparer was removed along with PushManager. Slim deploy runs
+# its own prep script (server_prep.sh) via _prepare_server_slim and is covered
+# by the deploy safety regression tests.

@@ -44,14 +44,13 @@ from ...utils.logging import (
     render_deploy_report,
 )
 from ...utils.ssh_manager import SSHConnectionManager, SCPTarget
-from ...utils.ssh_utils import add_ssh_host_key
 from ...utils.streaming import execute_with_streaming
 from ...utils.validation import validate_branch_name
 from .deploy_doctor import DeployDoctor
 from .deploy_preflight import DeployPreflight
+from .deploy_service_config import DeployServiceConfig, load_deploy_service_config
 from .remote_compose_probe import remote_compose_service_known, remote_compose_service_logs_tail
 from .remote_disk import RemoteDiskManager
-from .server_preparer import ServerPreparer
 from .transfer_manager import TransferManager
 
 
@@ -72,6 +71,16 @@ class SlimDeployManager:
         "restore": 600,
         "caddy": 300,
     }
+
+    # Remote ZD start-app script (nohup poll). Without an embedded `compose build web`,
+    # phases are compose up, canary health, swap, recreate web — normally a few minutes.
+    _APP_START_MAX_WAIT_SEC = 600
+    # When deploy passes build=True, the script also runs `docker compose build web` on the server.
+    _APP_START_MAX_WAIT_EMBEDDED_BUILD_SEC = 1200
+
+    # Upper bound on rsync wall-clock time. Prevents a stalled SSH connection
+    # from hanging the deploy indefinitely (Popen.wait has no built-in timeout).
+    _RSYNC_MAX_WAIT_SEC = 1800
 
     # Exclude heavy/non-runtime paths from deploy context by default
     _DEFAULT_DEPLOY_IGNORE = [
@@ -118,6 +127,7 @@ class SlimDeployManager:
         self.disk = RemoteDiskManager(self.ssh, self.REMOTE_APP_ROOT)
         self.doctor_mgr = DeployDoctor(self.ssh, self.REMOTE_APP_ROOT)
         self.preflight = DeployPreflight(self.project_root)
+        self.services = load_deploy_service_config(self.project_root)
         self._session_id = uuid.uuid4().hex[:8]
         self._tracker: Optional[StageTracker] = None
         self._last_report: Dict[str, Any] = {
@@ -284,15 +294,17 @@ class SlimDeployManager:
         self,
         branch_name: str,
         strict_deploy_drift: bool = False,
+        strict_env_contract: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Delegate to DeployPreflight and wire results into the deploy report."""
-        result = self.preflight._run_deploy_preflight(
+        result = self.preflight.run_deploy_preflight(
             branch_name,
             strict_deploy_drift=strict_deploy_drift,
+            strict_env_contract=strict_env_contract,
         )
         if result is None:
             # Determine failure reason and populate report even on failure
-            worktree_path = self.preflight._resolve_worktree_path(branch_name)
+            worktree_path = self.preflight.resolve_worktree_path(branch_name)
             if not worktree_path.exists():
                 self._set_failure(
                     error_code="worktree_not_found",
@@ -303,25 +315,43 @@ class SlimDeployManager:
                 )
             else:
                 # Gather manifest/drift for the report even though we're failing
-                comparison_root = self.preflight._resolve_comparison_root(worktree_path)
-                manifest = self.preflight._gather_source_manifest(branch_name, worktree_path, comparison_root)
-                drift_report = self.preflight._build_drift_report(
+                comparison_root = self.preflight.resolve_comparison_root(worktree_path)
+                manifest = self.preflight.gather_source_manifest(branch_name, worktree_path, comparison_root)
+                drift_report = self.preflight.build_drift_report(
                     worktree_path, comparison_root, strict_deploy_drift=strict_deploy_drift,
                 )
+                env_contract_warnings = self.preflight.detect_env_contract_issues(worktree_path)
                 self._last_report["source_manifest"] = manifest
                 self._last_report["drift_report"] = drift_report
-                self._set_failure(
-                    error_code="critical_file_drift",
-                    stage="preflight",
-                    root_cause=(
-                        "Critical deploy files differ between root and worktree. "
-                        "Deploy the worktree copy or sync the changes first."
-                    ),
-                    suggested_actions=[
-                        "Deploy the worktree copy or sync the changes first.",
-                    ],
-                    failure_category="validation_error",
-                )
+                if strict_env_contract and env_contract_warnings:
+                    self._set_failure(
+                        error_code="env_contract_violation",
+                        stage="preflight",
+                        root_cause=(
+                            "Env-contract issues detected (e.g. SITE_DOMAIN with "
+                            "http(s):// prefix). Mis-formed values break "
+                            "CSRF_TRUSTED_ORIGINS on the server."
+                        ),
+                        suggested_actions=[
+                            "Fix the offending values in .env or .ilha/env.ilha "
+                            "(bare host, not a URL).",
+                            "Or re-run with --no-strict-env-contract to bypass.",
+                        ],
+                        failure_category="validation_error",
+                    )
+                else:
+                    self._set_failure(
+                        error_code="critical_file_drift",
+                        stage="preflight",
+                        root_cause=(
+                            "Critical deploy files differ between root and worktree. "
+                            "Deploy the worktree copy or sync the changes first."
+                        ),
+                        suggested_actions=[
+                            "Deploy the worktree copy or sync the changes first.",
+                        ],
+                        failure_category="validation_error",
+                    )
             return None
 
         self._last_report["source_manifest"] = result["manifest"]
@@ -341,8 +371,8 @@ class SlimDeployManager:
         started_at = time.time()
         delays = [0, 1, 2, 4, 8, 15]
         checks: List[Dict[str, Any]] = []
-        via_web = self._remote_service_exists(username, server, "web")
-        local_url = f"http://127.0.0.1:8000{self._normalized_smoke_path(smoke_path)}"
+        via_web = self._remote_service_exists(username, server, self.services.web_service)
+        local_url = f"http://127.0.0.1:{self.services.web_port}{self._normalized_smoke_path(smoke_path)}"
         probe_target = "web_container" if via_web else "host_local"
         external_url = f"https://{domain}/" if domain else None
 
@@ -410,7 +440,7 @@ class SlimDeployManager:
                 username=username,
                 server=server,
                 remote_app_root=self.REMOTE_APP_ROOT,
-                service_name="web",
+                service_name=self.services.web_service,
                 lines=100,
                 timeout=45,
             )
@@ -446,20 +476,21 @@ class SlimDeployManager:
         via_compose_web: bool,
         quiet: bool = True,
     ) -> str:
-        """Shell command to verify the app responds on port 8000.
+        """Shell command to verify the app responds on the configured web port.
 
-        Caddy-only setups often do not publish 8000 on the host; the listener
-        lives inside the ``web`` container. When ``via_compose_web`` is true,
-        run curl inside that service via ``docker compose exec``.
+        Caddy-only setups often do not publish the app port on the host; the
+        listener lives inside the web container. When ``via_compose_web`` is
+        true, run curl inside that service via ``docker compose exec``.
         """
         norm = self._normalized_smoke_path(smoke_path)
-        url = f"http://127.0.0.1:8000{norm}"
+        url = f"http://127.0.0.1:{self.services.web_port}{norm}"
         tail = " >/dev/null" if quiet else " 2>&1"
         inner_curl = f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
         if via_compose_web:
             root = shlex.quote(self.REMOTE_APP_ROOT)
+            service = shlex.quote(self.services.web_service)
             return (
-                f"cd {root} && docker compose --env-file .env exec -T web sh -c {shlex.quote(inner_curl)}"
+                f"cd {root} && docker compose --env-file .env exec -T {service} sh -c {shlex.quote(inner_curl)}"
             )
         return f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
 
@@ -531,12 +562,15 @@ class SlimDeployManager:
         no_disk_check: bool = False,
         skip_volume_backup: bool = False,
         strict_deploy_drift: bool = False,
+        strict_env_contract: bool = True,
         smoke_timeout: int = 60,
+        expected_ssh_fingerprint: Optional[str] = None,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
         Returns True on success, False on failure.
         """
+        self.ssh.set_expected_fingerprint(expected_ssh_fingerprint)
         self._reset_report()
         try:
             target = SCPTarget(scp_target)
@@ -556,6 +590,7 @@ class SlimDeployManager:
         preflight = self._run_deploy_preflight(
             branch_name,
             strict_deploy_drift=strict_deploy_drift,
+            strict_env_contract=strict_env_contract,
         )
         if preflight is None:
             render_deploy_report(self._last_report)
@@ -606,8 +641,8 @@ class SlimDeployManager:
                 ):
                     break
                 self._last_report["recovery_attempted"] = True
-                self.disk._log_remote_disk_diagnostics(username, server)
-                recovered = self.disk._attempt_remote_disk_recovery(username, server, disk_recovery)
+                self.disk.log_remote_disk_diagnostics(username, server)
+                recovered = self.disk.attempt_remote_disk_recovery(username, server, disk_recovery)
                 self._last_report["recovery_succeeded"] = recovered
                 if not recovered:
                     break
@@ -703,7 +738,7 @@ class SlimDeployManager:
             if not no_disk_check:
                 log_step("Checking remote disk space")
                 stage_started = time.time()
-                disk_ok, disk_report = self.disk._check_remote_disk_capacity(
+                disk_ok, disk_report = self.disk.check_remote_disk_capacity(
                     username=username,
                     server=server,
                     deploy_size_bytes=deploy_size,
@@ -721,8 +756,8 @@ class SlimDeployManager:
                         ],
                         failure_category="disk_full",
                     )
-                    self.disk._log_remote_disk_diagnostics(username, server)
-                    self.disk._print_disk_recovery_guidance(username, server)
+                    self.disk.log_remote_disk_diagnostics(username, server)
+                    self.disk.print_disk_recovery_guidance(username, server)
                     return False
 
             stage_started = time.time()
@@ -736,7 +771,7 @@ class SlimDeployManager:
 
             log_step("Syncing code to server")
             stage_started = time.time()
-            add_ssh_host_key(server)
+            self.ssh.ensure_host_key(server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 self._set_failure(
                     error_code="rsync_failed",
@@ -944,7 +979,7 @@ class SlimDeployManager:
                         _cleanup_deploy_dir(deploy_dir)
                         return True
                     log_step("Syncing volumes to server")
-                    add_ssh_host_key(server)
+                    self.ssh.ensure_host_key(server)
                     if not self._rsync_volumes_to_server(deploy_dir, username, server):
                         _cleanup_deploy_dir(deploy_dir)
                         return False
@@ -988,7 +1023,7 @@ class SlimDeployManager:
                 render_deploy_report(self._last_report)
                 return False
             log_step("Syncing code to server")
-            add_ssh_host_key(server)
+            self.ssh.ensure_host_key(server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 _cleanup_deploy_dir(deploy_dir)
                 render_deploy_report(self._last_report)
@@ -1058,7 +1093,7 @@ class SlimDeployManager:
             log_step("Backing up volumes")
             volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
             log_step("Syncing to server")
-            add_ssh_host_key(server)
+            self.ssh.ensure_host_key(server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 _cleanup_deploy_dir(deploy_dir)
                 render_deploy_report(self._last_report)
@@ -1159,7 +1194,7 @@ class SlimDeployManager:
 
         try:
             # Locate worktree using config (respects fractal worktree_dir setting)
-            worktree_path = self.preflight._resolve_worktree_path(branch_name)
+            worktree_path = self.preflight.resolve_worktree_path(branch_name)
             if worktree_path == self.project_root.resolve():
                 log_info("Using current worktree as deploy source")
             if not worktree_path.exists():
@@ -1253,12 +1288,49 @@ class SlimDeployManager:
                 web_config = services.get("web")
                 if web_config is not None and "restart" not in web_config:
                     web_config["restart"] = "unless-stopped"
+
+            # Strip elevated container privileges from services that don't need them.
+            # Only services matching _PRIVILEGED_SERVICE_PATTERNS (Playwright/browser
+            # services) keep SYS_ADMIN, seccomp:unconfined, ipc:host, etc.
+            self._strip_unnecessary_privileges(data)
+
             compose_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
             log_info(f"Applied {'domain' if normalized_domain else 'IP'} override to compose labels")
         except ImportError:
             log_warning("PyYAML not available — skipping compose label override")
         except Exception as exc:
             log_warning(f"Could not update compose labels: {exc}")
+
+    # Services matching these patterns keep elevated privileges (Playwright/Chromium).
+    _PRIVILEGED_SERVICE_PATTERNS = ("web", "rq-worker")
+
+    # Keys removed from non-privileged services during deploy assembly.
+    _PRIVILEGE_KEYS = ("security_opt", "cap_add", "ipc", "shm_size")
+
+    def _strip_unnecessary_privileges(self, compose_data: dict) -> None:
+        """Remove elevated Docker privileges from services that don't need them.
+
+        Services whose name starts with one of ``_PRIVILEGED_SERVICE_PATTERNS``
+        (e.g. ``web``, ``rq-worker-1``) keep their privileges because they run
+        Playwright/Chromium.  All other services (``db``, ``redis``, ``caddy``,
+        etc.) have ``security_opt``, ``cap_add``, ``ipc``, and ``shm_size``
+        stripped for defense in depth.
+        """
+        services = compose_data.get("services")
+        if not services:
+            return
+        for svc_name, svc_config in services.items():
+            if not isinstance(svc_config, dict):
+                continue
+            if any(svc_name.startswith(prefix) for prefix in self._PRIVILEGED_SERVICE_PATTERNS):
+                continue
+            removed = []
+            for key in self._PRIVILEGE_KEYS:
+                if key in svc_config:
+                    del svc_config[key]
+                    removed.append(key)
+            if removed:
+                log_info(f"Stripped privileges from service '{svc_name}': {', '.join(removed)}")
 
     # ──────────────────────────────────────────────────────────────────
     # Internal: merged .env
@@ -1490,6 +1562,11 @@ if [ ! -f "$BACKUP_TAR" ]; then
     exit 0
 fi
 echo "Restoring volumes from $BACKUP_TAR..."
+
+# Stop application containers before restoring volumes to prevent data corruption.
+# Running containers (e.g. Postgres) crash if their data volume is overwritten underneath them.
+cd {self.REMOTE_APP_ROOT}/code 2>/dev/null && docker compose --env-file ../.env down 2>/dev/null || true
+
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 tar xzf "$BACKUP_TAR" -C "$TMPDIR"
@@ -1532,9 +1609,9 @@ echo "Volume restore complete"
     def _prepare_server_slim(self, username: str, server: str) -> bool:
         """Run the slim server preparation script (Docker-only)."""
         log_info("Running slim server preparation (Docker + firewall only)...")
-        add_ssh_host_key(server)
+        self.ssh.ensure_host_key(server)
 
-        script_path = get_script_dir() / "scripts" / "server_prep_slim.sh"
+        script_path = get_script_dir() / "scripts" / "server_prep.sh"
         if not script_path.exists():
             log_error(f"Slim prep script not found: {script_path}")
             return False
@@ -1617,13 +1694,43 @@ echo "Volume restore complete"
             errors="replace",
             bufsize=1,
         )
-        out_lines = []
-        for line in iter(process.stdout.readline, ""):
-            line = line.rstrip()
-            out_lines.append(line)
-            if "%" in line or "speedup" in line.lower():
-                log_info(f"  {line}")
-        process.wait()
+        out_lines: List[str] = []
+        deadline = time.time() + self._RSYNC_MAX_WAIT_SEC
+        timed_out = False
+        try:
+            for line in iter(process.stdout.readline, ""):
+                if time.time() > deadline:
+                    timed_out = True
+                    break
+                line = line.rstrip()
+                out_lines.append(line)
+                if "%" in line or "speedup" in line.lower():
+                    log_info(f"  {line}")
+        finally:
+            if timed_out or time.time() > deadline:
+                timed_out = True
+                process.kill()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                try:
+                    process.wait(timeout=max(1, deadline - time.time()))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    process.kill()
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+
+        if timed_out:
+            log_error(f"rsync exceeded {self._RSYNC_MAX_WAIT_SEC}s deadline — killed")
+            for line in out_lines[-20:]:
+                if line.strip():
+                    log_error(f"  {line}")
+            return False
 
         if process.returncode != 0:
             log_error(f"rsync failed (exit {process.returncode})")
@@ -1847,8 +1954,8 @@ echo "Caddy proxy started"
                         ],
                         failure_category="disk_full",
                     )
-                    self.disk._log_remote_disk_diagnostics(username, server)
-                    self.disk._print_disk_recovery_guidance(username, server)
+                    self.disk.log_remote_disk_diagnostics(username, server)
+                    self.disk.print_disk_recovery_guidance(username, server)
                     kill_cmd = self.ssh.build_ssh_command(username, server, f"kill -9 {pid} >/dev/null 2>&1 || true")
                     subprocess.run(kill_cmd, capture_output=True, timeout=10)
                     return False
@@ -1884,8 +1991,8 @@ echo "Caddy proxy started"
                         ],
                         failure_category="disk_full",
                     )
-                    self.disk._log_remote_disk_diagnostics(username, server)
-                    self.disk._print_disk_recovery_guidance(username, server)
+                    self.disk.log_remote_disk_diagnostics(username, server)
+                    self.disk.print_disk_recovery_guidance(username, server)
                 self._log_tail_and_return_false(username, server, log_file, label)
                 return False
             if elapsed % 60 == 0:
@@ -1924,34 +2031,91 @@ echo "Build complete"
             debug=debug,
         )
 
+    def _build_zd_deploy_script(
+        self,
+        *,
+        app_root: str,
+        web_service: str,
+        web_port: int,
+        health_path: str,
+        db_service: str,
+        deps_args: str,
+        worker_args: str,
+        build_web: bool,
+    ) -> str:
+        """Load the versioned zero-downtime script and prepend env exports.
+
+        The script body lives in ``ilha/scripts/zd_deploy.sh`` so it can be
+        shellcheck-ed, diffed, and covered by focused tests. The Python side
+        only decides which values get exported — no f-string surgery on bash.
+        """
+        from ...config.settings import get_script_dir
+
+        script_path = get_script_dir() / "scripts" / "zd_deploy.sh"
+        body = script_path.read_text()
+        # Strip the shebang from the loaded body; we rebuild the header with
+        # the exports so the shebang stays first.
+        if body.startswith("#!/"):
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+        header = "\n".join([
+            "#!/bin/bash",
+            f"export APP_ROOT={shlex.quote(app_root)}",
+            f"export WEB_SERVICE={shlex.quote(web_service)}",
+            f"export WEB_PORT={shlex.quote(str(web_port))}",
+            f"export HEALTH_PATH={shlex.quote(health_path)}",
+            f"export DB_SERVICE={shlex.quote(db_service)}",
+            # DEPS_SERVICES and WORKER_SERVICES are pre-quoted space-separated
+            # lists that the remote script intentionally word-splits.
+            f"export DEPS_SERVICES={shlex.quote(deps_args)}",
+            f"export WORKER_SERVICES={shlex.quote(worker_args)}",
+            f"export BUILD_WEB={'1' if build_web else '0'}",
+            "",
+        ])
+        return header + body
+
     def _start_app_remote(self, username: str, server: str, build: bool = False, debug: bool = False) -> bool:
         """Start application services on the server via nohup + poll.
 
-        Script is uploaded then launched (two-step pattern). When build=True, uses
-        docker compose up -d --build; otherwise up -d only.
+        Zero-downtime strategy:
+        1. Build new image while old container keeps serving traffic (slow part, no disruption)
+        2. Start a canary container from the new image and health-check it
+        3. If canary fails: abort, old container still serves (rollback)
+        4. Pause caddy_monitor to prevent drift correction during swap
+        5. Swap Caddy upstream to canary via admin API (canary now serves traffic)
+        6. Replace old web with new compose-managed container
+        7. Swap Caddy upstream to new compose web, cleanup canary, resume monitor
         """
         log_info("Starting application services on server...")
         self.ssh.ensure_host_key(server)
         app_root = self.REMOTE_APP_ROOT
-        up_build = "docker compose --env-file .env up -d --build 2>&1" if build else "docker compose --env-file .env up -d 2>&1"
-        script = f"""#!/bin/bash
-set -euo pipefail
-cd {app_root}
-
-docker compose --env-file .env down --remove-orphans 2>&1 || true
-{up_build}
-# Retry getting web container and connecting to Caddy network (container may not be listed immediately)
-for i in 1 2 3; do
-  WEB_CID=$(docker compose --env-file .env ps -q web 2>/dev/null | head -1)
-  if [ -n "$WEB_CID" ]; then
-    docker network connect ilha_caddy_proxy "$WEB_CID" 2>/dev/null || true
-    break
-  fi
-  [ $i -lt 3 ] && sleep 5
-done
-echo "Application services started"
-docker compose --env-file .env ps 2>&1
-"""
+        start_max_wait = (
+            self._APP_START_MAX_WAIT_EMBEDDED_BUILD_SEC
+            if build
+            else self._APP_START_MAX_WAIT_SEC
+        )
+        log_info(
+            f"App start watchdog: {start_max_wait}s "
+            f"({'includes embedded compose build web' if build else 'no embedded image build'})"
+        )
+        web_service = self.services.web_service
+        web_port = self.services.web_port
+        health_path = self.services.health_path
+        db_service = self.services.db_service
+        deps_args = " ".join(shlex.quote(s) for s in self.services.dependency_services)
+        # Empty worker_services ⇒ the script's Phase 10 branch logs "skipping"
+        # instead of running a no-arg `docker compose up` that would recreate
+        # every service in the project.
+        worker_args = " ".join(shlex.quote(s) for s in self.services.worker_services)
+        script = self._build_zd_deploy_script(
+            app_root=app_root,
+            web_service=web_service,
+            web_port=web_port,
+            health_path=health_path,
+            db_service=db_service,
+            deps_args=deps_args,
+            worker_args=worker_args,
+            build_web=build,
+        )
         log_file = self._remote_tmp("start-app.log")
         ok = self._run_nohup_remote(
             username, server, script,
@@ -1959,7 +2123,7 @@ docker compose --env-file .env ps 2>&1
             log_file=log_file,
             label="App start",
             success_markers=["EXIT_CODE=0"],
-            max_wait=1800,
+            max_wait=start_max_wait,
             debug=debug,
         )
         if not ok:
@@ -1967,12 +2131,12 @@ docker compose --env-file .env ps 2>&1
         # Verify web service container exists and is running
         web_cid_cmd = self.ssh.build_ssh_command(
             username, server,
-            f"cd {app_root} && docker compose --env-file .env ps -q web 2>/dev/null | head -1",
+            f"cd {app_root} && docker compose --env-file .env ps -q {shlex.quote(web_service)} 2>/dev/null | head -1",
         )
         web_cid_result = subprocess.run(web_cid_cmd, capture_output=True, text=True, timeout=10)
         web_cid = (web_cid_result.stdout or "").strip()
         if not web_cid:
-            log_error("Web service container not found after start")
+            log_error(f"{web_service} service container not found after start")
             self._log_tail_and_return_false(username, server, log_file, "App start")
             return False
         running_cmd = self.ssh.build_ssh_command(
@@ -1981,7 +2145,7 @@ docker compose --env-file .env ps 2>&1
         )
         running_result = subprocess.run(running_cmd, capture_output=True, text=True, timeout=10)
         if (running_result.stdout or "").strip().lower() != "true":
-            log_error("Web container is not running after start")
+            log_error(f"{web_service} container is not running after start")
             logs_cmd = self.ssh.build_ssh_command(
                 username, server,
                 f"docker logs --tail 20 {shlex.quote(web_cid)} 2>&1",

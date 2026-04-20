@@ -5,6 +5,7 @@ Extracted from SlimDeployManager to keep deploy orchestration and pre-deploy
 validation in separate modules.
 """
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -31,12 +32,24 @@ class DeployPreflight:
         ("uv.lock", "error"),
     ]
 
+    # Environment variables and their known-insecure default values.
+    # Deploy is blocked if any of these match, unless ILHA_ALLOW_INSECURE_DEFAULTS=1.
+    # Values are exact matches; prefixes are checked separately below.
+    _INSECURE_DEFAULTS: Dict[str, List[str]] = {
+        "DJANGO_SECRET_KEY": ["django-insecure-secret-key", ""],
+        "POSTGRES_PASSWORD": ["bipassword", ""],
+    }
+    # Values starting with these prefixes are also considered insecure.
+    _INSECURE_PREFIXES: Dict[str, List[str]] = {
+        "DJANGO_SECRET_KEY": ["django-insecure-"],
+    }
+
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root).resolve()
 
     # ── path resolution ──────────────────────────────────────────────
 
-    def _resolve_worktree_path(self, branch_name: str) -> Path:
+    def resolve_worktree_path(self, branch_name: str) -> Path:
         worktree_dir = get_worktree_dir()
         candidate = self.project_root / worktree_dir / branch_name
         if candidate.exists():
@@ -46,7 +59,7 @@ class DeployPreflight:
             return self.project_root.resolve()
         return candidate.resolve()
 
-    def _resolve_comparison_root(self, worktree_path: Path) -> Path:
+    def resolve_comparison_root(self, worktree_path: Path) -> Path:
         if worktree_path != self.project_root.resolve():
             return self.project_root.resolve()
 
@@ -130,8 +143,8 @@ class DeployPreflight:
                     labels = dict(label_items)
                 if isinstance(labels, dict) and labels.get("caddy.proxy.health_check"):
                     return str(labels["caddy.proxy.health_check"]).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_warning(f"Could not parse {worktree_compose} for smoke path: {exc}")
 
         for candidate in (
             comparison_root / "README.md",
@@ -141,11 +154,12 @@ class DeployPreflight:
                 try:
                     if "/api/health/" in candidate.read_text():
                         return "/api/health/"
-                except Exception:
+                except Exception as exc:
+                    log_warning(f"Could not read {candidate} for smoke path hint: {exc}")
                     continue
         return "/"
 
-    def _detect_env_contract_issues(self, worktree_path: Path) -> List[Dict[str, Any]]:
+    def detect_env_contract_issues(self, worktree_path: Path) -> List[Dict[str, Any]]:
         warnings: List[Dict[str, Any]] = []
         env_candidates = [
             worktree_path / ".env",
@@ -157,7 +171,8 @@ class DeployPreflight:
                 continue
             try:
                 env_values = load_env_file(env_path)
-            except Exception:
+            except Exception as exc:
+                log_warning(f"Could not parse env file {env_path} for contract check: {exc}")
                 continue
 
             site_domain = (env_values.get("SITE_DOMAIN") or "").strip()
@@ -178,9 +193,75 @@ class DeployPreflight:
 
         return warnings
 
+    # ── insecure defaults ────────────────────────────────────────────
+
+    def _check_insecure_defaults(self, worktree_path: Path) -> List[Dict[str, Any]]:
+        """Check merged environment for known-insecure default values.
+
+        Returns a list of issues (empty = all clear).  Each issue is a dict
+        with keys: variable, value, file, message.
+        """
+        issues: List[Dict[str, Any]] = []
+        env_candidates = [
+            worktree_path / ".env",
+            worktree_path / ".ilha" / "env.ilha",
+        ]
+        merged: Dict[str, str] = {}
+        source_file: Dict[str, str] = {}
+        for env_path in env_candidates:
+            if not env_path.exists():
+                continue
+            try:
+                env_values = load_env_file(env_path)
+            except Exception:
+                continue
+            for k, v in env_values.items():
+                merged[k] = v
+                source_file[k] = str(env_path)
+
+        for var_name, bad_values in self._INSECURE_DEFAULTS.items():
+            value = merged.get(var_name)
+            if value is None:
+                # Variable not set at all — likely relying on compose-level default
+                issues.append({
+                    "variable": var_name,
+                    "value": "(unset)",
+                    "file": "N/A",
+                    "message": (
+                        f"{var_name} is not set in any env file. "
+                        f"It will fall back to the insecure compose default. "
+                        f"Set it explicitly before deploying."
+                    ),
+                })
+            elif value in bad_values:
+                issues.append({
+                    "variable": var_name,
+                    "value": value or "(empty)",
+                    "file": source_file.get(var_name, "unknown"),
+                    "message": (
+                        f"{var_name} is set to a known-insecure default ({value!r}). "
+                        f"Set a strong, unique value before deploying."
+                    ),
+                })
+            else:
+                # Check insecure prefixes (e.g. django-insecure-*)
+                for prefix in self._INSECURE_PREFIXES.get(var_name, []):
+                    if value.startswith(prefix):
+                        issues.append({
+                            "variable": var_name,
+                            "value": value[:40] + ("..." if len(value) > 40 else ""),
+                            "file": source_file.get(var_name, "unknown"),
+                            "message": (
+                                f"{var_name} starts with insecure prefix {prefix!r}. "
+                                f"Set a strong, unique value before deploying."
+                            ),
+                        })
+                        break
+        return issues
+
     # ── manifest & drift ─────────────────────────────────────────────
 
-    def _gather_source_manifest(
+    def gather_source_manifest(
         self,
         branch_name: str,
         worktree_path: Path,
@@ -204,7 +285,7 @@ class DeployPreflight:
             },
         }
 
-    def _build_drift_report(
+    def build_drift_report(
         self,
         worktree_path: Path,
         comparison_root: Path,
@@ -290,10 +371,11 @@ class DeployPreflight:
 
     # ── orchestrator ─────────────────────────────────────────────────
 
-    def _run_deploy_preflight(
+    def run_deploy_preflight(
         self,
         branch_name: str,
         strict_deploy_drift: bool = False,
+        strict_env_contract: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Run all preflight checks and return context dict, or None on failure.
 
@@ -303,21 +385,27 @@ class DeployPreflight:
         On failure, returns None and populates ``errors`` (a list of dicts with
         error_code / stage / root_cause / suggested_actions / failure_category).
         Callers are responsible for forwarding those into the deploy report.
+
+        When ``strict_env_contract`` is True, env-contract issues (e.g.
+        ``SITE_DOMAIN`` with an ``http://``/``https://`` prefix) block the
+        deploy rather than just warning. This catches the CSRF-breakage class
+        documented in STAGING_DROPLET_FIXES.md before a deploy can reach the
+        server.
         """
-        worktree_path = self._resolve_worktree_path(branch_name)
+        worktree_path = self.resolve_worktree_path(branch_name)
         if not worktree_path.exists():
             log_error(f"Worktree directory not found: {worktree_path}")
             return None
 
-        comparison_root = self._resolve_comparison_root(worktree_path)
-        manifest = self._gather_source_manifest(branch_name, worktree_path, comparison_root)
-        drift_report = self._build_drift_report(
+        comparison_root = self.resolve_comparison_root(worktree_path)
+        manifest = self.gather_source_manifest(branch_name, worktree_path, comparison_root)
+        drift_report = self.build_drift_report(
             worktree_path,
             comparison_root,
             strict_deploy_drift=strict_deploy_drift,
         )
         smoke_path = self._detect_smoke_path(worktree_path / ".ilha" / "docker-compose.worktree.yml", comparison_root)
-        env_contract_warnings = self._detect_env_contract_issues(worktree_path)
+        env_contract_warnings = self.detect_env_contract_issues(worktree_path)
 
         self._print_source_manifest(manifest, drift_report, smoke_path, env_contract_warnings)
 
@@ -332,10 +420,39 @@ class DeployPreflight:
                 log_error(message)
 
         for warning in env_contract_warnings:
-            log_warning(warning["message"])
+            if strict_env_contract:
+                log_error(warning["message"])
+            else:
+                log_warning(warning["message"])
 
         if drift_report.get("status") == "error":
             return None
+
+        if strict_env_contract and env_contract_warnings:
+            log_error(
+                "Deploy blocked: env-contract issues detected. Fix the values above "
+                "(e.g. set SITE_DOMAIN to a bare host, not a URL) or pass "
+                "--no-strict-env-contract to bypass. Mis-formed SITE_DOMAIN "
+                "breaks CSRF_TRUSTED_ORIGINS on the server."
+            )
+            return None
+
+        # ── Insecure default credential check ─────────────────────────
+        insecure_issues = self._check_insecure_defaults(worktree_path)
+        if insecure_issues:
+            allow = os.environ.get("ILHA_ALLOW_INSECURE_DEFAULTS", "").lower() in ("1", "true", "yes")
+            for issue in insecure_issues:
+                if allow:
+                    log_warning(f"[insecure-defaults] {issue['message']} (allowed via ILHA_ALLOW_INSECURE_DEFAULTS)")
+                else:
+                    log_error(f"[insecure-defaults] {issue['message']}")
+            if not allow:
+                log_error(
+                    "Deploy blocked: insecure default credentials detected. "
+                    "Set strong values in .env or .ilha/env.ilha, or set "
+                    "ILHA_ALLOW_INSECURE_DEFAULTS=1 to bypass (not recommended for production)."
+                )
+                return None
 
         return {
             "worktree_path": worktree_path,

@@ -24,6 +24,16 @@ class SSHConnectionManager:
         self._host_keys_added: set = set()
         self._control_paths: Dict[str, str] = {}
         self._temp_dir: Optional[Path] = None
+        self._expected_fingerprint: Optional[str] = None
+
+    def set_expected_fingerprint(self, fingerprint: Optional[str]) -> None:
+        """Pin the SHA256 host-key fingerprint used by ``ensure_host_key``.
+
+        When set, subsequent first-time host-key adds verify the scanned key
+        against this fingerprint and refuse to trust it on mismatch. Pass
+        ``None`` to clear.
+        """
+        self._expected_fingerprint = fingerprint
 
     def _get_temp_dir(self) -> Path:
         """Get or create temporary directory for SSH control sockets.
@@ -39,30 +49,43 @@ class SSHConnectionManager:
             self._temp_dir = temp_path
         return self._temp_dir
     
-    def _get_control_path(self, username: str, server: str) -> str:
-        """Get control path for SSH connection reuse."""
-        key = f"{username}@{server}"
+    def _get_control_path(self, username: str, server: str, port: int = 22) -> str:
+        """Get control path for SSH connection reuse.
+
+        The filename includes the port so simultaneous connections to the same
+        host on different ports (e.g. one droplet behind a jumphost on :2222)
+        don't collide on the same Unix socket.
+        """
+        key = f"{username}@{server}:{port}"
         if key not in self._control_paths:
             temp_dir = self._get_temp_dir()
-            # Use a safe filename based on server
-            safe_name = server.replace('.', '_').replace(':', '_')
+            safe_name = f"{server.replace('.', '_').replace(':', '_')}-{port}"
             control_path = temp_dir / f"control-{safe_name}"
             self._control_paths[key] = str(control_path)
         return self._control_paths[key]
     
-    def ensure_host_key(self, server: str, port: int = 22) -> bool:
+    def ensure_host_key(
+        self,
+        server: str,
+        port: int = 22,
+        expected_fingerprint: Optional[str] = None,
+    ) -> bool:
         """Ensure SSH host key is added (cached check).
-        
+
         Args:
             server: Server hostname or IP
             port: SSH port
-            
+            expected_fingerprint: Optional SHA256:… fingerprint to pin. When
+                supplied and the scanned key does not match, the connection is
+                rejected (MITM defense). When omitted, TOFU applies.
+
         Returns:
             True if host key is available, False otherwise
         """
+        fp = expected_fingerprint if expected_fingerprint is not None else self._expected_fingerprint
         key = f"{server}:{port}"
         if key not in self._host_keys_added:
-            if add_ssh_host_key(server, port):
+            if add_ssh_host_key(server, port, expected_fingerprint=fp):
                 self._host_keys_added.add(key)
                 return True
             return False
@@ -178,8 +201,20 @@ class SSHConnectionManager:
         # Ensure host key is added
         self.ensure_host_key(server)
         
-        # Build command to write script and execute
-        exec_cmd = f"cat > /tmp/{script_name} && chmod +x /tmp/{script_name} && /tmp/{script_name} && rm -f /tmp/{script_name}"
+        # Sanitize script_name: strip path separators and shell metacharacters
+        import re
+        safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', script_name)
+        if not safe_name:
+            safe_name = "script.sh"
+
+        # Build command to write script and execute. Always clean up the /tmp
+        # file regardless of script exit status — the `&&` chain previously
+        # skipped the `rm` when the script exited non-zero, which accumulated
+        # stale scripts under /tmp on every failed remote exec.
+        exec_cmd = (
+            f"cat > /tmp/{safe_name} && chmod +x /tmp/{safe_name}; "
+            f"/tmp/{safe_name}; rc=$?; rm -f /tmp/{safe_name}; exit $rc"
+        )
         
         # Build SSH command
         ssh_cmd = self.build_ssh_command(username, server, exec_cmd)
