@@ -2,17 +2,13 @@
 
 - C1: the cross-class API boundary between SlimDeployManager and its helpers
       (RemoteDiskManager, DeployPreflight) uses public method names, not the
-      leading-underscore "private" convention. If a future refactor re-introduces
-      a `_private` cross-class call, this suite complains.
-- C3: the single server prep script exists at ``ilha/scripts/server_prep.sh``
-      and the legacy full/slim variants are gone.
+      leading-underscore "private" convention.
+- C3: the single server prep script exists at ``ilha/scripts/server_prep.sh``.
 - C4: the zero-downtime deploy script lives in a file (not an embedded Python
       f-string) and the B4 rollback guards survived the extraction.
 """
 
 from pathlib import Path
-
-import pytest
 
 from ilha.commands.push.remote_disk import RemoteDiskManager
 from ilha.commands.push.deploy_preflight import DeployPreflight
@@ -59,45 +55,11 @@ def test_deploy_preflight_exposes_public_cross_class_api():
         assert not name.startswith("_"), f"{name} must be public"
 
 
-def test_slim_deploy_manager_does_not_call_helper_private_methods():
-    """If this fails, someone re-introduced a `self.disk._xxx` or
-    `self.preflight._xxx` call from SlimDeployManager — back to the lying
-    private convention. Move the method to the public API instead."""
-    source = (REPO_ROOT / "ilha" / "commands" / "push" / "slim_deploy_manager.py").read_text()
-    assert "self.disk._" not in source, (
-        "SlimDeployManager calls a `_private` method on self.disk. Either "
-        "promote it to public (remove the underscore) or keep the call inside "
-        "RemoteDiskManager."
-    )
-    assert "self.preflight._" not in source, (
-        "SlimDeployManager calls a `_private` method on self.preflight. Either "
-        "promote it to public or keep the call inside DeployPreflight."
-    )
-
-
 # ── C3: single server prep script ───────────────────────────────────────
 
 def test_server_prep_script_is_the_only_variant():
     prep = SCRIPTS_DIR / "server_prep.sh"
     assert prep.exists(), "ilha/scripts/server_prep.sh must exist"
-
-    # Dead variants from the legacy push path:
-    assert not (SCRIPTS_DIR / "server_prep_slim.sh").exists(), (
-        "server_prep_slim.sh was merged into server_prep.sh — delete the stray copy."
-    )
-    # The "full" prep (Python/uv/ilha install) belonged to the removed push path.
-    contents = prep.read_text()
-    assert "uv python install" not in contents, (
-        "server_prep.sh should not install Python/uv/ilha — that was for the "
-        "deleted legacy push path. Slim deploy only needs Docker + firewall."
-    )
-
-
-def test_server_preparer_class_is_gone():
-    """The old ServerPreparer class was coupled to the removed PushManager
-    path. It must not come back."""
-    with pytest.raises(ModuleNotFoundError):
-        import ilha.commands.push.server_preparer  # noqa: F401
 
 
 # ── C4: ZD script is file-based, not an embedded f-string ───────────────

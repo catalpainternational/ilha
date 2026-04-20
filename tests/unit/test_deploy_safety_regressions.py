@@ -6,9 +6,6 @@ analysis in the feature-slim-deploy branch discussion.
 """
 
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 from ilha.commands.push.deploy_preflight import DeployPreflight
 from ilha.commands.push.slim_deploy_manager import SlimDeployManager
@@ -148,55 +145,12 @@ def test_backup_volumes_aborts_when_a_volume_fails(tmp_path: Path, monkeypatch):
     assert not outer_tar_calls, "outer tar czf must be skipped on partial failure"
 
 
-# ── B4: zero-downtime start-app script gates Phase 8 on NEW_HEALTHY ──
-
-def test_zd_start_app_script_rolls_back_on_unhealthy_new_web(tmp_path: Path):
-    """B4: Phase 8 must refuse to swap Caddy if NEW_HEALTHY != 1.
-
-    The script should leave the canary in place (not execute the trap cleanup
-    that removes it) and exit non-zero so the deploy fails loudly instead of
-    swapping traffic onto a broken container.
-    """
-    mgr = SlimDeployManager(project_root=tmp_path)
-    rendered = {}
-
-    def capture(username, server, script, **kwargs):
-        rendered["script"] = script
-        return True
-
-    # Bind on the instance so `self` isn't shifted into our positional args.
-    mgr._run_nohup_remote = capture  # type: ignore[method-assign]
-    mgr.ssh.ensure_host_key = lambda *a, **kw: True  # type: ignore[method-assign]
-    mgr.ssh.build_ssh_command = lambda *a, **kw: ["echo"]  # type: ignore[method-assign]
-
-    with patch("ilha.commands.push.slim_deploy_manager.subprocess.run") as run_mock:
-        run_mock.return_value.stdout = ""
-        run_mock.return_value.returncode = 0
-        try:
-            mgr._start_app_remote("root", "1.2.3.4", build=False, debug=False)
-        except Exception:
-            pass  # post-nohup verification steps may fail without a real server
-
-    script = rendered.get("script", "")
-    assert script, "start-app script should have been rendered"
-
-    # The guard that must exist:
-    assert 'NEW_HEALTHY" != "1"' in script, (
-        "Phase 8 must check NEW_HEALTHY before swapping Caddy upstream"
-    )
-    # The rollback branch must (a) announce itself, (b) disarm the trap so the
-    # canary keeps serving, and (c) exit non-zero — all before Phase 9 runs.
-    guard_idx = script.find('NEW_HEALTHY" != "1"')
-    phase9_idx = script.find('Phase 9:')
-    assert guard_idx != -1 and phase9_idx != -1 and guard_idx < phase9_idx
-    rollback_region = script[guard_idx:phase9_idx]
-    assert 'ROLLBACK: new compose web failed health check' in rollback_region, (
-        "Rollback branch should announce itself in logs"
-    )
-    assert "trap - EXIT" in rollback_region, (
-        "Rollback must disarm the cleanup trap so the canary continues serving"
-    )
-    assert "exit 1" in rollback_region, "Rollback must exit non-zero"
+# B4 coverage lives in tests/unit/test_phase6_architecture.py::
+# test_zd_deploy_script_keeps_b4_rollback_guard, which reads the extracted
+# zd_deploy.sh file directly. The previous duplicate here asserted the same
+# invariants against the Python-rendered script body; since the rendered
+# script is literally the file contents plus an exports header, the
+# assertions were identical.
 
 
 # ── B1: server_prep.sh aborts firewall setup on UFW SSH rule failure ──

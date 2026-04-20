@@ -348,11 +348,18 @@ class TestConfigurationGeneration:
         caddy_labels = [label for label in labels if 'caddy.proxy' in label]
         assert len(caddy_labels) > 0
         
-        # Check specific Caddy labels
-        assert any('caddy.proxy=${SITE_DOMAIN:-${COMPOSE_PROJECT_NAME}.localhost}' in label for label in labels)
-        # Note: reverse_proxy label is not added automatically - Caddy script uses container name
-        # Verify caddy.proxy label is present
-        assert any('caddy.proxy=' in label for label in labels)
+        # A caddy.proxy= label must exist and must route through SITE_DOMAIN
+        # (overridable at deploy time) with the project's per-worktree hostname
+        # as the fallback. Exact template syntax is intentionally not pinned —
+        # reformatting the default should not break this test.
+        proxy_labels = [label for label in labels if 'caddy.proxy=' in label]
+        assert proxy_labels, "expected at least one caddy.proxy= label"
+        assert any('SITE_DOMAIN' in label for label in proxy_labels), (
+            "caddy.proxy should honor SITE_DOMAIN as the override"
+        )
+        assert any('COMPOSE_PROJECT_NAME' in label for label in proxy_labels), (
+            "caddy.proxy should fall back to the per-worktree hostname"
+        )
         # Health check is optional and disabled by default
         # assert any('caddy.proxy.health_check' in label for label in labels)
         
