@@ -14,6 +14,17 @@ from ilha.core.git_manager import GitManager
 from ilha.core.environment_manager import EnvironmentManager
 
 
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests under tests/integration/ and tests/e2e/ so the default
+    suite (unit only) stays fast. Opt in with `pytest -m integration` etc."""
+    for item in items:
+        path = str(item.fspath).replace("\\", "/")
+        if "/tests/integration/" in path:
+            item.add_marker(pytest.mark.integration)
+        elif "/tests/e2e/" in path:
+            item.add_marker(pytest.mark.e2e)
+
+
 @pytest.fixture(scope="session")
 def temp_project_dir() -> Generator[Path, None, None]:
     """Create a temporary project directory for testing."""

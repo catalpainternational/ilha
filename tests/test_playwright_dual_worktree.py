@@ -21,9 +21,15 @@ import time
 import subprocess
 from pathlib import Path
 from typing import Tuple, Optional
-from playwright.sync_api import sync_playwright, Page
 
 import pytest
+
+playwright = pytest.importorskip("playwright.sync_api")
+sync_playwright = playwright.sync_playwright
+Page = playwright.Page
+
+# This is a live browser test — opt in with `pytest -m e2e`.
+pytestmark = pytest.mark.e2e
 
 
 class TestPlaywrightDualWorktree:
