@@ -55,7 +55,7 @@ class RemoteDiskManager:
             "/var/lib/docker": docker_required,
         }
 
-    def _check_remote_disk_capacity(
+    def check_remote_disk_capacity(
         self,
         *,
         username: str,
@@ -94,6 +94,19 @@ class RemoteDiskManager:
             report["available_bytes"][path] = _safe_int(value)
             report["probe_paths"][path] = probe_path
 
+        # Warn when the target path didn't exist yet and we fell back to an
+        # ancestor. The capacity number we report is for the ancestor's
+        # filesystem — which may or may not be the same fs the target will land
+        # on once it's created (e.g. /var/lib/docker can be a separate mount).
+        for path in ["/app", "/var/lib/docker"]:
+            probe_path = report["probe_paths"].get(path, path)
+            if probe_path != path:
+                log_warning(
+                    f"Disk probe for {path} fell back to ancestor {probe_path} "
+                    f"(target path does not yet exist). If {path} will live on "
+                    "a separate mount, this estimate may be wrong."
+                )
+
         ok = True
         for path, required in required_by_path.items():
             available = _safe_int(report["available_bytes"].get(path, 0))
@@ -111,7 +124,7 @@ class RemoteDiskManager:
                 )
         return ok, report
 
-    def _log_remote_disk_diagnostics(self, username: str, server: str) -> None:
+    def log_remote_disk_diagnostics(self, username: str, server: str) -> None:
         commands = [
             "df -h /app /var/lib/docker 2>/dev/null || true",
             "docker system df 2>/dev/null || true",
@@ -122,7 +135,7 @@ class RemoteDiskManager:
                 if line.strip():
                     log_error(f"  {line}")
 
-    def _attempt_remote_disk_recovery(self, username: str, server: str, mode: str, force: bool = False) -> bool:
+    def attempt_remote_disk_recovery(self, username: str, server: str, mode: str, force: bool = False) -> bool:
         safe_script = f"""
 set -euo pipefail
 find {self.remote_app_root} -type f -name '*.ilha-package.tar.gz' -delete 2>/dev/null || true
@@ -158,7 +171,7 @@ docker container prune -f >/dev/null 2>&1 || true
         log_success("Remote disk recovery completed")
         return True
 
-    def _print_disk_recovery_guidance(self, username: str, server: str) -> None:
+    def print_disk_recovery_guidance(self, username: str, server: str) -> None:
         log_error("Disk exhaustion detected. Suggested recovery commands:")
         log_error(f"  ssh {username}@{server} \"df -h /app /var/lib/docker\"")
         log_error(f"  ssh {username}@{server} \"find {self.remote_app_root} -type f -name '*.ilha-package.tar.gz' -delete\"")

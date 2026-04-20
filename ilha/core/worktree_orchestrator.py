@@ -71,8 +71,8 @@ class WorktreeOrchestrator:
         Ensures we use the correct project_root context from the orchestrator instance.
         """
         # If we have a project_root with config, use it directly
-        from ..config.settings import ilha_DIR
-        config_path = self.project_root / ilha_DIR / "config.yml"
+        from ..config.settings import ILHA_DIR
+        config_path = self.project_root / ILHA_DIR / "config.yml"
         if config_path.exists():
             try:
                 import yaml

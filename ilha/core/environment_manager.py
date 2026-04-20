@@ -244,7 +244,7 @@ class EnvironmentManager:
             domain: Optional domain override (subdomain.domain.tld)
         """
         from ..config.settings import (
-            ilha_DIR,
+            ILHA_DIR,
             sanitize_project_name,
             get_allowed_hosts_for_worktree,
             build_allowed_hosts_with_container,
@@ -260,7 +260,7 @@ class EnvironmentManager:
         
         # Get project name from config in self.project_root (not current directory)
         project_name = None
-        config_path = self.project_root / ilha_DIR / "config.yml"
+        config_path = self.project_root / ILHA_DIR / "config.yml"
         if config_path.exists():
             try:
                 with open(config_path) as f:
@@ -337,12 +337,12 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
     
     def _generate_env_compose_content(self, branch_name: str) -> str:
         """Generate env.ilha content for a worktree using self.project_root."""
-        from ..config.settings import ilha_DIR, sanitize_project_name, get_allowed_hosts_for_worktree
+        from ..config.settings import ILHA_DIR, sanitize_project_name, get_allowed_hosts_for_worktree
         import yaml
         
         # Get project name from config in self.project_root
         project_name = None
-        config_path = self.project_root / ilha_DIR / "config.yml"
+        config_path = self.project_root / ILHA_DIR / "config.yml"
         if config_path.exists():
             try:
                 with open(config_path) as f:
@@ -755,7 +755,7 @@ ILHA_SUBNET_WEB={web_subnet}
         Returns:
             Environment file content with domain overrides
         """
-        from ..config.settings import ilha_DIR, sanitize_project_name
+        from ..config.settings import ILHA_DIR, sanitize_project_name
         from ..utils.logging import log_warning
         import yaml
         
@@ -763,7 +763,7 @@ ILHA_SUBNET_WEB={web_subnet}
         
         # Get project name from config in self.project_root (not current directory)
         project_name = None
-        config_path = self.project_root / ilha_DIR / "config.yml"
+        config_path = self.project_root / ILHA_DIR / "config.yml"
         if config_path.exists():
             try:
                 with open(config_path) as f:

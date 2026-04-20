@@ -10,7 +10,7 @@ import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from ..config.settings import get_project_root, ilha_DIR, get_worktree_dir
+from ..config.settings import get_project_root, ILHA_DIR, get_worktree_dir
 from ..utils.logging import log_info, log_success, log_warning, log_error, log_step
 from ..utils.validation import check_prerequisites
 from ..utils.caddy_config import ensure_caddy_labels_and_network
@@ -39,7 +39,7 @@ class SetupManager:
             project_root: Project root directory. If None, uses current working directory.
         """
         self.project_root = project_root or Path.cwd()
-        self.ilha_dir = self.project_root / ilha_DIR
+        self.ilha_dir = self.project_root / ILHA_DIR
     
     def _get_examples_dir(self) -> Path:
         """Get path to examples directory in current project.
@@ -1704,7 +1704,7 @@ environment:
 # ============================================================================
 
 # Deployment configuration
-# Used by 'ilha droplet push' command
+# Used by 'ilha droplet deploy' and 'ilha droplet put' commands
 # These settings provide defaults for deployment operations
 # deployment:
   # Default server for push operations
@@ -1896,22 +1896,22 @@ environment:
 # ============================================================================
 
 # Default region for droplet creation
-# Used with ilha droplet create command
+# Used with ilha droplet deploy command
 # Example: nyc1, sfo3, lon1
 # DROPLET_DEFAULT_REGION=nyc1
 
 # Default size for droplet creation
-# Used with ilha droplet create command
+# Used with ilha droplet deploy command
 # Example: s-1vcpu-1gb, s-2vcpu-4gb
 # DROPLET_DEFAULT_SIZE=s-1vcpu-1gb
 
 # Default image for droplet creation
-# Used with ilha droplet create command
+# Used with ilha droplet deploy command
 # Example: ubuntu-22-04-x64, ubuntu-20-04-x64
 # DROPLET_DEFAULT_IMAGE=ubuntu-22-04-x64
 
 # Default SSH keys for droplet creation (comma-separated)
-# Used with ilha droplet create and droplet push commands
+# Used with ilha droplet deploy and droplet put commands
 # SSH key names (comma-separated, e.g., anders,peter)
 # Only key names are supported, not numeric IDs or fingerprints
 # DROPLET_DEFAULT_SSH_KEYS=anders,peter

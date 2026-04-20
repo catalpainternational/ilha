@@ -19,7 +19,7 @@ AUTHOR = "ilha Contributors"
 # PROJECT_NAME is now dynamically determined from get_project_name()
 CADDY_NETWORK = "ilha_caddy_proxy"
 COMPOSE_OVERRIDE_DIR = "ilha"
-ilha_DIR = ".ilha"
+ILHA_DIR = ".ilha"
 
 # File paths
 COMPOSE_OVERRIDE = f"{COMPOSE_OVERRIDE_DIR}/config/docker-compose.ilha.yml"
@@ -88,7 +88,7 @@ def _get_config_value(path_keys: list[str], default: Optional[str] = None) -> Op
         String value or default
     """
     try:
-        config_path = get_project_root() / ilha_DIR / "config.yml"
+        config_path = get_project_root() / ILHA_DIR / "config.yml"
         if not config_path.exists():
             return default
         import yaml  # local import to avoid top-level dependency at import time
@@ -141,7 +141,7 @@ def get_deployment_ssh_key() -> Optional[str]:
 # Configuration loading functions
 def get_project_config() -> Dict[str, Any]:
     """Load project configuration from .ilha/config.yml"""
-    config_path = get_project_root() / ilha_DIR / "config.yml"
+    config_path = get_project_root() / ILHA_DIR / "config.yml"
     if config_path.exists():
         try:
             with open(config_path) as f:
