@@ -1,12 +1,10 @@
 """
-Push commands for ilha deployment operations.
+Deploy commands for ilha. Slim-deploy is the only remaining pipeline.
 """
 
-from .push_manager import PushManager
 from .remote_disk import RemoteDiskManager
-from .server_preparer import ServerPreparer
 from .transfer_manager import TransferManager
 from .slim_deploy_manager import SlimDeployManager
 
-__all__ = ['PushManager', 'RemoteDiskManager', 'ServerPreparer', 'TransferManager', 'SlimDeployManager']
+__all__ = ['RemoteDiskManager', 'TransferManager', 'SlimDeployManager']
 

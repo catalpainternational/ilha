@@ -6,16 +6,14 @@ from __future__ import annotations
 
 import click
 
-from pathlib import Path
 from typing import Optional
 
-from ilha.cli.helpers import add_json_option, add_remote_push_options, add_verbose_option, command_wrapper
-from ilha.commands.push.push_manager import PushManager
+from ilha.cli.helpers import add_json_option, add_verbose_option, command_wrapper
 from ilha.commands.utility import UtilityManager
 from ilha.commands.worktree import WorktreeManager
 from ilha.exceptions import ilhaCommandError
 from ilha.utils.json_output import JSONOutput
-from ilha.utils.logging import error_exit, log_info, log_success, log_warning
+from ilha.utils.logging import log_info, log_success
 from ilha.utils.pattern_matcher import has_wildcard
 
 
@@ -196,81 +194,4 @@ def register_commands(cli) -> None:
             return JSONOutput.success("Pruned worktrees", {"pruned_count": pruned_count})
         pruned_count = utility_manager.prune_worktrees()
         log_info(f"Pruned {pruned_count} worktree(s)")
-
-    @cli.command()
-    @click.argument("branch_name", required=False)
-    @click.argument("scp_target", required=False)
-    @add_remote_push_options()
-    @add_json_option
-    @add_verbose_option
-    @command_wrapper(require_setup=True, require_prerequisites=True)
-    def push(
-        branch_name: Optional[str],
-        scp_target: Optional[str],
-        output_dir: str,
-        keep_package: bool,
-        no_auto_import: bool,
-        prepare_server: bool,
-        domain: str,
-        ip: str,
-        dns_token: str,
-        skip_dns_check: bool,
-        resume: bool,
-        code_only: bool,
-        build: bool,
-        containers: Optional[str],
-        exclude_deps: Optional[str],
-        json: bool,
-    ):
-        """Push worktree package to remote server via SCP."""
-        if domain and ip:
-            if json:
-                JSONOutput.print_error("Options --domain and --ip are mutually exclusive")
-            else:
-                error_exit("Options --domain and --ip are mutually exclusive")
-            return
-        
-        if not code_only and not scp_target:
-            if json:
-                JSONOutput.print_error("scp_target is required (or use --code-only with stored config)")
-            else:
-                error_exit("scp_target is required (or use --code-only with stored config)")
-            return
-        
-        push_manager = PushManager()
-        exclude_deps_list = [d.strip() for d in exclude_deps.split(",")] if exclude_deps else None
-        success = push_manager.push_package(
-            branch_name=branch_name,
-            scp_target=scp_target,
-            output_dir=Path(output_dir),
-            keep_package=keep_package,
-            auto_import=not no_auto_import,
-            domain=domain,
-            ip=ip,
-            prepare_server=prepare_server,
-            dns_token=dns_token,
-            skip_dns_check=skip_dns_check,
-            create_droplet=False,
-            droplet_name=None,
-            droplet_region=None,
-            droplet_size=None,
-            droplet_image=None,
-            droplet_ssh_keys=None,
-            resume=resume,
-            code_only=code_only,
-            build=build,
-            containers=containers,
-            exclude_deps=exclude_deps_list,
-        )
-        
-        if not success:
-            if json:
-                JSONOutput.print_error("Failed to push package")
-            else:
-                error_exit("Failed to push package")
-        else:
-            if json:
-                JSONOutput.print_success("Package pushed successfully")
-            else:
-                log_success("Package pushed successfully")
 
