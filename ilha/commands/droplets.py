@@ -1344,7 +1344,7 @@ def resolve_existing_remote_target(
     cli_target = scp_target
     cli_domain = domain or None
 
-    merged, _, stored_config = load_and_merge_config(
+    merged_obj = load_and_merge_config(
         branch_name,
         {
             "scp_target": scp_target,
@@ -1353,6 +1353,8 @@ def resolve_existing_remote_target(
             "dns_token": api_token or "",
         },
     )
+    merged = merged_obj.config
+    stored_config = merged_obj.stored_config
     scp_target = merged["scp_target"]
     domain = merged["domain"] or None
     ip = merged["ip"] or None

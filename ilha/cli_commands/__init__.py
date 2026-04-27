@@ -14,7 +14,7 @@ def register_all_commands(cli) -> None:
 
 
 def _collect_registrars() -> List[Callable]:
-    from . import completion, compose, domains, droplets, packages, proxy, server_import, setup, volumes, worktrees
+    from . import completion, compose, db, domains, droplets, packages, proxy, server_import, setup, volumes, worktrees
 
     return [
         proxy.register_commands,
@@ -27,6 +27,7 @@ def _collect_registrars() -> List[Callable]:
         setup.register_commands,
         completion.register_commands,
         compose.register_commands,
+        db.register_commands,
     ]
 
 

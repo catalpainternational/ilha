@@ -500,12 +500,18 @@ echo OK
         return result
 
     def _probe_external_domain_html(self, domain: str) -> Tuple[bool, Optional[str]]:
-        """GET ``https://<domain>/`` and require ``text/html`` plus a non-trivial body."""
+        """GET ``https://<domain>/`` and require ``text/html`` plus a non-trivial body.
+
+        Follows redirects: a login-required app routinely 302s ``/`` to a login
+        URL, so ``-L`` lets the probe land on the rendered HTML before measuring
+        the body. The header dump (``-D -``) reflects the *final* response after
+        redirects, which is what we want for content-type and body checks.
+        """
         url = f"https://{domain}/"
         code, out, err = self._run_local_text(
             [
                 "curl",
-                "-kfsS",
+                "-kfsSL",
                 "--max-time",
                 "15",
                 "-D",
@@ -570,6 +576,27 @@ echo OK
         if not location.startswith(expected_prefix):
             return False, f"expected Location to start with {expected_prefix}, got {location!r}"
         return True, None
+
+    @staticmethod
+    def _describe_smoke_failure(smoke_report: Dict[str, Any]) -> str:
+        """Build a one-line root_cause that names the failing check + its error.
+
+        The previous hardcoded ``"did not pass before timeout"`` lied whenever
+        the failure was a 502, an auth error, or content-length too small —
+        which is most of the time. Use the structured smoke_report instead.
+        """
+        checks = (smoke_report or {}).get("checks") or []
+        for check in checks:
+            if not check.get("success"):
+                name = check.get("name", "unknown")
+                target = check.get("target", "")
+                err = (check.get("error") or "").strip()
+                err_excerpt = err.splitlines()[0][:240] if err else "no error message"
+                target_str = f" ({target})" if target else ""
+                return f"Smoke check '{name}' failed{target_str}: {err_excerpt}"
+        # No individual check reported failure but smoke_ok was False — likely
+        # the entire window of probe attempts timed out before convergence.
+        return "Post-deploy smoke checks did not converge before timeout."
 
     def _run_smoke_checks(
         self,
@@ -1184,7 +1211,7 @@ echo OK
                 self._set_failure(
                     error_code="smoke_checks_failed",
                     stage="smoke_checks",
-                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
                         "Run `ilha droplet doctor` for this target.",
                         "Inspect remote compose ps output and service logs.",
@@ -1231,6 +1258,7 @@ echo OK
         use_staging_certificates: bool = False,
         code_only: bool = False,
         db_only: bool = False,
+        force_password_reset: bool = False,
         smoke_timeout: int = 60,
     ) -> bool:
         """Update an existing slim-deployed server.
@@ -1308,6 +1336,11 @@ echo OK
                     if not self._restore_volumes_remote(username, server, branch_name):
                         _cleanup_deploy_dir(deploy_dir)
                         return False
+                    if not self._validate_restored_postgres_password(
+                        username, server, force_password_reset=force_password_reset
+                    ):
+                        _cleanup_deploy_dir(deploy_dir)
+                        return False
                     log_step("Starting application")
                     if not self._start_app_remote(username, server, build=False, debug=False):
                         _cleanup_deploy_dir(deploy_dir)
@@ -1376,7 +1409,7 @@ echo OK
                 self._set_failure(
                     error_code="smoke_checks_failed",
                     stage="smoke_checks",
-                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
                         "Run `ilha droplet doctor` for this target.",
                         "Inspect remote compose ps output and service logs.",
@@ -1424,14 +1457,23 @@ echo OK
                         self._restore_volumes_remote, username, server, branch_name
                     )
                 futures["caddy"] = executor.submit(self._start_caddy_remote, username, server)
+                restore_ok = True
                 for key in futures:
                     try:
                         ok = futures[key].result(timeout=self._FUTURE_TIMEOUTS.get(key, 600))
                     except TimeoutError:
                         log_error(f"{key} timed out after {self._FUTURE_TIMEOUTS.get(key, 600)}s")
                         ok = False
-                    if key == "caddy" and not ok:
+                    if key == "restore":
+                        restore_ok = ok
+                    elif key == "caddy" and not ok:
                         log_warning("Caddy start had issues, but continuing with app services...")
+            if volume_tar and restore_ok and not self._validate_restored_postgres_password(
+                username, server, force_password_reset=force_password_reset
+            ):
+                _cleanup_deploy_dir(deploy_dir)
+                render_deploy_report(self._last_report)
+                return False
             log_step("Starting application")
             if not self._start_app_remote(username, server, build=build, debug=debug):
                 _cleanup_deploy_dir(deploy_dir)
@@ -1459,7 +1501,7 @@ echo OK
                 self._set_failure(
                     error_code="smoke_checks_failed",
                     stage="smoke_checks",
-                    root_cause="Post-deploy smoke checks did not pass before timeout.",
+                    root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
                         "Run `ilha droplet doctor` for this target.",
                         "Inspect remote compose ps output and service logs.",

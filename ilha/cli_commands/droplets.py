@@ -652,6 +652,12 @@ def register_commands(cli) -> None:
     @click.option("--use-production-certificates", is_flag=True, default=False, help="Use production certificates (explicit default)")
     @click.option("--code-only", is_flag=True, default=False, help="Only sync code and config (no volume/data transfer)")
     @click.option("--db-only", is_flag=True, default=False, help="Only sync volumes/data (no code transfer). Stops app during restore.")
+    @click.option(
+        "--force-password-reset",
+        is_flag=True,
+        default=False,
+        help="Skip Postgres password validation after volume restore (dangerous; use only when intentional).",
+    )
     @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
     @add_json_option
     @add_verbose_option
@@ -666,6 +672,7 @@ def register_commands(cli) -> None:
         use_production_certificates: bool,
         code_only: bool,
         db_only: bool,
+        force_password_reset: bool,
         api_token: Optional[str],
         json: bool,
     ):
@@ -750,6 +757,7 @@ def register_commands(cli) -> None:
                     use_staging_certificates=use_staging_certificates,
                     code_only=code_only,
                     db_only=db_only,
+                    force_password_reset=force_password_reset,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:

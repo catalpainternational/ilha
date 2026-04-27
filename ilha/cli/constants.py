@@ -22,6 +22,7 @@ RESERVED_COMMANDS = {
     "packages",
     "droplet",
     "domains",
+    "db",
     "-D",
     "-r",
 }
