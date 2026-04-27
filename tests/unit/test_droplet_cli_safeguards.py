@@ -127,7 +127,10 @@ def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
     assert payload["data"]["source_manifest"]["branch_name"] == "demo"
     assert payload["data"]["smoke_checks"]["success"] is True
     assert deploy_kwargs["strict_deploy_drift"] is False
-    assert deploy_kwargs.get("restore_volumes") is False
+    # `--restore-volumes` defaults to True (flipped 2026-04-27): a fresh-droplet
+    # deploy should land as a working staging by default; pass
+    # --no-restore-volumes for code-only.
+    assert deploy_kwargs.get("restore_volumes") is True
     assert deploy_kwargs.get("no_build") is False
 
 

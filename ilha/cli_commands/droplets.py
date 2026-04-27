@@ -326,10 +326,14 @@ def register_commands(cli) -> None:
     @click.option("--no-disk-check", is_flag=True, default=False, help="Skip remote disk preflight checks")
     @click.option("--skip-volume-backup", is_flag=True, default=False, help="Skip local volume backup for faster stateless deploys")
     @click.option(
-        "--restore-volumes",
-        is_flag=True,
-        default=False,
-        help="Copy local worktree Docker volumes to the server (opt-in; default deploy ships code only).",
+        "--restore-volumes/--no-restore-volumes",
+        default=True,
+        show_default=True,
+        help=(
+            "Copy local worktree Docker volumes (DB, media, redis) to the server."
+            " Default is on so a fresh-droplet deploy lands as a working staging environment;"
+            " pass --no-restore-volumes for a code-only deploy that lets the server initialize empty volumes."
+        ),
     )
     @click.option(
         "--no-build",
