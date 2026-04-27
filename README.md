@@ -179,7 +179,7 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 |---------|-------------|---------|
 | `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). Default ships **code only**; use `--restore-volumes` to copy local DB/volumes. Auto-builds the web image on the server when it is missing (unless `--no-build`). | `ilha droplet deploy staging --domain app.example.com --build` |
 | `droplet deploy --no-create` | Deploy to an existing server (skip droplet creation) | `ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root` |
-| `droplet put [branch]` | Update an existing deployment (code + config, zero-downtime) | `ilha droplet put staging` |
+| `droplet put [branch]` | Update an existing deployment (code + config; brief downtime during web restart) | `ilha droplet put staging` |
 | `droplet logs [branch]` | Tail Docker Compose logs from a remote droplet | `ilha droplet logs staging` or `ilha droplet logs -s web -f` |
 | `droplet list` | List all droplets (formatted table) | `ilha droplet list` |
 | `droplet list --as-json` | List droplets as JSON | `ilha droplet list --as-json` |
@@ -935,7 +935,7 @@ ilha droplet deploy staging --no-create --scp-target root@1.2.3.4:/root
 
 ### Update an Existing Deployment
 ```bash
-# Push code + config updates (zero-downtime canary)
+# Push code + config updates (brief downtime while the web container restarts)
 ilha droplet put staging
 
 # With explicit target overrides

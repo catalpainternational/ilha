@@ -3,7 +3,7 @@
 Covers:
 - B2: SSH execute_remote_script always cleans up /tmp file, even on failure.
 - B6: DeployServiceConfig defaults match historical hardcoded values and flow
-      into the zero-downtime start-app script and the smoke-probe command.
+      into the remote start-app script and the smoke-probe command.
 - B8: SSH control paths include the port, so simultaneous connections to the
       same host on different ports do not collide.
 - G4: SSH host-key pinning refuses a stored known_hosts entry whose
@@ -188,11 +188,11 @@ def test_load_deploy_service_config_reads_yaml(tmp_path: Path):
     assert cfg.worker_services == []
 
 
-# ── B6: config flows into the zero-downtime start-app script ─────────────
+# ── B6: config flows into the remote start-app script ───────────────────
 
 def _render_start_app_script(mgr: SlimDeployManager) -> str:
-    """Return the remote ZD wrapper script (exports + ``python3 remote_deploy.py``)."""
-    return mgr._compose_remote_zd_wrapper_script(
+    """Return the remote deploy wrapper script (exports + ``python3 remote_deploy.py``)."""
+    return mgr._compose_remote_deploy_wrapper_script(
         app_root=mgr.REMOTE_APP_ROOT,
         remote_tmp_dir="/tmp/ilha-testsession",
         remote_deploy_file="/tmp/ilha-testsession/remote_deploy.py",

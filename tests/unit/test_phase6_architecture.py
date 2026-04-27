@@ -4,7 +4,7 @@
       (RemoteDiskManager, DeployPreflight) uses public method names, not the
       leading-underscore "private" convention.
 - C3: the single server prep script exists as a Python script at ``ilha/scripts/server_prep.py``.
-- C4: the zero-downtime deploy script lives in a Python file at ``ilha/scripts/remote_deploy.py``
+- C4: the remote deploy script lives in a Python file at ``ilha/scripts/remote_deploy.py``
       with reusable utilities in ``ilha/scripts/deploy_utils.py``.
 """
 
@@ -67,21 +67,21 @@ def test_server_prep_script_is_python():
     assert utils.exists(), "ilha/scripts/deploy_utils.py must exist (required by server_prep.py)"
 
 
-# ── C4: ZD script is file-based and Python ───────────────────────────────
+# ── C4: remote deploy script is file-based and Python ───────────────────
 
-def test_zd_deploy_script_exists_as_python():
-    """Zero-downtime deploy is now a Python script for DRY, type-safe deployment."""
+def test_remote_deploy_script_exists_as_python():
+    """Remote deploy is a Python script for DRY, type-safe deployment."""
     remote_deploy = SCRIPTS_DIR / "remote_deploy.py"
     assert remote_deploy.exists(), (
-        "ilha/scripts/remote_deploy.py must exist — the zero-downtime deploy "
-        "logic was migrated to Python in Phase 2 for DRY principles and type safety."
+        "ilha/scripts/remote_deploy.py must exist — the remote deploy logic "
+        "was migrated to Python in Phase 2 for DRY principles and type safety."
     )
     body = remote_deploy.read_text()
-    assert "_persist_canary_diagnostics" in body
+    assert "_persist_failure_diagnostics" in body
     assert "/tmp/ilha-diagnostics" in body
 
 
-def test_zd_deploy_script_uses_env_vars():
+def test_remote_deploy_script_uses_env_vars():
     """The Python deployment script must read environment variables."""
     body = (SCRIPTS_DIR / "remote_deploy.py").read_text()
     required = [
@@ -104,4 +104,3 @@ def test_remote_deploy_imports_utilities():
     assert "from deploy_utils import" in body
     assert "DeployLogger" in body
     assert "DockerCommand" in body
-    assert "CaddyManager" in body

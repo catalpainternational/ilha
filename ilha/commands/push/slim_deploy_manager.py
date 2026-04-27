@@ -77,8 +77,10 @@ class SlimDeployManager:
         "caddy": 300,
     }
 
-    # Remote ZD start-app script (nohup poll). Without an embedded `compose build web`,
-    # phases are compose up, canary health, swap, recreate web — normally a few minutes.
+    # Upper bound for the remote start-app script (nohup poll). Steps without an
+    # embedded `compose build web` are: bring up deps, wait for db,
+    # `compose up -d` web/workers, health-check (which waits up to 180s for the
+    # entrypoint's own migrations to finish) — normally a few minutes.
     _APP_START_MAX_WAIT_SEC = 600
     # When deploy passes build=True, the script also runs `docker compose build web` on the server.
     _APP_START_MAX_WAIT_EMBEDDED_BUILD_SEC = 1200
@@ -1160,7 +1162,7 @@ echo OK
                         root_cause="Failed to start application services on the server.",
                         suggested_actions=[
                             "Inspect remote logs under /tmp/ilha-*.log and docker compose ps output.",
-                            "If canary failed, check /tmp/ilha-diagnostics/ on the server for captured logs.",
+                            "Check /tmp/ilha-diagnostics/ on the server for captured logs from the failed step.",
                         ],
                         failure_category="remote_runtime_error",
                     )
@@ -2400,7 +2402,7 @@ echo "Build complete"
             debug=debug,
         )
 
-    def _compose_remote_zd_wrapper_script(
+    def _compose_remote_deploy_wrapper_script(
         self,
         *,
         app_root: str,
@@ -2436,14 +2438,12 @@ echo "Build complete"
     def _start_app_remote(self, username: str, server: str, build: bool = False, debug: bool = False) -> bool:
         """Start application services on the server via nohup + poll.
 
-        Zero-downtime strategy:
-        1. Build new image while old container keeps serving traffic (slow part, no disruption)
-        2. Start a canary container from the new image and health-check it
-        3. If canary fails: abort, old container still serves (rollback)
-        4. Pause caddy_monitor to prevent drift correction during swap
-        5. Swap Caddy upstream to canary via admin API (canary now serves traffic)
-        6. Replace old web with new compose-managed container
-        7. Swap Caddy upstream to new compose web, cleanup canary, resume monitor
+        Strategy (brief downtime accepted; no canary/swap):
+        1. Bring up dependency services and wait for the database.
+        2. (Optional) Build the web image.
+        3. ``compose up -d`` for web + workers. The container's entrypoint
+           is responsible for running migrations before serving traffic.
+        4. Health-check the running web container.
         """
         log_info("Starting application services on server...")
         self.ssh.ensure_host_key(server)
@@ -2506,7 +2506,7 @@ echo "Build complete"
             log_error(f"Failed to upload remote_deploy.py: {result.stderr}")
             return False
 
-        wrapper_script = self._compose_remote_zd_wrapper_script(
+        wrapper_script = self._compose_remote_deploy_wrapper_script(
             app_root=app_root,
             remote_tmp_dir=remote_tmp_dir,
             remote_deploy_file=remote_deploy_file,

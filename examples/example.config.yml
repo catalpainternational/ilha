@@ -146,12 +146,13 @@ environment:
   # Port the web service listens on inside the container. Default: 8000
   # web_port: 8000
 
-  # Path probed during canary and post-deploy smoke checks. Default: /health-check/
-  # Must start with a / — a leading slash is added if missing.
+  # Path probed by the post-start health check and post-deploy smoke checks.
+  # Default: /health-check/. Must start with a / — a leading slash is added
+  # if missing.
   # health_path: /health-check/
 
-  # Services the web service needs at start time (brought up before the
-  # canary). Default: [db, redis]
+  # Services the web service needs at start time (brought up before
+  # migrations run). Default: [db, redis]
   # dependency_services:
   #   - db
   #   - redis
@@ -160,8 +161,8 @@ environment:
   # dependency_services. Default: db
   # db_service: db
 
-  # Worker services recreated during Phase 10 of the zero-downtime deploy.
-  # Empty list ⇒ Phase 10 is a no-op. Default: [rq-worker-1]
+  # Worker services started after the web service via `docker compose up -d`.
+  # Empty list ⇒ no workers are started. Default: [rq-worker-1]
   # worker_services:
   #   - rq-worker-1
 

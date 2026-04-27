@@ -35,10 +35,11 @@ mv *.sh ../
 ## Python Replacements
 
 ### `remote_deploy.py`
-- Standalone 10-phase zero-downtime deployment script
+
+- Standalone remote deployment script (deps → migrate → up → health)
 - Reads configuration from environment variables (APP_ROOT, WEB_SERVICE, etc.)
 - Imports reusable classes from `deploy_utils.py`
-- Equivalent functionality to original `zd_deploy.sh`
+- Replaced the 10-phase zero-downtime canary flow that lived in `zd_deploy.sh`. The current script accepts brief downtime in exchange for a much simpler control flow.
 
 ### `server_prep.py`
 - Fresh Ubuntu server preparation (Docker, firewall, swap)
@@ -48,7 +49,7 @@ mv *.sh ../
 
 ### `deploy_utils.py`
 - Shared DRY utilities for both deployment scripts
-- Classes: `DeployLogger`, `DockerCommand`, `CaddyManager`, `RemoteSystemCommand`
+- Classes: `DeployLogger`, `DockerCommand`, `RemoteSystemCommand`
 - Used by both `remote_deploy.py` and `server_prep.py`
 
 ## Integration Points

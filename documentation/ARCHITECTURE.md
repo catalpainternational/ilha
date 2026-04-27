@@ -952,7 +952,7 @@ ilha includes a droplet provider abstraction layer for cloud server management:
 ```
 Preflight → (parallel) [DNS Management | Server Prep (slim) | Assemble Deploy Dir]
          → Remote Disk Check → Volume Backup (local) → rsync → (parallel) [Volume Restore | Start Caddy]
-         → (optional) Remote Docker Build → Zero-Downtime App Start (canary → swap) → Smoke Checks
+         → (optional) Remote Docker Build → Remote App Start (deps → up → health) → Smoke Checks
 ```
 
 Implemented by `SlimDeployManager` in [ilha/commands/push/slim_deploy_manager.py](../ilha/commands/push/slim_deploy_manager.py). Key stages:
@@ -966,7 +966,7 @@ Implemented by `SlimDeployManager` in [ilha/commands/push/slim_deploy_manager.py
 - **rsync**: transfers the assembled directory to the server, reusing an SSH ControlMaster connection.
 - **Volume Restore | Start Caddy**: runs in parallel on the server.
 - **Remote Docker Build** (optional, `--build`): runs `docker compose build` on the server inside a nohup-polled script.
-- **Zero-Downtime App Start**: starts a canary container, health-checks it, swaps Caddy upstream, recreates the compose `web` service, re-swaps to the new container.
+- **Remote App Start** (`ilha/scripts/remote_deploy.py`): brings up dependency services, waits for the database, runs `manage.py migrate --noinput` via a one-shot `compose run --rm web`, then `compose up -d` for the web service and any workers, and finally health-checks the running web container. Brief downtime is expected while the web container restarts.
 - **Smoke Checks**: probes the app from inside the `web` container and (for domain deploys) from the host via the public URL.
 
 ### Droplet Deploy Command Flow
@@ -1047,7 +1047,7 @@ These are read via helper functions in `config/settings.py` and are entirely opt
 
 - Runs the slim deploy pipeline against a pre-existing server (no droplet creation).
 - Modes: default (full sync), `--code-only` (no volume sync), `--db-only` (volumes only, stops app during restore).
-- Zero-downtime canary swap via Caddy admin API.
+- Brief downtime while the web container is recreated; migrations run before the new container starts (no canary).
 - Requires target from stored config, `--scp-target`, `--domain`, or `--ip`.
 
 ### Adding New Commands
