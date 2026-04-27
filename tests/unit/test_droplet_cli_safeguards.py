@@ -36,10 +36,10 @@ def test_droplet_put_json_includes_safeguard_report(monkeypatch, runner):
         def cleanup(self):
             pass
 
-    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
     monkeypatch.setattr(
-        "ilha.cli_commands.droplets._resolve_existing_remote_target",
+        "ilha.cli_commands.droplets.resolve_existing_remote_target",
         lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
     )
     monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
@@ -70,10 +70,10 @@ def test_droplet_doctor_json_reports_checks(monkeypatch, runner):
         def cleanup(self):
             pass
 
-    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
     monkeypatch.setattr(
-        "ilha.cli_commands.droplets._resolve_existing_remote_target",
+        "ilha.cli_commands.droplets.resolve_existing_remote_target",
         lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
     )
     monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
@@ -109,11 +109,11 @@ def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
         def cleanup(self):
             pass
 
-    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
     monkeypatch.setattr("ilha.cli_commands.droplets.check_setup_or_prompt", lambda: None)
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites", lambda: None)
-    monkeypatch.setattr("ilha.cli_commands.droplets._parse_rsync_target_or_droplet", lambda target, token=None: target)
+    monkeypatch.setattr("ilha.cli_commands.droplets.parse_rsync_target_or_droplet", lambda target, token=None: target)
     monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
 
     result = runner.invoke(
@@ -127,6 +127,8 @@ def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
     assert payload["data"]["source_manifest"]["branch_name"] == "demo"
     assert payload["data"]["smoke_checks"]["success"] is True
     assert deploy_kwargs["strict_deploy_drift"] is False
+    assert deploy_kwargs.get("restore_volumes") is False
+    assert deploy_kwargs.get("no_build") is False
 
 
 def test_droplet_deploy_passes_strict_deploy_drift_flag(monkeypatch, runner):
@@ -151,11 +153,11 @@ def test_droplet_deploy_passes_strict_deploy_drift_flag(monkeypatch, runner):
         def cleanup(self):
             pass
 
-    monkeypatch.setattr("ilha.cli_commands.droplets._auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
     monkeypatch.setattr("ilha.cli_commands.droplets.check_setup_or_prompt", lambda: None)
     monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites", lambda: None)
-    monkeypatch.setattr("ilha.cli_commands.droplets._parse_rsync_target_or_droplet", lambda target, token=None: target)
+    monkeypatch.setattr("ilha.cli_commands.droplets.parse_rsync_target_or_droplet", lambda target, token=None: target)
     monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
 
     result = runner.invoke(
@@ -173,3 +175,24 @@ def test_droplet_deploy_passes_strict_deploy_drift_flag(monkeypatch, runner):
     )
     assert result.exit_code == 0, result.output
     assert deploy_kwargs["strict_deploy_drift"] is True
+
+
+def test_droplet_list_skips_docker_prerequisite(monkeypatch, runner):
+    """Cloud-only droplet list must not block on `docker info` (see ilha.utils.validation)."""
+
+    def _docker_prereq_must_not_run():
+        raise AssertionError("check_prerequisites_no_git must not run for ilha droplet list")
+
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", _docker_prereq_must_not_run)
+
+    calls = {"n": 0}
+
+    def fake_list_droplets(self, api_token=None, json=False, csv=False):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr("ilha.commands.droplets.DropletCommands.list_droplets", fake_list_droplets)
+
+    result = runner.invoke(cli, ["droplet", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 1

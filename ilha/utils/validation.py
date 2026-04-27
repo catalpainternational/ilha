@@ -14,6 +14,9 @@ from typing import Optional, List
 from .logging import log_error, error_exit
 from ..config.settings import BRANCH_NAME_PATTERN, PROTECTED_BRANCHES
 
+# Bound `docker info` / `docker compose version` so wedged daemons cannot hang the CLI indefinitely.
+DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS = 20
+
 # Reserved command names that cannot be used as worktree names
 RESERVED_COMMAND_NAMES = {
     'start-proxy', 'stop-proxy', 'start', 'stop', 'create', 'up', 'down', 
@@ -49,27 +52,45 @@ def validate_git_repository(project_root: Optional[Path] = None) -> bool:
         return False
 
 
-def validate_docker_running() -> bool:
-    """Check if Docker is running."""
+def validate_docker_running(timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS) -> bool:
+    """Check if Docker is running (bounded; avoids hang on unresponsive daemon)."""
     try:
-        subprocess.run(["docker", "info"], 
-                      capture_output=True, check=True)
+        subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
         return True
+    except subprocess.TimeoutExpired:
+        return False
     except (subprocess.CalledProcessError, FileNotFoundError, Exception):
         return False
 
 
-def validate_docker_compose() -> bool:
-    """Check if Docker Compose is available."""
+def validate_docker_compose(timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS) -> bool:
+    """Check if Docker Compose is available (bounded)."""
     try:
-        subprocess.run(["docker", "compose", "version"], 
-                      capture_output=True, check=True)
+        subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
         return True
+    except subprocess.TimeoutExpired:
+        return False
     except (subprocess.CalledProcessError, FileNotFoundError, Exception):
         try:
-            subprocess.run(["docker-compose", "version"], 
-                          capture_output=True, check=True)
+            subprocess.run(
+                ["docker-compose", "version"],
+                capture_output=True,
+                check=True,
+                timeout=timeout_seconds,
+            )
             return True
+        except subprocess.TimeoutExpired:
+            return False
         except (subprocess.CalledProcessError, FileNotFoundError, Exception):
             return False
 
@@ -134,10 +155,10 @@ def validate_current_branch(project_root: Optional[Path] = None) -> Optional[str
         if project_root is None:
             from ..config.settings import get_project_root
             project_root = get_project_root()
-        result = subprocess.run(["git", "branch", "--show-current"], 
+        result = subprocess.run(["git", "branch", "--show-current"],
                               capture_output=True, text=True, check=True, cwd=project_root)
         return result.stdout.strip()
-    except (subprocess.CalledProcessError, Exception):
+    except Exception:
         return None
 
 
@@ -147,10 +168,10 @@ def validate_branch_merged(branch_name: str, project_root: Optional[Path] = None
         if project_root is None:
             from ..config.settings import get_project_root
             project_root = get_project_root()
-        subprocess.run(["git", "branch", "-d", branch_name], 
+        subprocess.run(["git", "branch", "-d", branch_name],
                       capture_output=True, check=True, cwd=project_root)
         return True
-    except (subprocess.CalledProcessError, Exception):
+    except Exception:
         return False
 
 
@@ -158,21 +179,39 @@ def check_prerequisites(project_root: Optional[Path] = None) -> None:
     """Check all prerequisites and exit if any fail."""
     if not validate_git_repository(project_root):
         error_exit("Not in a git repository. Please run this command from the project root.")
-    
-    if not validate_docker_running():
-        error_exit("Docker is not running. Please start Docker and try again.")
-    
-    if not validate_docker_compose():
-        error_exit("Docker Compose is not available. Please install Docker Compose.")
+
+    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
+    if not validate_docker_running(timeout_seconds=timeout):
+        error_exit(
+            "Docker is not running or did not respond in time. "
+            "Start Docker Desktop / the daemon and try again. "
+            f"(Health probe timeout: {timeout}s)"
+        )
+
+    if not validate_docker_compose(timeout_seconds=timeout):
+        error_exit(
+            "Docker Compose is not available or did not respond in time. "
+            "Install Docker Compose v2 (or docker-compose) and try again. "
+            f"(Health probe timeout: {timeout}s)"
+        )
 
 
 def check_prerequisites_no_git() -> None:
     """Check Docker prerequisites only (skip git validation)."""
-    if not validate_docker_running():
-        error_exit("Docker is not running. Please start Docker and try again.")
-    
-    if not validate_docker_compose():
-        error_exit("Docker Compose is not available. Please install Docker Compose.")
+    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
+    if not validate_docker_running(timeout_seconds=timeout):
+        error_exit(
+            "Docker is not running or did not respond in time. "
+            "Start Docker Desktop / the daemon and try again. "
+            f"(Health probe timeout: {timeout}s)"
+        )
+
+    if not validate_docker_compose(timeout_seconds=timeout):
+        error_exit(
+            "Docker Compose is not available or did not respond in time. "
+            "Install Docker Compose v2 (or docker-compose) and try again. "
+            f"(Health probe timeout: {timeout}s)"
+        )
 
 
 def validate_volume_exists(volume_name: str) -> bool:
