@@ -10,9 +10,11 @@ from ..core.droplet_manager import DropletManager, DropletProvider, DropletInfo
 from ..core.dns_manager import DNSManager
 from ..core import dns_providers  # noqa: F401 - Import to trigger registration
 from ..core.dns_providers.digitalocean import DigitalOceanProvider
-from ..utils.logging import log_info, log_success, log_warning, log_error, log_step, print_plain
+from ..utils.logging import log_info, log_success, log_warning, log_error, log_step, print_plain, emit_error
 from ..utils.confirmation import confirm_action, confirm_by_typing_name
 from ..utils.json_output import JSONOutput
+from ._constants import DO_TOKEN_NOT_FOUND
+from .models import RemoteTarget, MergedConfig
 from rich.table import Table
 from rich.console import Console
 
@@ -38,21 +40,14 @@ class DropletCommands:
         # Resolve API token
         token = DropletManager.resolve_droplet_token(api_token)
         if not token:
-            error_msg = "Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token"
-            if json:
-                JSONOutput.print_error(error_msg)
-            else:
-                log_error(error_msg)
-            return None, error_msg
+            emit_error(DO_TOKEN_NOT_FOUND, json)
+            return None, DO_TOKEN_NOT_FOUND
         
         # Create provider
         provider = DropletManager.create_provider('digitalocean', token)
         if not provider:
             error_msg = "Failed to create droplet provider"
-            if json:
-                JSONOutput.print_error(error_msg)
-            else:
-                log_error(error_msg)
+            emit_error(error_msg, json)
             return None, error_msg
         
         return provider, None
@@ -104,10 +99,7 @@ class DropletCommands:
             droplet = provider.get_droplet(droplet_id)
             if not droplet:
                 error_msg = f"Droplet {droplet_id} not found"
-                if json:
-                    JSONOutput.print_error(error_msg)
-                else:
-                    log_error(error_msg)
+                emit_error(error_msg, json)
                 return None, error_msg
             
             return droplet_id, None
@@ -130,10 +122,7 @@ class DropletCommands:
             else:
                 error_msg = f"Droplet '{identifier}' not found"
             
-            if json:
-                JSONOutput.print_error(error_msg)
-            else:
-                log_error(error_msg)
+            emit_error(error_msg, json)
             return None, error_msg
         
         return droplet.id, None
@@ -158,10 +147,7 @@ class DropletCommands:
         
         if not identifier_list:
             error_msg = "No valid droplet identifiers provided"
-            if json:
-                JSONOutput.print_error(error_msg)
-            else:
-                log_error(error_msg)
+            emit_error(error_msg, json)
             return [], [{"identifier": "", "error": error_msg}]
         
         # Resolve each identifier
@@ -205,10 +191,7 @@ class DropletCommands:
             # Resolve API token
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             # Get defaults from environment
@@ -223,10 +206,7 @@ class DropletCommands:
             # Create provider
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return None if return_droplet else False
             
             if not json:
@@ -331,19 +311,13 @@ class DropletCommands:
             # Resolve API token
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             # Create provider
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return False
             
             # List droplets
@@ -523,19 +497,13 @@ class DropletCommands:
             # Resolve API token for droplet operations
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             # Create provider
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return False
             
             # Get droplet info for confirmation
@@ -626,10 +594,7 @@ class DropletCommands:
         # Get droplet IP first
         token = DropletManager.resolve_droplet_token(None)
         if not token:
-            if json:
-                JSONOutput.print_error("Digital Ocean API token not found")
-            else:
-                log_error("Digital Ocean API token not found")
+            emit_error(DO_TOKEN_NOT_FOUND, json)
             return False
         
         provider = DropletManager.create_provider('digitalocean', token)
@@ -765,19 +730,13 @@ class DropletCommands:
             # Resolve API token
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             # Create provider
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return False
             
             # Get droplet info
@@ -856,19 +815,13 @@ class DropletCommands:
             # Resolve API token
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             # Create provider
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return False
             
             # List sizes (now handles pagination exhaustively)
@@ -1020,18 +973,12 @@ class DropletCommands:
         try:
             token = DropletManager.resolve_droplet_token(api_token)
             if not token:
-                if json:
-                    JSONOutput.print_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
-                else:
-                    log_error("Digital Ocean API token not found. Set DIGITALOCEAN_API_TOKEN environment variable, or use --api-token")
+                emit_error(DO_TOKEN_NOT_FOUND, json)
                 return False
             
             provider = DropletManager.create_provider('digitalocean', token)
             if not provider:
-                if json:
-                    JSONOutput.print_error("Failed to create droplet provider")
-                else:
-                    log_error("Failed to create droplet provider")
+                emit_error("Failed to create droplet provider", json)
                 return False
             
             all_regions = provider.list_regions()
@@ -1118,3 +1065,322 @@ class DropletCommands:
             else:
                 log_error(f"Error listing regions: {e}")
             return False
+
+
+# ===== Helper functions (moved from cli_commands/droplets.py) =====
+
+
+def auto_detect_branch_name(branch_name: Optional[str], json: bool) -> str:
+    """Autodetect the branch name when not explicitly provided."""
+    if branch_name:
+        return branch_name
+
+    if not json:
+        log_info("Branch name not provided, attempting auto-detection...")
+
+    from ..utils.path_utils import detect_execution_context, get_worktree_branch_name
+
+    worktree_path, detected_branch, is_worktree = detect_execution_context()
+    if is_worktree and detected_branch:
+        return detected_branch
+
+    try:
+        from ..config.settings import get_project_root
+
+        project_root = get_project_root()
+        branch = get_worktree_branch_name(project_root)
+        if branch:
+            return branch
+    except (FileNotFoundError, Exception):
+        pass
+
+    from pathlib import Path
+    current_path = Path.cwd()
+    if "worktrees" in str(current_path):
+        branch = get_worktree_branch_name(current_path)
+        if branch:
+            return branch
+
+    message = (
+        "Could not detect branch name. Please specify branch_name as argument or use --domain "
+        "to auto-detect from subdomain."
+    )
+    if json:
+        JSONOutput.print_error(message)
+    else:
+        from ..utils.logging import error_exit
+        error_exit(message)
+    return ""
+
+
+def resolve_droplet_name(branch_name: str, domain: Optional[str], json: bool) -> str:
+    """Resolve droplet name from branch/domain settings."""
+    if not domain:
+        if not json:
+            log_info(f"Using branch name '{branch_name}' as droplet name")
+        return branch_name
+
+    try:
+        from ..core.dns_manager import parse_domain
+
+        subdomain, _ = parse_domain(domain)
+        if not subdomain:
+            if not json:
+                log_info(
+                    f"Domain '{domain}' is a root domain (no subdomain), using branch name '{branch_name}' as droplet name"
+                )
+            return branch_name
+        if not json:
+            log_info(f"Using subdomain '{subdomain}' from domain '{domain}' as droplet name")
+        return subdomain
+    except ValueError:
+        if not json:
+            log_warning(f"Could not parse domain '{domain}', using branch name '{branch_name}' as droplet name")
+        return branch_name
+
+
+def resolve_host_to_ip(host: str, api_token: Optional[str] = None) -> str:
+    """Resolve host to IP: already-IP, domain (via DO when token present), DNS, or droplet id/name."""
+    import re
+    from ..utils.network import resolve_server_ip
+
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
+        return host
+
+    # Domain + token: resolve via DO only (subdomain = droplet name), no DNS fallback
+    if "." in host and api_token:
+        from ..core.dns_manager import parse_domain
+        subdomain, _ = parse_domain(host)
+        if subdomain:
+            droplet_commands = DropletCommands()
+            droplet_id, error = droplet_commands._resolve_droplet_identifier(subdomain, api_token)
+            if error:
+                raise ValueError(f"Could not resolve domain '{host}' (droplet name '{subdomain}'): {error}")
+            if droplet_id:
+                provider, _ = droplet_commands._get_provider(api_token)
+                if provider:
+                    droplet = provider.get_droplet(droplet_id)
+                    if droplet and droplet.ip_address:
+                        return droplet.ip_address
+                raise ValueError(f"No droplet or IP for '{subdomain}' (domain '{host}')")
+
+    # DNS (when no token or not domain-like)
+    try:
+        ip = resolve_server_ip(host)
+        if ip != host:
+            return ip
+    except Exception as exc:
+        log_warning(f"DNS lookup for '{host}' failed: {exc}")
+
+    # Droplet ID or name
+    droplet_commands = DropletCommands()
+    droplet_id, error = droplet_commands._resolve_droplet_identifier(host, api_token)
+    if error:
+        raise ValueError(f"Could not resolve '{host}': {error}")
+
+    provider, _ = droplet_commands._get_provider(api_token)
+    if not provider:
+        raise ValueError(f"Failed to create droplet provider: {error}")
+
+    droplet = provider.get_droplet(droplet_id)
+    if not droplet or not droplet.ip_address:
+        raise ValueError(f"Droplet {host} has no IP address")
+
+    return droplet.ip_address
+
+
+def parse_rsync_target_or_droplet(arg: str, api_token: Optional[str] = None) -> str:
+    """Parse rsync/connection target patterns and resolve to user@ip:path.
+
+    Supports:
+    - Full target: `user@host:path` → resolve host to IP, return user@ip:path
+    - Username + domain: `user@example.com` → resolve domain, return user@ip:/root
+    - Domain/IP + path: `example.com:/path` → return root@ip:path
+    - Domain/IP only: `example.com` → return root@ip:/root
+    - Droplet ID or name → resolve to IP, return root@ip:/root
+    """
+    # Full target format user@host:path
+    if '@' in arg and ':' in arg:
+        at_pos = arg.index('@')
+        colon_pos = arg.index(':')
+        if at_pos < colon_pos:
+            username = arg[:at_pos]
+            host = arg[at_pos + 1:colon_pos]
+            path = arg[colon_pos + 1:]
+            ip = resolve_host_to_ip(host, api_token)
+            return f"{username}@{ip}:{path}"
+
+    # Username + domain/IP
+    if '@' in arg and ':' not in arg:
+        username, host = arg.split('@', 1)
+        ip = resolve_host_to_ip(host, api_token)
+        return f"{username}@{ip}:/root"
+
+    # Domain/IP + path
+    if ':' in arg and '@' not in arg:
+        host, path = arg.rsplit(':', 1)
+        ip = resolve_host_to_ip(host, api_token)
+        return f"root@{ip}:{path}"
+
+    # Just host
+    ip = resolve_host_to_ip(arg, api_token)
+    return f"root@{ip}:/root"
+
+
+def log_creation_context(
+    droplet_name: str,
+    resolved_region: str,
+    resolved_size: str,
+    resolved_image: str,
+    ssh_keys: Optional[str],
+    tags: tuple,
+    containers: Optional[str],
+    exclude_deps: Optional[str],
+    json: bool,
+) -> None:
+    """Log droplet creation configuration."""
+    if json:
+        return
+    log_info("Starting droplet creation process...")
+    log_info("Droplet configuration:")
+    log_info(f"  Name: {droplet_name}")
+    log_info(f"  Region: {resolved_region}")
+    log_info(f"  Size: {resolved_size}")
+    log_info(f"  Image: {resolved_image}")
+    if ssh_keys:
+        log_info(f"  SSH Keys: {ssh_keys}")
+    if tags:
+        log_info(f"  Tags: {', '.join(tags)}")
+    if containers:
+        log_info(f"  Containers: {containers}")
+    if exclude_deps:
+        log_info(f"  Exclude Dependencies: {exclude_deps}")
+
+
+def load_and_merge_config(branch_name: str, cli_args: Dict[str, Any]) -> MergedConfig:
+    """Merge CLI arguments with stored droplet config.
+
+    Priority: CLI argument > stored config value > None.
+    Returns MergedConfig with merged dict, env_manager, and stored_config.
+    """
+    from ..core.environment_manager import EnvironmentManager
+    from ..config.settings import get_project_root
+
+    env_manager = EnvironmentManager(project_root=get_project_root())
+    stored_config = env_manager.get_droplet_config(branch_name or '')
+
+    result = dict(cli_args)
+
+    # String fields: CLI wins if truthy, else stored
+    for key in (
+        'region', 'size', 'image', 'ssh_keys', 'vpc_uuid',
+        'central_droplet_name', 'scp_target', 'containers', 'exclude_deps',
+    ):
+        if not result.get(key):
+            result[key] = stored_config.get(key)
+
+    # Empty-string fields: CLI wins if truthy, else stored or ''
+    for key in ('domain', 'ip', 'dns_token'):
+        if not result.get(key):
+            result[key] = stored_config.get(key) or ''
+
+    # Boolean fields: if CLI is falsy, parse stored string
+    for key in ('keep_package', 'prepare_server', 'resume', 'build', 'debug'):
+        if not result.get(key):
+            stored_val = stored_config.get(key)
+            if stored_val:
+                result[key] = str(stored_val).lower() in ('true', '1', 'yes')
+
+    # output_dir: only override if CLI is at the Click default
+    if result.get('output_dir') == './packages':
+        stored_dir = stored_config.get('output_dir')
+        if stored_dir:
+            result['output_dir'] = stored_dir
+
+    # tags: CLI tuple wins; stored is comma-separated string
+    if not result.get('tags'):
+        stored_tags = stored_config.get('tags')
+        if stored_tags:
+            result['tags'] = tuple(
+                t.strip() for t in stored_tags.split(',') if t.strip()
+            )
+
+    return MergedConfig(
+        config=result,
+        env_manager=env_manager,
+        stored_config=stored_config
+    )
+
+
+def attach_deploy_report_data(data: Dict[str, Any], deploy_report: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach shared deploy report metadata to JSON output payloads."""
+    if not deploy_report:
+        return data
+
+    for key in (
+        "disk_check",
+        "failure_category",
+        "source_manifest",
+        "drift_report",
+        "smoke_checks",
+    ):
+        if deploy_report.get(key) is not None:
+            data[key] = deploy_report.get(key)
+    data["recovery_attempted"] = deploy_report.get("recovery_attempted", False)
+    data["recovery_succeeded"] = deploy_report.get("recovery_succeeded", False)
+    data["stage_timings"] = deploy_report.get("stage_timings", {})
+    return data
+
+
+def resolve_existing_remote_target(
+    branch_name: str,
+    scp_target: Optional[str],
+    domain: Optional[str],
+    ip: Optional[str],
+    api_token: Optional[str],
+    json: bool,
+) -> Tuple[str, Optional[str], Optional[str], Optional[str], Dict[str, Any]]:
+    """Resolve stored config + CLI overrides to a concrete rsync/SSH target."""
+    cli_target = scp_target
+    cli_domain = domain or None
+
+    merged, _, stored_config = load_and_merge_config(
+        branch_name,
+        {
+            "scp_target": scp_target,
+            "domain": domain,
+            "ip": ip,
+            "dns_token": api_token or "",
+        },
+    )
+    scp_target = merged["scp_target"]
+    domain = merged["domain"] or None
+    ip = merged["ip"] or None
+    token = api_token or stored_config.get("dns_token")
+
+    if cli_target:
+        scp_target = cli_target
+        if not json:
+            log_info(f"Using rsync target from command line: {cli_target}")
+    elif cli_domain:
+        scp_target = cli_domain
+        if not json:
+            log_info(f"Using domain from command line: {cli_domain}")
+    elif domain:
+        scp_target = domain
+        if not json:
+            log_info(f"Using domain from config: {domain}")
+    elif ip:
+        scp_target = f"root@{ip}:/root"
+    elif not scp_target:
+        scp_target = stored_config.get("scp_target")
+        if scp_target and not json:
+            log_info(f"Using rsync target from config: {scp_target}")
+
+    if not scp_target:
+        raise ValueError("Rsync target required (--scp-target or --domain or --ip or stored config)")
+
+    resolved = parse_rsync_target_or_droplet(scp_target, token)
+    if resolved != scp_target and not json:
+        log_info(f"Resolved rsync target: {scp_target} → {resolved}")
+    return resolved, domain, ip, token, stored_config

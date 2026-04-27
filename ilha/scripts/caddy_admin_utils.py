@@ -57,3 +57,28 @@ def resolve_caddy_admin_url(
             return candidate.replace(hostname, ip_address)
 
     return candidate
+
+
+def build_http_to_https_redirect_route(domains: list[str]) -> dict:
+    """Build a Caddy JSON route that redirects HTTP requests to HTTPS.
+
+    The route must be ordered before reverse-proxy routes. It matches only
+    plain HTTP requests for real domains, preserving path and query string.
+    """
+    return {
+        "match": [
+            {
+                "host": domains,
+                "protocol": "http",
+            }
+        ],
+        "handle": [
+            {
+                "handler": "static_response",
+                "headers": {
+                    "Location": ["https://{http.request.host}{http.request.uri}"]
+                },
+                "status_code": 308,
+            }
+        ],
+    }

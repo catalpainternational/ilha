@@ -39,9 +39,9 @@ HOST_PORT_RANGES: Dict[str, tuple[int, int]] = {
 class EnvironmentManager:
     """Manages environment configuration for ilha CLI."""
     
-    def __init__(self, project_root: Optional[Path] = None):
+    def __init__(self, project_root: Optional[Path] = None) -> None:
         """Initialize environment manager.
-        
+
         Args:
             project_root: Project root directory. If None, uses get_project_root().
         """

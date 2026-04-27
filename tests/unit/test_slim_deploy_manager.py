@@ -238,8 +238,18 @@ def test_run_smoke_checks_retries_until_success(tmp_path: Path, monkeypatch):
             return 1, "", "connection refused"
         return 0, "", ""
 
-    def fake_local(*args, **kwargs):
+    def fake_local(cmd, timeout=10):
         calls["local"] += 1
+        argv = cmd if isinstance(cmd, list) else []
+        joined = " ".join(argv)
+        if "http://demo.example.com/accounts/login/" in joined:
+            return 0, (
+                "HTTP/1.1 308 Permanent Redirect\n"
+                "Location: https://demo.example.com/accounts/login/\n\n"
+            ), ""
+        if "-D" in joined and "-o -" in joined and "https://" in joined:
+            body = "x" * 300
+            return 0, f"HTTP/2 200\nContent-Type: text/html; charset=utf-8\n\n{body}", ""
         return 0, "", ""
 
     monkeypatch.setattr(mgr, "_remote_service_exists", lambda *a, **k: False)
@@ -258,7 +268,13 @@ def test_run_smoke_checks_retries_until_success(tmp_path: Path, monkeypatch):
     assert ok is True
     assert report["success"] is True
     assert calls["remote"] == 3
-    assert calls["local"] == 1
+    assert calls["local"] == 3  # HTTP redirect + HEAD + HTML GET for domain smoke
+    assert {check["name"] for check in report["checks"]} == {
+        "local_app",
+        "external_http_to_https_redirect",
+        "external_domain_head",
+        "external_domain_html",
+    }
 
 
 def test_run_smoke_checks_reports_failure(tmp_path: Path, monkeypatch):
@@ -279,6 +295,24 @@ def test_run_smoke_checks_reports_failure(tmp_path: Path, monkeypatch):
     assert report["success"] is False
     assert report["checks"][0]["name"] == "local_app"
     assert "web_logs_tail" not in report
+
+
+def test_http_redirect_probe_requires_https_location(tmp_path: Path, monkeypatch):
+    mgr = SlimDeployManager(project_root=tmp_path)
+
+    monkeypatch.setattr(
+        mgr,
+        "_run_local_text",
+        lambda *a, **k: (
+            0,
+            "HTTP/1.1 200 OK\nContent-Type: text/html\n\n",
+            "",
+        ),
+    )
+    ok, err = mgr._probe_http_redirects_to_https("demo.example.com")
+
+    assert ok is False
+    assert "expected HTTP redirect" in (err or "")
 
 
 def test_run_smoke_checks_failure_attaches_web_logs_when_probing_container(tmp_path: Path, monkeypatch):

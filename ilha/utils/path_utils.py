@@ -42,7 +42,7 @@ def get_worktree_branch_name(worktree_path: Optional[Path] = None) -> Optional[s
         branch_name = result.stdout.strip()
         if branch_name:
             return branch_name
-    except (subprocess.CalledProcessError, Exception):
+    except Exception:
         pass
 
     # Fallback: Extract branch name from directory path

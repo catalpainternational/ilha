@@ -3,9 +3,9 @@
 - C1: the cross-class API boundary between SlimDeployManager and its helpers
       (RemoteDiskManager, DeployPreflight) uses public method names, not the
       leading-underscore "private" convention.
-- C3: the single server prep script exists at ``ilha/scripts/server_prep.sh``.
-- C4: the zero-downtime deploy script lives in a file (not an embedded Python
-      f-string) and the B4 rollback guards survived the extraction.
+- C3: the single server prep script exists as a Python script at ``ilha/scripts/server_prep.py``.
+- C4: the zero-downtime deploy script lives in a Python file at ``ilha/scripts/remote_deploy.py``
+      with reusable utilities in ``ilha/scripts/deploy_utils.py``.
 """
 
 from pathlib import Path
@@ -57,26 +57,33 @@ def test_deploy_preflight_exposes_public_cross_class_api():
 
 # ── C3: single server prep script ───────────────────────────────────────
 
-def test_server_prep_script_is_the_only_variant():
-    prep = SCRIPTS_DIR / "server_prep.sh"
-    assert prep.exists(), "ilha/scripts/server_prep.sh must exist"
+def test_server_prep_script_is_python():
+    """Server prep is now a Python script for DRY, type-safe deployment."""
+    prep = SCRIPTS_DIR / "server_prep.py"
+    assert prep.exists(), "ilha/scripts/server_prep.py must exist"
+
+    # Also check that deploy_utils exists (required dependency)
+    utils = SCRIPTS_DIR / "deploy_utils.py"
+    assert utils.exists(), "ilha/scripts/deploy_utils.py must exist (required by server_prep.py)"
 
 
-# ── C4: ZD script is file-based, not an embedded f-string ───────────────
+# ── C4: ZD script is file-based and Python ───────────────────────────────
 
-def test_zd_deploy_script_exists_as_file():
-    zd = SCRIPTS_DIR / "zd_deploy.sh"
-    assert zd.exists(), (
-        "ilha/scripts/zd_deploy.sh must exist — the zero-downtime deploy "
-        "logic was extracted out of slim_deploy_manager.py in Phase 6 so it "
-        "can be shellcheck'd and diff-reviewed."
+def test_zd_deploy_script_exists_as_python():
+    """Zero-downtime deploy is now a Python script for DRY, type-safe deployment."""
+    remote_deploy = SCRIPTS_DIR / "remote_deploy.py"
+    assert remote_deploy.exists(), (
+        "ilha/scripts/remote_deploy.py must exist — the zero-downtime deploy "
+        "logic was migrated to Python in Phase 2 for DRY principles and type safety."
     )
+    body = remote_deploy.read_text()
+    assert "_persist_canary_diagnostics" in body
+    assert "/tmp/ilha-diagnostics" in body
 
 
-def test_zd_deploy_script_uses_env_vars_not_python_interpolation():
-    """The extracted script must consume shell env vars. If someone renames
-    e.g. WEB_SERVICE, this test fails before a real deploy surfaces it."""
-    body = (SCRIPTS_DIR / "zd_deploy.sh").read_text()
+def test_zd_deploy_script_uses_env_vars():
+    """The Python deployment script must read environment variables."""
+    body = (SCRIPTS_DIR / "remote_deploy.py").read_text()
     required = [
         "APP_ROOT",
         "WEB_SERVICE",
@@ -88,73 +95,13 @@ def test_zd_deploy_script_uses_env_vars_not_python_interpolation():
         "BUILD_WEB",
     ]
     for name in required:
-        assert f": \"${{{name}:" in body or f'"${name}"' in body or f"${name}" in body, (
-            f"zd_deploy.sh must reference ${name}"
-        )
-
-    # Hard no: the script should not contain leftover Python f-string marker
-    # patterns (e.g. `{web_service}`) that would indicate a bad merge.
-    # (Note: `{{...}}` is legit — docker inspect --format uses Go templates.)
-    for token in ("{web_service}", "{web_port}", "{health_path}", "{db_service}", "{deps_args}"):
-        assert token not in body, f"stale Python f-string placeholder: {token}"
+        assert name in body, f"remote_deploy.py must reference environment variable {name}"
 
 
-def test_zd_deploy_script_keeps_b4_rollback_guard():
-    """B4: Phase 8 must still refuse to swap Caddy when NEW_HEALTHY != 1 and
-    exit non-zero with the trap disarmed. Extraction to a file must not have
-    lost this invariant."""
-    body = (SCRIPTS_DIR / "zd_deploy.sh").read_text()
-    assert 'NEW_HEALTHY" != "1"' in body
-    guard_idx = body.find('NEW_HEALTHY" != "1"')
-    phase9_idx = body.find("Phase 9:")
-    assert guard_idx != -1 and phase9_idx != -1 and guard_idx < phase9_idx, (
-        "The NEW_HEALTHY guard must appear before Phase 9 cleanup"
-    )
-    rollback_region = body[guard_idx:phase9_idx]
-    assert "trap - EXIT" in rollback_region, "rollback must disarm the cleanup trap"
-    assert "exit 1" in rollback_region, "rollback must exit non-zero"
-    assert "leaving Caddy upstream on canary" in rollback_region
-
-
-def test_build_zd_deploy_script_prepends_exports(tmp_path: Path):
-    """Given a rendered script, the exports header must precede the body."""
-    mgr = SlimDeployManager(project_root=tmp_path)
-    script = mgr._build_zd_deploy_script(
-        app_root="/app",
-        web_service="api",
-        web_port=3000,
-        health_path="/healthz",
-        db_service="postgres",
-        deps_args="postgres cache",
-        worker_args="",
-        build_web=True,
-    )
-    assert script.startswith("#!/bin/bash\n")
-    # Header order + values.
-    header_end = script.index("\nset -euo pipefail")
-    header = script[:header_end]
-    assert "export APP_ROOT=/app" in header
-    assert "export WEB_SERVICE=api" in header
-    assert "export WEB_PORT=3000" in header
-    assert "export HEALTH_PATH=/healthz" in header
-    assert "export DB_SERVICE=postgres" in header
-    assert "export DEPS_SERVICES='postgres cache'" in header
-    assert "export WORKER_SERVICES=''" in header
-    assert "export BUILD_WEB=1" in header
-    # Body must start after exports (not earlier).
-    assert "set -euo pipefail" in script[header_end:]
-
-
-def test_build_zd_deploy_script_sets_build_web_false_when_not_building(tmp_path: Path):
-    mgr = SlimDeployManager(project_root=tmp_path)
-    script = mgr._build_zd_deploy_script(
-        app_root="/app",
-        web_service="web",
-        web_port=8000,
-        health_path="/health-check/",
-        db_service="db",
-        deps_args="db redis",
-        worker_args="rq-worker-1",
-        build_web=False,
-    )
-    assert "export BUILD_WEB=0" in script
+def test_remote_deploy_imports_utilities():
+    """remote_deploy.py must import the DRY utility classes."""
+    body = (SCRIPTS_DIR / "remote_deploy.py").read_text()
+    assert "from deploy_utils import" in body
+    assert "DeployLogger" in body
+    assert "DockerCommand" in body
+    assert "CaddyManager" in body

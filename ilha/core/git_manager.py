@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from ..config.settings import PROTECTED_BRANCHES, get_worktree_paths, get_project_root
+from ..exceptions import PrerequisiteError
 from ..utils.logging import log_info, log_success, log_warning, log_error
 from ..utils.validation import (
-    validate_branch_exists, 
-    validate_worktree_exists, 
+    validate_branch_exists,
+    validate_worktree_exists,
     validate_current_branch,
     validate_branch_merged,
     validate_branch_protection
@@ -49,10 +50,13 @@ class GitManager:
     def _validate_git_repo(self) -> None:
         """Validate we're in a git repository."""
         try:
-            subprocess.run(["git", "rev-parse", "--git-dir"], 
+            subprocess.run(["git", "rev-parse", "--git-dir"],
                           capture_output=True, check=True, cwd=self.project_root)
         except subprocess.CalledProcessError:
-            raise RuntimeError("Not in a git repository. Please run this command from the project root.")
+            raise PrerequisiteError(
+                message="Not in a git repository. Please run this command from the project root.",
+                error_code="not_git_repo"
+            )
     
     def get_current_branch(self) -> Optional[str]:
         """Get the current git branch name."""

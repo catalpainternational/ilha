@@ -22,14 +22,16 @@ Concise guidance for working with the ilha CLI: worktree-isolated Docker environ
 ## Command quick reference
 
 | Area | Commands |
-|------|----------|
+| ---- | -------- |
 | Setup | `ilha setup [--monkey-patch]` |
-| Lifecycle | `ilha create <branch>`, `ilha <branch> up -d`, `ilha <branch> down`, `ilha remove <branch>`, `ilha delete <branch>`, `ilha list` |
-| Compose | `ilha <branch> exec <service> <cmd>`, `ilha <branch> logs <service>`, `ilha <branch> ps`, `ilha <branch> run --rm <service> <cmd>` |
-| Django | `ilha <branch> exec web python manage.py migrate`, `ilha <branch> exec web python manage.py test`, `ilha <branch> exec web python manage.py shell`, `ilha <branch> exec web python manage.py collectstatic` |
-| Droplet | `ilha droplet deploy [branch] --domain <domain>`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy <id>`, `ilha droplet doctor [branch]`, `ilha droplet regions` |
-| Packages | `ilha packages export <branch>`, `ilha packages import <file> [--standalone] [--domain|--ip]` |
+| Lifecycle | `ilha create [branch]`, `ilha [branch] up -d`, `ilha [branch] down`, `ilha remove [branch]`, `ilha delete [branch]`, `ilha list` |
+| Compose | `ilha [branch] exec [service] [cmd]`, `ilha [branch] logs [service]`, `ilha [branch] ps`, `ilha [branch] run --rm [service] [cmd]` |
+| Django | `ilha [branch] exec web python manage.py migrate`, `ilha [branch] exec web python manage.py test`, `ilha [branch] exec web python manage.py shell`, `ilha [branch] exec web python manage.py collectstatic` |
+| Droplet | `ilha droplet deploy [branch] --domain [domain]`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy [id]`, `ilha droplet doctor [branch]`, `ilha droplet regions` |
+| Packages | `ilha packages export [branch]`, `ilha packages import [file] [--standalone] [--domain or --ip]` |
 | Proxy | `ilha start-proxy`, `ilha stop-proxy` |
+
+**Droplet deploy defaults (resilience):** `droplet deploy` ships **code only** (no local volume backup/restore unless `--restore-volumes`). Missing web images on the server trigger an **automatic** remote `docker compose build` unless `--no-build`. Use `--domain` for Caddy/TLS; `--ip` alone warns (IP-only routing). Fast redeploy: `--no-create --no-prepare --skip-volume-backup`. See repo README “Recommended flows”.
 
 For full options and deployment (DNS, VPC, code-only), see [references/commands.md](references/commands.md) or the repo [README](../../../README.md).
 

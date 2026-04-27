@@ -17,12 +17,14 @@ from typing import Dict, List, Optional
 
 try:
     from .caddy_admin_utils import (
+        build_http_to_https_redirect_route,
         default_caddy_admin_url,
         resolve_caddy_admin_url,
         running_in_container,
     )
 except ImportError:
     from caddy_admin_utils import (
+        build_http_to_https_redirect_route,
         default_caddy_admin_url,
         resolve_caddy_admin_url,
         running_in_container,
@@ -312,6 +314,9 @@ class CaddyDynamicConfig:
             }
         
         routes = []
+        if domains:
+            routes.append(build_http_to_https_redirect_route(domains))
+            logger.info(f"Added HTTP to HTTPS redirect for domains: {', '.join(domains)}")
         
         # Add routes for each container (specific routes first)
         for container in containers:

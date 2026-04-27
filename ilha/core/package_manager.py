@@ -260,9 +260,9 @@ class PackageManager:
                 "error": f"Unexpected error: {str(e)}"
             }
     
-    def import_package(self, package_path: Path, target_branch: str = None,
-                      restore_data: bool = True, standalone: bool = None,
-                      target_directory: Path = None, domain: Optional[str] = None,
+    def import_package(self, package_path: Path, target_branch: Optional[str] = None,
+                      restore_data: bool = True, standalone: Optional[bool] = None,
+                      target_directory: Optional[Path] = None, domain: Optional[str] = None,
                       ip: Optional[str] = None, debug: bool = False, non_interactive: bool = False) -> Dict[str, Any]:
         """Import package with automatic standalone detection.
         
@@ -356,7 +356,7 @@ class PackageManager:
         
         return (temp_extract_dir, package_dir, metadata)
     
-    def _normal_import(self, package_path: Path, target_branch: str = None,
+    def _normal_import(self, package_path: Path, target_branch: Optional[str] = None,
                       restore_data: bool = True, domain: Optional[str] = None,
                       ip: Optional[str] = None, debug: bool = False) -> Dict[str, Any]:
         """Import package to existing project as new worktree.

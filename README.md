@@ -177,7 +177,7 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 ### Droplet Management
 | Command | Description | Example |
 |---------|-------------|---------|
-| `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). No Python/git/ilha needed on server | `ilha droplet deploy --domain app.example.com` |
+| `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). Default ships **code only**; use `--restore-volumes` to copy local DB/volumes. Auto-builds the web image on the server when it is missing (unless `--no-build`). | `ilha droplet deploy staging --domain app.example.com --build` |
 | `droplet deploy --no-create` | Deploy to an existing server (skip droplet creation) | `ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root` |
 | `droplet put [branch]` | Update an existing deployment (code + config, zero-downtime) | `ilha droplet put staging` |
 | `droplet logs [branch]` | Tail Docker Compose logs from a remote droplet | `ilha droplet logs staging` or `ilha droplet logs -s web -f` |
@@ -208,7 +208,10 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 - `--domain` - Domain for HTTPS deployment
 - `--ip` - IP for HTTP-only deployment
 - `--dns-token` - DNS API token for domain management
-- `--build` - Rebuild Docker images on server
+- `--build` - Rebuild Docker images on server (`docker compose build` before app start)
+- `--no-build` - Never run a remote compose build; fail if the web image is missing (mutually exclusive with `--build`)
+- `--restore-volumes` - Backup local worktree volumes and restore them on the server (opt-in; avoids accidental DB password mismatches on fresh droplets)
+- `--force-password-reset` - After `--restore-volumes`, skip the Postgres password vs `.env` validation (dangerous)
 - `--debug` - Enable DEBUG mode on server
 - `--use-staging-certificates` - Use Let's Encrypt staging certificates
 
@@ -918,6 +921,17 @@ ilha droplet deploy staging --create-only --ssh-keys anders
 ilha droplet deploy staging --no-create --domain app.example.com
 ilha droplet deploy staging --no-create --scp-target root@1.2.3.4:/root
 ```
+
+**Recommended flows**
+- **First deploy to a new droplet** (domain + TLS + explicit build):  
+  `ilha droplet deploy <branch> --domain <fqdn> --ssh-keys <key> --region syd1 --size s-1vcpu-2gb --build`  
+  The CLI also **auto-runs** `docker compose build` when the web image is absent on the server (unless you pass `--no-build`).
+- **Fast redeploy** after server prep and images exist:  
+  `ilha droplet deploy <branch> --domain <fqdn> --no-create --no-prepare --skip-volume-backup`
+- **Ship local Postgres/Redis volumes** to the server (explicit):  
+  `ilha droplet deploy <branch> --domain <fqdn> --restore-volumes`  
+  After restore, ilha checks that Postgres accepts `POSTGRES_PASSWORD` from the merged `.env` before starting the app.
+- **`droplet put`** still defaults to syncing volumes + code for “update existing server” workflows.
 
 ### Update an Existing Deployment
 ```bash

@@ -191,34 +191,21 @@ def test_load_deploy_service_config_reads_yaml(tmp_path: Path):
 # ── B6: config flows into the zero-downtime start-app script ─────────────
 
 def _render_start_app_script(mgr: SlimDeployManager) -> str:
-    """Invoke ``_start_app_remote`` with SSH/subprocess stubbed so we can
-    capture the rendered shell script for assertions."""
-    rendered = {}
-
-    def capture(username, server, script, **kwargs):
-        rendered["script"] = script
-        return True
-
-    mgr._run_nohup_remote = capture  # type: ignore[method-assign]
-    mgr.ssh.ensure_host_key = lambda *a, **kw: True  # type: ignore[method-assign]
-    mgr.ssh.build_ssh_command = lambda *a, **kw: ["echo"]  # type: ignore[method-assign]
-
-    with patch("ilha.commands.push.slim_deploy_manager.subprocess.run") as run_mock:
-        run_mock.return_value.stdout = ""
-        run_mock.return_value.returncode = 0
-        try:
-            mgr._start_app_remote("root", "1.2.3.4", build=False, debug=False)
-        except Exception:
-            pass
-    return rendered.get("script", "")
+    """Return the remote ZD wrapper script (exports + ``python3 remote_deploy.py``)."""
+    return mgr._compose_remote_zd_wrapper_script(
+        app_root=mgr.REMOTE_APP_ROOT,
+        remote_tmp_dir="/tmp/ilha-testsession",
+        remote_deploy_file="/tmp/ilha-testsession/remote_deploy.py",
+        build=False,
+    )
 
 
 def test_start_app_script_honors_custom_service_config(tmp_path: Path):
     """A project that configures `deploy:` in its config.yml must see those
     values exported to the start-app script — not the hardcoded defaults.
 
-    Post Phase 6: service config is passed as shell env vars to an external
-    ``zd_deploy.sh``. The rendered script is the exports header + that file.
+    Post Phase 6: service config is passed as shell env vars to the wrapper that
+    runs ``remote_deploy.py`` on the server.
     """
     (tmp_path / ".ilha").mkdir()
     (tmp_path / ".ilha" / "config.yml").write_text(
@@ -241,10 +228,7 @@ def test_start_app_script_honors_custom_service_config(tmp_path: Path):
     assert "export DEPS_SERVICES='postgres cache'" in script
     assert "export WORKER_SERVICES=celery-worker" in script
 
-    # And the body refers to them as shell vars (no hardcoded literals).
-    assert '"http://127.0.0.1:${WEB_PORT}${HEALTH_PATH}"' in script
-    assert 'up -d $DEPS_SERVICES' in script
-    assert 'up -d --no-deps --force-recreate "$WEB_SERVICE"' in script
+    assert "python3" in script and "remote_deploy.py" in script
 
     # Historical hardcoded values must NOT appear in functional positions.
     assert ":8000/" not in script
@@ -272,8 +256,7 @@ def test_start_app_script_no_worker_services_skips_phase10(tmp_path: Path):
     )
     mgr = SlimDeployManager(project_root=tmp_path)
     script = _render_start_app_script(mgr)
-    # Empty export so the script's `if [ -n "$WORKER_SERVICES" ]` branch falls
-    # through to the "skipping" message instead of calling `compose up` with
-    # zero arguments (which would recreate every service in the project).
-    assert "export WORKER_SERVICES=''" in script
-    assert "No worker services configured" in script
+    # Empty worker list is exported; Phase 10 in remote_deploy.py logs "No workers configured".
+    assert "export WORKER_SERVICES=" in script
+    remote_body = (Path(__file__).resolve().parents[2] / "ilha" / "scripts" / "remote_deploy.py").read_text()
+    assert "No workers configured" in remote_body

@@ -212,3 +212,9 @@ test-results/
 .ilha/
 worktrees/
 packages/
+
+# Local git transfer bundles (not for VCS)
+*.bundle
+
+# Archived binary snapshots (keep README / scripts; omit large tarballs)
+ilha/scripts/archived/*.tar.gz

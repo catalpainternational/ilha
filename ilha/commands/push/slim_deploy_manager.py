@@ -30,7 +30,12 @@ from ...core.dns_manager import DNSManager, parse_domain, is_domain
 from ...core.droplet_manager import DropletInfo
 from ...core.environment_manager import EnvironmentManager
 from ...utils.checksum import calculate_file_checksum
+from ...utils.compose_external_volumes import (
+    compose_web_image_reference,
+    list_external_volume_host_names,
+)
 from ...utils.caddy_config import ensure_caddy_labels_and_network
+from ...utils.env_loader import load_env_file
 from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ...utils.logging import (
     log_info,
@@ -81,6 +86,8 @@ class SlimDeployManager:
     # Upper bound on rsync wall-clock time. Prevents a stalled SSH connection
     # from hanging the deploy indefinitely (Popen.wait has no built-in timeout).
     _RSYNC_MAX_WAIT_SEC = 1800
+    # Minimum bytes of HTML body for domain smoke (avoids empty Caddy-only 200s)
+    _SMOKE_HTML_MIN_BYTES = 256
 
     # Exclude heavy/non-runtime paths from deploy context by default
     _DEFAULT_DEPLOY_IGNORE = [
@@ -141,6 +148,8 @@ class SlimDeployManager:
             "smoke_checks": None,
             "recovery_attempted": False,
             "recovery_succeeded": False,
+            "notes": [],
+            "volume_backup_path": None,
         }
         self._last_failure_category: Optional[str] = None
 
@@ -165,6 +174,8 @@ class SlimDeployManager:
             "smoke_checks": None,
             "recovery_attempted": False,
             "recovery_succeeded": False,
+            "notes": [],
+            "volume_backup_path": None,
         }
 
     def _mark_stage_timing(self, stage: str, started_at: float) -> None:
@@ -197,6 +208,134 @@ class SlimDeployManager:
     def _is_enospc_line(cls, line: str) -> bool:
         lower = line.strip().lower()
         return any(marker in lower for marker in cls._ENOSPC_MARKERS)
+
+    def _note(self, message: str) -> None:
+        """Append a deploy report note and log in verbose mode."""
+        notes = self._last_report.setdefault("notes", [])
+        if isinstance(notes, list) and message not in notes:
+            notes.append(message)
+        log_info(message)
+
+    def _ensure_remote_external_volumes(
+        self, deploy_dir: Path, username: str, server: str
+    ) -> bool:
+        """Create declared ``external: true`` volumes on the remote host (idempotent)."""
+        compose = deploy_dir / "docker-compose.yml"
+        env_path = deploy_dir / ".env"
+        if not compose.exists() or not env_path.exists():
+            return True
+        env = load_env_file(env_path)
+        names = list_external_volume_host_names(compose, env)
+        if not names:
+            return True
+        log_step(f"Ensuring {len(names)} external Docker volume(s) on server")
+        self.ssh.ensure_host_key(server)
+        for vol_name in names:
+            vq = shlex.quote(vol_name)
+            cmd = self.ssh.build_ssh_command(
+                username, server, f"docker volume inspect {vq} >/dev/null 2>&1 || docker volume create {vq}"
+            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            if result.returncode != 0:
+                log_error(
+                    f"Failed to ensure external volume {vol_name!r}: "
+                    f"{(result.stderr or result.stdout or '').strip()}"
+                )
+                self._set_failure(
+                    error_code="external_volume_create_failed",
+                    stage="remote_prepare",
+                    root_cause=f"Could not create external Docker volume {vol_name!r} on the server.",
+                    suggested_actions=[
+                        "SSH to the server and run: docker volume create <name>",
+                        "Check Docker permissions and disk space.",
+                    ],
+                    failure_category="remote_setup_error",
+                )
+                return False
+        log_success("External Docker volumes are present on server")
+        return True
+
+    def _remote_docker_image_exists(
+        self, username: str, server: str, image: str
+    ) -> bool:
+        """Return True if *image* exists on the remote Docker host."""
+        if not (image or "").strip():
+            return True
+        iq = shlex.quote(image.strip())
+        cmd = self.ssh.build_ssh_command(
+            username, server, f"docker image inspect {iq} >/dev/null 2>&1"
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        return result.returncode == 0
+
+    def _ssh_reachable(self, username: str, server: str) -> bool:
+        cmd = self.ssh.build_ssh_command(username, server, "true")
+        cmd.insert(1, "-o")
+        cmd.insert(2, "BatchMode=yes")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return result.returncode == 0
+
+    def _validate_restored_postgres_password(
+        self,
+        username: str,
+        server: str,
+        *,
+        force_password_reset: bool,
+    ) -> bool:
+        """Verify Postgres accepts POSTGRES_PASSWORD from ``/app/.env`` after volume restore."""
+        if force_password_reset:
+            self._note("Skipping Postgres password validation (--force-password-reset).")
+            return True
+        script = r"""set -euo pipefail
+cd /app
+set -a
+[ -f .env ] && source .env
+set +a
+docker compose --env-file .env up -d db
+for i in $(seq 1 90); do
+  if docker compose --env-file .env exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if ! docker compose --env-file .env exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
+  echo "PG_NOT_READY" >&2
+  exit 2
+fi
+if ! docker compose --env-file .env exec -T -e PGPASSWORD="${POSTGRES_PASSWORD:-}" db \
+  psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" -h 127.0.0.1 -c "select 1" >/dev/null 2>&1; then
+  echo "PG_AUTH_OR_CONN_FAILED" >&2
+  exit 3
+fi
+echo OK
+"""
+        code, out, err = self._run_remote_text(username, server, script, timeout=180)
+        if code == 0:
+            log_success("Postgres password matches deployed .env after volume restore")
+            return True
+        log_error(
+            "Postgres credential check failed after volume restore. "
+            "Restored data may not match POSTGRES_PASSWORD in the merged .env."
+        )
+        if err.strip():
+            log_error(f"  Remote stderr: {err.strip()[:800]}")
+        self._set_failure(
+            error_code="postgres_password_mismatch",
+            stage="restore",
+            root_cause=(
+                "Restored Postgres volume does not accept POSTGRES_PASSWORD from the deployed .env."
+            ),
+            suggested_actions=[
+                "Re-align the DB role password with .env on the server, or deploy without "
+                "`--restore-volumes` so Postgres initializes fresh.",
+                "If you intentionally reset DB passwords, re-run with --force-password-reset.",
+            ],
+            failure_category="remote_data_error",
+        )
+        return False
 
     @staticmethod
     def _safe_int(value: str, default: int = 0) -> int:
@@ -358,6 +497,78 @@ class SlimDeployManager:
         self._last_report["drift_report"] = result["drift_report"]
         return result
 
+    def _probe_external_domain_html(self, domain: str) -> Tuple[bool, Optional[str]]:
+        """GET ``https://<domain>/`` and require ``text/html`` plus a non-trivial body."""
+        url = f"https://{domain}/"
+        code, out, err = self._run_local_text(
+            [
+                "curl",
+                "-kfsS",
+                "--max-time",
+                "15",
+                "-D",
+                "-",
+                "-o",
+                "-",
+                url,
+            ],
+            timeout=25,
+        )
+        if code != 0:
+            return False, (err or out or "curl failed").strip()[:800] or None
+        sep = "\r\n\r\n"
+        if sep not in out:
+            sep = "\n\n"
+        if sep not in out:
+            return False, "malformed HTTP response (no header/body separator)"
+        headers, body = out.split(sep, 1)
+        lower = headers.lower()
+        if "content-type:" not in lower or "text/html" not in lower:
+            return False, f"expected Content-Type text/html; got headers excerpt: {headers[:400]!r}"
+        if len(body.strip()) < self._SMOKE_HTML_MIN_BYTES:
+            return False, (
+                f"HTML body too small ({len(body)} bytes, minimum {self._SMOKE_HTML_MIN_BYTES})"
+            )
+        return True, None
+
+    def _probe_http_redirects_to_https(self, domain: str) -> Tuple[bool, Optional[str]]:
+        """Verify plain HTTP for a domain redirects to HTTPS."""
+        url = f"http://{domain}/accounts/login/"
+        code, out, err = self._run_local_text(
+            [
+                "curl",
+                "-fsSI",
+                "--max-time",
+                "10",
+                "--max-redirs",
+                "0",
+                url,
+            ],
+            timeout=15,
+        )
+        if code not in (0, 22):
+            return False, (err or out or "curl failed").strip()[:800] or None
+
+        status_line = next(
+            (line.strip() for line in out.splitlines() if line.startswith("HTTP/")),
+            "",
+        )
+        location = next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in out.splitlines()
+                if line.lower().startswith("location:")
+            ),
+            "",
+        )
+        redirect_statuses = ("301", "302", "307", "308")
+        if not any(f" {status} " in f"{status_line} " for status in redirect_statuses):
+            return False, f"expected HTTP redirect to HTTPS, got {status_line or 'no HTTP status'}"
+        expected_prefix = f"https://{domain}/"
+        if not location.startswith(expected_prefix):
+            return False, f"expected Location to start with {expected_prefix}, got {location!r}"
+        return True, None
+
     def _run_smoke_checks(
         self,
         *,
@@ -399,23 +610,51 @@ class SlimDeployManager:
             }
 
             external_result = None
+            redirect_result = None
+            external_html_result = None
             external_ok = True
+            redirect_ok = True
+            external_html_ok = True
             if local_ok and external_url:
+                redirect_ok, redirect_err = self._probe_http_redirects_to_https(domain)
+                redirect_result = {
+                    "name": "external_http_to_https_redirect",
+                    "target": f"http://{domain}/accounts/login/",
+                    "attempt": attempt,
+                    "success": redirect_ok,
+                    "error": redirect_err,
+                }
                 external_code, _, external_err = self._run_local_text(
                     ["curl", "-kfsSI", "--max-time", "5", external_url],
                     timeout=10,
                 )
                 external_ok = external_code == 0
                 external_result = {
-                    "name": "external_domain",
+                    "name": "external_domain_head",
                     "target": external_url,
                     "attempt": attempt,
                     "success": external_ok,
                     "error": external_err.strip() or None,
                 }
+                if external_ok and domain:
+                    html_ok, html_err = self._probe_external_domain_html(domain)
+                    external_html_ok = html_ok
+                    external_html_result = {
+                        "name": "external_domain_html",
+                        "target": external_url,
+                        "attempt": attempt,
+                        "success": html_ok,
+                        "error": html_err,
+                    }
 
-            checks = [local_result] + ([external_result] if external_result else [])
-            if local_ok and external_ok:
+            checks = [local_result]
+            if redirect_result is not None:
+                checks.append(redirect_result)
+            if external_result is not None:
+                checks.append(external_result)
+            if external_html_result is not None:
+                checks.append(external_html_result)
+            if local_ok and redirect_ok and external_ok and external_html_ok:
                 report = {
                     "success": True,
                     "path": smoke_path,
@@ -565,6 +804,9 @@ class SlimDeployManager:
         strict_env_contract: bool = True,
         smoke_timeout: int = 60,
         expected_ssh_fingerprint: Optional[str] = None,
+        restore_volumes: bool = False,
+        no_build: bool = False,
+        force_password_reset: bool = False,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
@@ -630,6 +872,9 @@ class SlimDeployManager:
                     skip_volume_backup=skip_volume_backup,
                     smoke_path=preflight["smoke_path"],
                     smoke_timeout=smoke_timeout,
+                    restore_volumes=restore_volumes,
+                    no_build=no_build,
+                    force_password_reset=force_password_reset,
                 )
                 if success:
                     self._last_report["success"] = True
@@ -671,9 +916,18 @@ class SlimDeployManager:
         skip_volume_backup: bool,
         smoke_path: str,
         smoke_timeout: int = 60,
+        restore_volumes: bool = False,
+        no_build: bool = False,
+        force_password_reset: bool = False,
     ) -> bool:
         deploy_dir: Optional[Path] = None
         try:
+            if ip and not domain:
+                print_plain(
+                    "[ilha] Warning: deploy with --ip and no --domain configures Caddy for IP-only access; "
+                    "HTTPS and hostname routing for your app domain will not be set up. "
+                    "Pass --domain <fqdn> for domain routing and TLS."
+                )
             stage_started = time.time()
             log_step("Preparing server, DNS, and assembly")
             with ThreadPoolExecutor(max_workers=3) as executor:
@@ -760,13 +1014,28 @@ class SlimDeployManager:
                     self.disk.print_disk_recovery_guidance(username, server)
                     return False
 
+            if not self._ensure_remote_external_volumes(deploy_dir, username, server):
+                return False
+
             stage_started = time.time()
             volume_tar = None
-            if skip_volume_backup:
-                log_info("Skipping local volume backup (--skip-volume-backup)")
-            else:
+            if restore_volumes and not skip_volume_backup:
                 log_step("Backing up volumes")
                 volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+                if volume_tar:
+                    self._last_report["volume_backup_path"] = str(volume_tar)
+            elif restore_volumes and skip_volume_backup:
+                print_plain(
+                    "[ilha] Warning: --restore-volumes with --skip-volume-backup skips local backup; "
+                    "remote restore only runs if a backup archive already exists under /app/volumes/."
+                )
+            elif skip_volume_backup:
+                log_info("Skipping local volume backup (--skip-volume-backup)")
+            else:
+                log_info(
+                    "Skipping local volume backup (default for `droplet deploy`). "
+                    "Pass --restore-volumes to copy worktree Docker volumes to the server."
+                )
             self._mark_stage_timing("volume_backup", stage_started)
 
             log_step("Syncing code to server")
@@ -782,6 +1051,40 @@ class SlimDeployManager:
                 )
                 return False
             self._mark_stage_timing("transfer", stage_started)
+
+            compose_env = load_env_file(deploy_dir / ".env")
+            web_image = compose_web_image_reference(
+                deploy_dir / "docker-compose.yml",
+                compose_env,
+                self.services.web_service,
+            )
+            image_exists = (
+                self._remote_docker_image_exists(username, server, web_image)
+                if web_image
+                else True
+            )
+            if web_image and not image_exists and no_build:
+                self._set_failure(
+                    error_code="missing_remote_image",
+                    stage="transfer",
+                    root_cause=(
+                        f"Docker image {web_image!r} is not present on the server and "
+                        "`--no-build` was set."
+                    ),
+                    suggested_actions=[
+                        "Run a deploy with `--build`, or remove `--no-build` to allow an automatic first-time build.",
+                        "Or build/push the image to the server registry before deploying.",
+                    ],
+                    failure_category="remote_setup_error",
+                )
+                return False
+            auto_build_missing = bool(web_image) and not image_exists and not no_build and not build
+            if auto_build_missing:
+                msg = (
+                    f"Remote image {web_image!r} not found; will run `docker compose build` "
+                    "before starting the app."
+                )
+                self._note(msg)
 
             stage_started = time.time()
             restore_ok = True
@@ -809,22 +1112,6 @@ class SlimDeployManager:
                     elif key == "caddy" and not ok:
                         log_warning("Caddy start had issues, but continuing with app services...")
 
-            # Phase 2: build (only if restore succeeded — build may depend on restored volumes)
-            if build and restore_ok:
-                log_step("Running Docker build")
-                try:
-                    build_ok = self._build_remote(username, server, debug)
-                except Exception as exc:
-                    log_error(f"Docker build failed: {exc}")
-                    build_ok = False
-                if not build_ok:
-                    log_warning("Docker build had issues, but continuing with app start...")
-            elif build and not restore_ok:
-                log_warning("Skipping Docker build because volume restore failed")
-                build_ok = False
-
-            self._mark_stage_timing("remote_prepare", stage_started)
-
             if not restore_ok:
                 self._set_failure(
                     error_code="volume_restore_failed",
@@ -834,20 +1121,49 @@ class SlimDeployManager:
                     failure_category="remote_data_error",
                 )
                 return False
-            if build and not build_ok and self._last_failure_category == "disk_full":
+
+            if volume_tar and not self._validate_restored_postgres_password(
+                username, server, force_password_reset=force_password_reset
+            ):
                 return False
+
+            should_compose_build = restore_ok and (bool(build) or auto_build_missing)
+            if should_compose_build:
+                log_step("Running Docker build")
+                try:
+                    build_ok = self._build_remote(username, server, debug)
+                except Exception as exc:
+                    log_error(f"Docker build failed: {exc}")
+                    build_ok = False
+                if not build_ok:
+                    self._set_failure(
+                        error_code="compose_build_failed",
+                        stage="remote_prepare",
+                        root_cause="Remote `docker compose build` did not complete successfully.",
+                        suggested_actions=[
+                            "Inspect the remote build log under /tmp/ilha-*.log",
+                            "Free disk space if ENOSPC appears, then retry.",
+                        ],
+                        failure_category=self._last_failure_category or "remote_setup_error",
+                    )
+                    return False
+
+            self._mark_stage_timing("remote_prepare", stage_started)
 
             log_step("Starting application")
             stage_started = time.time()
-            if not self._start_app_remote(username, server, build=build, debug=debug):
+            if not self._start_app_remote(username, server, build=False, debug=debug):
                 if self._last_failure_category != "disk_full":
                     self._set_failure(
                         error_code="app_start_failed",
                         stage="start_app",
                         root_cause="Failed to start application services on the server.",
-                        suggested_actions=["Inspect remote logs under /tmp/ilha-*.log and docker compose ps output."],
+                        suggested_actions=[
+                            "Inspect remote logs under /tmp/ilha-*.log and docker compose ps output.",
+                            "If canary failed, check /tmp/ilha-diagnostics/ on the server for captured logs.",
+                        ],
                         failure_category="remote_runtime_error",
-                )
+                    )
                 return False
             self._mark_stage_timing("app_start", stage_started)
 
@@ -1607,23 +1923,65 @@ echo "Volume restore complete"
     # Internal: server prep (slim)
     # ──────────────────────────────────────────────────────────────────
     def _prepare_server_slim(self, username: str, server: str) -> bool:
-        """Run the slim server preparation script (Docker-only)."""
+        """Run the slim server preparation script (Docker-only) via Python."""
         log_info("Running slim server preparation (Docker + firewall only)...")
         self.ssh.ensure_host_key(server)
 
-        script_path = get_script_dir() / "scripts" / "server_prep.sh"
-        if not script_path.exists():
-            log_error(f"Slim prep script not found: {script_path}")
+        script_dir = get_script_dir() / "scripts"
+        server_prep_path = script_dir / "server_prep.py"
+        deploy_utils_path = script_dir / "deploy_utils.py"
+
+        if not server_prep_path.exists():
+            log_error(f"Slim prep script not found: {server_prep_path}")
+            return False
+        if not deploy_utils_path.exists():
+            log_error(f"Deploy utilities not found: {deploy_utils_path}")
             return False
 
-        script = script_path.read_text()
-        tmp_script = self._remote_tmp("prep.sh")
-        q = shlex.quote(tmp_script)
-        exec_cmd = f"cat > {q} && chmod +x {q} && {q} && rm -f {q}"
+        # Upload both files to remote /tmp directory
+        remote_tmp_dir = f"/tmp/ilha-{self._session_id}"
+        remote_prep_path = f"{remote_tmp_dir}/server_prep.py"
+        remote_utils_path = f"{remote_tmp_dir}/deploy_utils.py"
+
+        # Create remote tmp directory
+        mkdir_cmd = self.ssh.build_ssh_command(
+            username, server, f"mkdir -p {remote_tmp_dir}"
+        )
+        result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            log_error(f"Failed to create remote temp directory: {result.stderr}")
+            return False
+
+        # Upload deploy_utils.py first (it's a dependency)
+        utils_content = deploy_utils_path.read_text()
+        upload_utils_cmd = self.ssh.build_ssh_command(
+            username, server, f"cat > {shlex.quote(remote_utils_path)}"
+        )
+        result = subprocess.run(
+            upload_utils_cmd, input=utils_content, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            log_error(f"Failed to upload deploy_utils.py: {result.stderr}")
+            return False
+
+        # Upload server_prep.py
+        prep_content = server_prep_path.read_text()
+        upload_prep_cmd = self.ssh.build_ssh_command(
+            username, server, f"cat > {shlex.quote(remote_prep_path)}"
+        )
+        result = subprocess.run(
+            upload_prep_cmd, input=prep_content, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            log_error(f"Failed to upload server_prep.py: {result.stderr}")
+            return False
+
+        # Execute server_prep.py with PYTHONPATH set to find deploy_utils
+        exec_cmd = f"cd {remote_tmp_dir} && PYTHONPATH={remote_tmp_dir} python3 {shlex.quote(remote_prep_path)}"
         ssh_cmd = self.ssh.build_ssh_command(username, server, exec_cmd)
 
         success, stdout_lines, stderr_lines = execute_with_streaming(
-            ssh_cmd, script=script, timeout=None, progress_interval=15, prefix="  "
+            ssh_cmd, timeout=None, progress_interval=15, prefix="  "
         )
 
         if not success:
@@ -1655,36 +2013,10 @@ echo "Volume restore complete"
     # ──────────────────────────────────────────────────────────────────
     # Internal: rsync
     # ──────────────────────────────────────────────────────────────────
-    def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
-        """rsync the deploy directory to the server."""
-        log_info(f"Transferring deploy directory to {server}:{self.REMOTE_APP_ROOT}/ ...")
-
-        # Ensure remote directory exists
-        mkdir_cmd = self.ssh.build_ssh_command(
-            username, server, f"mkdir -p {self.REMOTE_APP_ROOT}"
-        )
-        mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=45)
-        if mkdir_result.returncode != 0:
-            log_error(f"Failed to create remote directory {self.REMOTE_APP_ROOT}: {mkdir_result.stderr.strip()}")
-            return False
-
-        # rsync with compression (reuse SSH connection from mkdir via same ControlPath)
-        cmd = [
-            "rsync",
-            "-avz",
-            "--progress",
-            "--delete-delay",
-            "--partial",
-            "--inplace",
-            "-e", self.ssh.get_rsync_ssh_command(username, server),
-            f"{deploy_dir}/",
-            f"{username}@{server}:{self.REMOTE_APP_ROOT}/",
-        ]
-        if is_verbose():
-            log_info(f"Running rsync ({_dir_size_mb(deploy_dir):.1f} MB)...")
-        else:
-            log_info("Running rsync...")
-
+    def _rsync_streaming_once(
+        self, cmd: List[str]
+    ) -> Tuple[bool, int, List[str]]:
+        """Run rsync with progress streaming. Returns (timed_out, returncode, out_lines)."""
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1698,6 +2030,7 @@ echo "Volume restore complete"
         deadline = time.time() + self._RSYNC_MAX_WAIT_SEC
         timed_out = False
         try:
+            assert process.stdout is not None
             for line in iter(process.stdout.readline, ""):
                 if time.time() > deadline:
                     timed_out = True
@@ -1724,23 +2057,59 @@ echo "Volume restore complete"
                         process.wait(timeout=30)
                     except subprocess.TimeoutExpired:
                         pass
+        return timed_out, int(process.returncode or 0), out_lines
 
-        if timed_out:
-            log_error(f"rsync exceeded {self._RSYNC_MAX_WAIT_SEC}s deadline — killed")
-            for line in out_lines[-20:]:
-                if line.strip():
-                    log_error(f"  {line}")
+    def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
+        """rsync the deploy directory to the server."""
+        log_info(f"Transferring deploy directory to {server}:{self.REMOTE_APP_ROOT}/ ...")
+
+        # Ensure remote directory exists
+        mkdir_cmd = self.ssh.build_ssh_command(
+            username, server, f"mkdir -p {self.REMOTE_APP_ROOT}"
+        )
+        mkdir_result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=45)
+        if mkdir_result.returncode != 0:
+            log_error(f"Failed to create remote directory {self.REMOTE_APP_ROOT}: {mkdir_result.stderr.strip()}")
             return False
 
-        if process.returncode != 0:
-            log_error(f"rsync failed (exit {process.returncode})")
+        cmd = [
+            "rsync",
+            "-avz",
+            "--progress",
+            "--delete-delay",
+            "--partial",
+            "--inplace",
+            "-e", self.ssh.get_rsync_ssh_command(username, server),
+            f"{deploy_dir}/",
+            f"{username}@{server}:{self.REMOTE_APP_ROOT}/",
+        ]
+        if is_verbose():
+            log_info(f"Running rsync ({_dir_size_mb(deploy_dir):.1f} MB)...")
+        else:
+            log_info("Running rsync...")
+
+        for attempt in (1, 2):
+            if attempt > 1:
+                log_info("Retrying rsync after exit 255 (unexpected end of file)...")
+            timed_out, code, out_lines = self._rsync_streaming_once(cmd)
+            if timed_out:
+                log_error(f"rsync exceeded {self._RSYNC_MAX_WAIT_SEC}s deadline — killed")
+                for line in out_lines[-20:]:
+                    if line.strip():
+                        log_error(f"  {line}")
+                return False
+            if code == 0:
+                log_success("Transfer complete")
+                return True
+            if code == 255 and attempt == 1 and self._ssh_reachable(username, server):
+                log_warning("rsync exited 255; SSH still reachable — retrying once.")
+                continue
+            log_error(f"rsync failed (exit {code})")
             for line in out_lines[-20:]:
                 if line.strip() and ("%" not in line and "speedup" not in line.lower()):
                     log_error(f"  {line}")
             return False
-
-        log_success("Transfer complete")
-        return True
+        return False
 
     def _rsync_volumes_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
         """Rsync only deploy_dir/volumes/ to REMOTE_VOLUMES_DIR on the server."""
@@ -2031,47 +2400,38 @@ echo "Build complete"
             debug=debug,
         )
 
-    def _build_zd_deploy_script(
+    def _compose_remote_zd_wrapper_script(
         self,
         *,
         app_root: str,
-        web_service: str,
-        web_port: int,
-        health_path: str,
-        db_service: str,
-        deps_args: str,
-        worker_args: str,
-        build_web: bool,
+        remote_tmp_dir: str,
+        remote_deploy_file: str,
+        build: bool,
     ) -> str:
-        """Load the versioned zero-downtime script and prepend env exports.
-
-        The script body lives in ``ilha/scripts/zd_deploy.sh`` so it can be
-        shellcheck-ed, diffed, and covered by focused tests. The Python side
-        only decides which values get exported — no f-string surgery on bash.
-        """
-        from ...config.settings import get_script_dir
-
-        script_path = get_script_dir() / "scripts" / "zd_deploy.sh"
-        body = script_path.read_text()
-        # Strip the shebang from the loaded body; we rebuild the header with
-        # the exports so the shebang stays first.
-        if body.startswith("#!/"):
-            body = body.split("\n", 1)[1] if "\n" in body else ""
-        header = "\n".join([
-            "#!/bin/bash",
-            f"export APP_ROOT={shlex.quote(app_root)}",
-            f"export WEB_SERVICE={shlex.quote(web_service)}",
-            f"export WEB_PORT={shlex.quote(str(web_port))}",
-            f"export HEALTH_PATH={shlex.quote(health_path)}",
-            f"export DB_SERVICE={shlex.quote(db_service)}",
-            # DEPS_SERVICES and WORKER_SERVICES are pre-quoted space-separated
-            # lists that the remote script intentionally word-splits.
-            f"export DEPS_SERVICES={shlex.quote(deps_args)}",
-            f"export WORKER_SERVICES={shlex.quote(worker_args)}",
-            f"export BUILD_WEB={'1' if build_web else '0'}",
-            "",
-        ])
-        return header + body
+        """Shell wrapper that exports service config and runs ``remote_deploy.py`` on the server."""
+        web_service = self.services.web_service
+        web_port = self.services.web_port
+        health_path = self.services.health_path
+        db_service = self.services.db_service
+        deps_args = " ".join(shlex.quote(s) for s in self.services.dependency_services)
+        worker_args = " ".join(shlex.quote(s) for s in self.services.worker_services)
+        return "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                f"export APP_ROOT={shlex.quote(app_root)}",
+                f"export WEB_SERVICE={shlex.quote(web_service)}",
+                f"export WEB_PORT={shlex.quote(str(web_port))}",
+                f"export HEALTH_PATH={shlex.quote(health_path)}",
+                f"export DB_SERVICE={shlex.quote(db_service)}",
+                f"export DEPS_SERVICES={shlex.quote(deps_args)}",
+                f"export WORKER_SERVICES={shlex.quote(worker_args)}",
+                f"export BUILD_WEB={'1' if build else '0'}",
+                f"export PYTHONPATH={remote_tmp_dir}:${{PYTHONPATH:-}}",
+                f"cd {remote_tmp_dir}",
+                f"python3 {shlex.quote(remote_deploy_file)}",
+            ]
+        )
 
     def _start_app_remote(self, username: str, server: str, build: bool = False, debug: bool = False) -> bool:
         """Start application services on the server via nohup + poll.
@@ -2097,28 +2457,65 @@ echo "Build complete"
             f"App start watchdog: {start_max_wait}s "
             f"({'includes embedded compose build web' if build else 'no embedded image build'})"
         )
-        web_service = self.services.web_service
-        web_port = self.services.web_port
-        health_path = self.services.health_path
-        db_service = self.services.db_service
-        deps_args = " ".join(shlex.quote(s) for s in self.services.dependency_services)
-        # Empty worker_services ⇒ the script's Phase 10 branch logs "skipping"
-        # instead of running a no-arg `docker compose up` that would recreate
-        # every service in the project.
-        worker_args = " ".join(shlex.quote(s) for s in self.services.worker_services)
-        script = self._build_zd_deploy_script(
-            app_root=app_root,
-            web_service=web_service,
-            web_port=web_port,
-            health_path=health_path,
-            db_service=db_service,
-            deps_args=deps_args,
-            worker_args=worker_args,
-            build_web=build,
+        # Upload remote_deploy.py and deploy_utils.py to remote /tmp
+        script_dir = get_script_dir() / "scripts"
+        remote_deploy_path = script_dir / "remote_deploy.py"
+        deploy_utils_path = script_dir / "deploy_utils.py"
+
+        if not remote_deploy_path.exists():
+            log_error(f"Remote deploy script not found: {remote_deploy_path}")
+            return False
+        if not deploy_utils_path.exists():
+            log_error(f"Deploy utilities not found: {deploy_utils_path}")
+            return False
+
+        remote_tmp_dir = f"/tmp/ilha-{self._session_id}"
+        remote_deploy_file = f"{remote_tmp_dir}/remote_deploy.py"
+        remote_utils_file = f"{remote_tmp_dir}/deploy_utils.py"
+
+        # Create remote tmp directory
+        mkdir_cmd = self.ssh.build_ssh_command(
+            username, server, f"mkdir -p {remote_tmp_dir}"
         )
+        result = subprocess.run(mkdir_cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            log_error(f"Failed to create remote temp directory: {result.stderr}")
+            return False
+
+        # Upload deploy_utils.py first (it's a dependency)
+        utils_content = deploy_utils_path.read_text()
+        upload_utils_cmd = self.ssh.build_ssh_command(
+            username, server, f"cat > {shlex.quote(remote_utils_file)}"
+        )
+        result = subprocess.run(
+            upload_utils_cmd, input=utils_content, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            log_error(f"Failed to upload deploy_utils.py: {result.stderr}")
+            return False
+
+        # Upload remote_deploy.py
+        deploy_content = remote_deploy_path.read_text()
+        upload_deploy_cmd = self.ssh.build_ssh_command(
+            username, server, f"cat > {shlex.quote(remote_deploy_file)}"
+        )
+        result = subprocess.run(
+            upload_deploy_cmd, input=deploy_content, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            log_error(f"Failed to upload remote_deploy.py: {result.stderr}")
+            return False
+
+        wrapper_script = self._compose_remote_zd_wrapper_script(
+            app_root=app_root,
+            remote_tmp_dir=remote_tmp_dir,
+            remote_deploy_file=remote_deploy_file,
+            build=build,
+        )
+
         log_file = self._remote_tmp("start-app.log")
         ok = self._run_nohup_remote(
-            username, server, script,
+            username, server, wrapper_script,
             script_path=self._remote_tmp("start-app.sh"),
             log_file=log_file,
             label="App start",
@@ -2129,6 +2526,7 @@ echo "Build complete"
         if not ok:
             return False
         # Verify web service container exists and is running
+        web_service = self.services.web_service
         web_cid_cmd = self.ssh.build_ssh_command(
             username, server,
             f"cd {app_root} && docker compose --env-file .env ps -q {shlex.quote(web_service)} 2>/dev/null | head -1",

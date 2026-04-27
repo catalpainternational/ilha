@@ -24,6 +24,7 @@ from ..config.settings import (
     sanitize_project_name,
     POSTGRES_VOLUME_SUFFIX,
 )
+from ..exceptions import PrerequisiteError
 from ..utils.logging import log_info, log_success, log_warning, log_error, show_progress
 from ..utils.file_utils import ensure_entrypoint_executable
 from ..utils.validation import (
@@ -59,7 +60,10 @@ class DockerManager:
     def _validate_docker(self) -> None:
         """Validate Docker is running."""
         if not validate_docker_running():
-            raise RuntimeError("Docker is not running. Please start Docker and try again.")
+            raise PrerequisiteError(
+                message="Docker is not running. Please start Docker and try again.",
+                error_code="docker_not_running"
+            )
     
     def create_network(self, network_name: str = CADDY_NETWORK) -> bool:
         """Create external network if it doesn't exist."""
@@ -108,6 +112,7 @@ class DockerManager:
                         subprocess.run(
                             ["docker", "network", "rm", name],
                             capture_output=True,
+                            text=True,
                             check=True,
                             timeout=30,
                         )

@@ -384,8 +384,8 @@ def update_vite_allowed_hosts_in_compose(
     Returns:
         True if VITE_ALLOWED_HOSTS was updated, False otherwise
     """
-    # Only apply to frontend services
-    if service_name not in ['frontend']:
+    # Only apply to frontend / Vite services
+    if service_name not in ['frontend', 'vite']:
         # Also check if service has VITE_* environment variables (indicates Vite project)
         if 'environment' in service_config:
             env_vars = service_config['environment']

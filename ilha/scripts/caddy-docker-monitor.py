@@ -16,9 +16,17 @@ import re
 from typing import Dict, List, Optional, Any
 
 try:
-    from .caddy_admin_utils import default_caddy_admin_url, resolve_caddy_admin_url
+    from .caddy_admin_utils import (
+        build_http_to_https_redirect_route,
+        default_caddy_admin_url,
+        resolve_caddy_admin_url,
+    )
 except ImportError:
-    from caddy_admin_utils import default_caddy_admin_url, resolve_caddy_admin_url
+    from caddy_admin_utils import (
+        build_http_to_https_redirect_route,
+        default_caddy_admin_url,
+        resolve_caddy_admin_url,
+    )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -221,6 +229,9 @@ class CaddyDockerMonitor:
             }
         
         routes = []
+        if domains:
+            routes.append(build_http_to_https_redirect_route(domains))
+            logger.info(f"Added HTTP to HTTPS redirect for domains: {', '.join(domains)}")
         
         # Group containers by domain to handle path-based routing
         domain_containers = {}

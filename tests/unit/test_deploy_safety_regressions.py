@@ -153,23 +153,18 @@ def test_backup_volumes_aborts_when_a_volume_fails(tmp_path: Path, monkeypatch):
 # assertions were identical.
 
 
-# ── B1: server_prep.sh aborts firewall setup on UFW SSH rule failure ──
+# ── B1: server_prep aborts firewall setup on UFW SSH rule failure ──
 
 def test_server_prep_aborts_on_ufw_ssh_failure():
-    """B1: the prep script must `exit 1` (not continue) if the UFW SSH rule
-    cannot be added, otherwise users can lock themselves out silently."""
-    script_path = Path(__file__).resolve().parents[2] / "ilha" / "scripts" / "server_prep.sh"
+    """B1: prep must stop (not continue) if the UFW SSH rule cannot be added."""
+    script_path = Path(__file__).resolve().parents[2] / "ilha" / "scripts" / "server_prep.py"
     contents = script_path.read_text()
 
-    # Find the SSH-rule guard and confirm it exits.
-    assert "ufw allow 22/tcp" in contents
-    # Split around the key line and check the block that follows contains exit 1
-    # before the next non-nested statement.
-    idx = contents.find('Failed to add UFW SSH rule')
+    assert '["ufw", "allow", "22/tcp"]' in contents
+    idx = contents.find("Failed to add UFW SSH rule")
     assert idx != -1, "expected firewall lockout warning string"
-    tail = contents[idx:idx + 400]
-    assert "exit 1" in tail, (
-        "server_prep.sh must `exit 1` after logging the UFW SSH failure; "
-        "otherwise the script continues and installs Docker while claiming the "
-        "firewall was aborted (silent lockout risk)."
+    tail = contents[idx : idx + 400]
+    assert "return False" in tail, (
+        "server_prep.py must return False after logging the UFW SSH failure "
+        "(do not enable UFW or continue Docker setup)."
     )

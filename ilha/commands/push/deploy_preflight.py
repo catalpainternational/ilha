@@ -73,19 +73,12 @@ class DeployPreflight:
     # ── git helpers ──────────────────────────────────────────────────
 
     def _get_git_branch(self, path: Path) -> Optional[str]:
+        from ...utils.path_utils import get_worktree_branch_name
         try:
-            result = subprocess.run(
-                ["git", "branch", "--show-current"],
-                capture_output=True,
-                text=True,
-                check=True,
-                cwd=path,
-                timeout=10,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            branch = get_worktree_branch_name(path)
+            return branch
+        except (FileNotFoundError, Exception):
             return None
-        branch = (result.stdout or "").strip()
-        return branch or None
 
     def _is_git_dirty(self, path: Path) -> Optional[bool]:
         try:

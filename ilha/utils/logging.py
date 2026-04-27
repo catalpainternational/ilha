@@ -77,6 +77,21 @@ def log_error(message: str) -> None:
     if not _quiet_mode:
         console.print(f"[{Colors.RED}][ERROR][/{Colors.RED}] {message}")
 
+def emit_error(message: str, json: bool) -> None:
+    """Emit an error to JSON output or stderr depending on mode.
+
+    Args:
+        message: Error message to emit
+        json: If True, emit to JSON output; if False, use log_error()
+    """
+    if json:
+        # Imported lazily because json_output imports this module for plain logging.
+        from .json_output import JSONOutput
+
+        JSONOutput.print_error(message)
+    else:
+        log_error(message)
+
 def log_phase(message: str) -> None:
     """Log a phase message."""
     if not _quiet_mode:
@@ -388,6 +403,16 @@ def render_deploy_report(report: Dict[str, Any]) -> None:
     url = report.get("url")
     if url and success:
         console.print(f"\n  [bold green]🌐 {url}[/bold green]")
+
+    notes = report.get("notes") or []
+    if notes and isinstance(notes, list):
+        console.print("\n  [bold]Notes[/bold]")
+        for note in notes:
+            console.print(f"    • {note}")
+
+    vb = report.get("volume_backup_path")
+    if vb:
+        console.print(f"\n  [dim]Volume backup path: {vb}[/dim]")
 
     # Suggested actions on failure
     if error_info:
