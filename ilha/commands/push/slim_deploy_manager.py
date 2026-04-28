@@ -1062,8 +1062,8 @@ echo OK
                 log_info("Skipping local volume backup (--skip-volume-backup)")
             else:
                 log_info(
-                    "Skipping local volume backup (default for `droplet deploy`). "
-                    "Pass --restore-volumes to copy worktree Docker volumes to the server."
+                    "Skipping local volume backup (--no-restore-volumes); "
+                    "the server will initialize empty volumes."
                 )
             self._mark_stage_timing("volume_backup", stage_started)
 

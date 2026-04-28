@@ -107,10 +107,14 @@ def _reset_local_pg_password(*, container_override: Optional[str], confirm: bool
         return False
 
     original = pg_hba_host_path.read_text()
-    if "trust" not in original and "scram-sha-256" not in original and "md5" not in original:
-        log_warning(
-            "pg_hba.conf has no recognised auth method to flip — proceeding anyway."
+    if "scram-sha-256" not in original and "md5" not in original:
+        log_error(
+            "pg_hba.conf has no scram-sha-256 or md5 auth methods to flip to trust. "
+            "This command's strategy (temporary trust override) cannot work here; "
+            "either edit pg_hba.conf manually or reset the role's password through "
+            "another channel (e.g. via a known-password connection)."
         )
+        return False
 
     restore_failed_reason: Optional[str] = None
     try:
@@ -142,19 +146,22 @@ def _reset_local_pg_password(*, container_override: Optional[str], confirm: bool
         log_info("ALTER USER succeeded.")
 
     finally:
-        # Step 4: always restore pg_hba.conf. Don't `return` from here — Python
-        # would silently swallow any exception from the try block. Track the
-        # restore outcome and check after the finally instead.
+        # Step 4: always restore pg_hba.conf — even if the try block hit an
+        # early `return False`, this finally still runs. Log the restore
+        # failure HERE (not after the finally) so it's visible regardless of
+        # how the try exited; otherwise a step-2/3 failure would short-circuit
+        # the function before any post-finally code could warn that
+        # pg_hba.conf is now stuck in trust mode.
         try:
             pg_hba_host_path.write_text(original)
             log_info("pg_hba.conf restored.")
         except Exception as exc:
             restore_failed_reason = str(exc)
+            log_error(
+                f"Failed to restore pg_hba.conf at {pg_hba_host_path}: {exc}. "
+                "Restore manually before restarting the container!"
+            )
     if restore_failed_reason is not None:
-        log_error(
-            f"Failed to restore pg_hba.conf at {pg_hba_host_path}: {restore_failed_reason}. "
-            "Restore manually before restarting the container!"
-        )
         return False
 
     # Step 5: restart again so the original pg_hba.conf takes effect
