@@ -13,6 +13,8 @@ Flow:
   6. Start Caddy and app services via SSH + docker compose
 """
 
+import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -23,7 +25,7 @@ import fnmatch
 import random
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Any, Set
+from typing import Iterable, Optional, List, Tuple, Dict, Any, Set
 
 from ...config.settings import get_script_dir, get_worktree_dir
 from ...core.dns_manager import DNSManager, parse_domain, is_domain
@@ -31,6 +33,7 @@ from ...core.droplet_manager import DropletInfo
 from ...core.environment_manager import EnvironmentManager
 from ...utils.checksum import calculate_file_checksum
 from ...utils.compose_external_volumes import (
+    compose_service_is_buildable,
     compose_web_image_reference,
     list_external_volume_host_names,
 )
@@ -54,6 +57,7 @@ from ...utils.validation import validate_branch_name
 from .deploy_doctor import DeployDoctor
 from .deploy_preflight import DeployPreflight
 from .deploy_service_config import DeployServiceConfig, load_deploy_service_config
+from ...scripts.http_probe import build_probe_shell_chain, normalize_path as _normalize_http_path
 from .remote_compose_probe import remote_compose_service_known, remote_compose_service_logs_tail
 from .remote_disk import RemoteDiskManager
 from .transfer_manager import TransferManager
@@ -66,6 +70,10 @@ class SlimDeployManager:
     REMOTE_APP_ROOT = "/app"
     REMOTE_CADDY_DIR = "/app/caddy"
     REMOTE_VOLUMES_DIR = "/app/volumes"
+
+    # Compose flags for every remote `docker compose` invocation: ship both the
+    # user's compose (base) and ilha's overlay so server merges them at runtime.
+    COMPOSE_FLAGS = "-f docker-compose.yml -f docker-compose.overlay.yml"
 
     # Timeouts (seconds) for parallel futures
     _FUTURE_TIMEOUTS = {
@@ -165,6 +173,9 @@ class SlimDeployManager:
 
     def _reset_report(self) -> None:
         self._last_failure_category = None
+        # Names of host volumes the deploy is about to ship; populated by
+        # _backup_volumes_locally for the restore-warning step.
+        self._last_backup_volume_names: List[str] = []
         self._last_report = {
             "success": False,
             "stage_timings": {},
@@ -296,24 +307,24 @@ cd /app
 set -a
 [ -f .env ] && source .env
 set +a
-docker compose --env-file .env up -d db
+docker compose --env-file .env __COMPOSE_FLAGS__ up -d db
 for i in $(seq 1 90); do
-  if docker compose --env-file .env exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
+  if docker compose --env-file .env __COMPOSE_FLAGS__ exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
     break
   fi
   sleep 1
 done
-if ! docker compose --env-file .env exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
+if ! docker compose --env-file .env __COMPOSE_FLAGS__ exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
   echo "PG_NOT_READY" >&2
   exit 2
 fi
-if ! docker compose --env-file .env exec -T -e PGPASSWORD="${POSTGRES_PASSWORD:-}" db \
+if ! docker compose --env-file .env __COMPOSE_FLAGS__ exec -T -e PGPASSWORD="${POSTGRES_PASSWORD:-}" db \
   psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" -h 127.0.0.1 -c "select 1" >/dev/null 2>&1; then
   echo "PG_AUTH_OR_CONN_FAILED" >&2
   exit 3
 fi
 echo OK
-"""
+""".replace("__COMPOSE_FLAGS__", self.COMPOSE_FLAGS)
         code, out, err = self._run_remote_text(username, server, script, timeout=180)
         if code == 0:
             log_success("Postgres password matches deployed .env after volume restore")
@@ -435,16 +446,13 @@ echo OK
         self,
         branch_name: str,
         strict_deploy_drift: bool = False,
-        strict_env_contract: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Delegate to DeployPreflight and wire results into the deploy report."""
         result = self.preflight.run_deploy_preflight(
             branch_name,
             strict_deploy_drift=strict_deploy_drift,
-            strict_env_contract=strict_env_contract,
         )
         if result is None:
-            # Determine failure reason and populate report even on failure
             worktree_path = self.preflight.resolve_worktree_path(branch_name)
             if not worktree_path.exists():
                 self._set_failure(
@@ -461,53 +469,81 @@ echo OK
                 drift_report = self.preflight.build_drift_report(
                     worktree_path, comparison_root, strict_deploy_drift=strict_deploy_drift,
                 )
-                env_contract_warnings = self.preflight.detect_env_contract_issues(worktree_path)
                 self._last_report["source_manifest"] = manifest
                 self._last_report["drift_report"] = drift_report
-                if strict_env_contract and env_contract_warnings:
-                    self._set_failure(
-                        error_code="env_contract_violation",
-                        stage="preflight",
-                        root_cause=(
-                            "Env-contract issues detected (e.g. SITE_DOMAIN with "
-                            "http(s):// prefix). Mis-formed values break "
-                            "CSRF_TRUSTED_ORIGINS on the server."
-                        ),
-                        suggested_actions=[
-                            "Fix the offending values in .env or .ilha/env.ilha "
-                            "(bare host, not a URL).",
-                            "Or re-run with --no-strict-env-contract to bypass.",
-                        ],
-                        failure_category="validation_error",
-                    )
-                else:
-                    self._set_failure(
-                        error_code="critical_file_drift",
-                        stage="preflight",
-                        root_cause=(
-                            "Critical deploy files differ between root and worktree. "
-                            "Deploy the worktree copy or sync the changes first."
-                        ),
-                        suggested_actions=[
-                            "Deploy the worktree copy or sync the changes first.",
-                        ],
-                        failure_category="validation_error",
-                    )
+                self._set_failure(
+                    error_code="critical_file_drift",
+                    stage="preflight",
+                    root_cause=(
+                        "Critical deploy files differ between root and worktree. "
+                        "Deploy the worktree copy or sync the changes first."
+                    ),
+                    suggested_actions=[
+                        "Deploy the worktree copy or sync the changes first.",
+                    ],
+                    failure_category="validation_error",
+                )
             return None
 
         self._last_report["source_manifest"] = result["manifest"]
         self._last_report["drift_report"] = result["drift_report"]
+
+        # Smoke path override precedence (highest first):
+        #   1. ILHA_SMOKE_PATH env var (per-invocation override)
+        #   2. ``deploy.smoke_path`` in .ilha/config.yml (per-project override)
+        #   3. preflight detection (compose label / README hint / ``/``)
+        env_override = os.environ.get("ILHA_SMOKE_PATH", "").strip()
+        if env_override:
+            result["smoke_path"] = env_override
+        elif self.services.smoke_path is not None:
+            result["smoke_path"] = self.services.smoke_path
         return result
 
-    def _probe_external_domain_html(self, domain: str) -> Tuple[bool, Optional[str]]:
-        """GET ``https://<domain>/`` and require ``text/html`` plus a non-trivial body.
+    def _probe_external_path_content_type(
+        self, domain: str, path: str, expected_type_substring: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """HEAD ``https://<domain><path>`` and verify the ``Content-Type``
+        header contains the expected substring.
 
-        Follows redirects: a login-required app routinely 302s ``/`` to a login
+        Used to detect the SPA-fallback trap: if Caddy isn't routing the
+        path to the backend, the frontend's catch-all serves ``index.html``
+        and ``Content-Type: text/html`` — even though the app appears
+        "alive". Comparing content-type catches that without false-positives
+        from auth redirects or other 3xx behaviour.
+        """
+        url = f"https://{domain}{self._normalized_smoke_path(path)}"
+        # ``-kfsSI`` = ignore TLS issues, fail on 4xx/5xx, silent, head only.
+        code, out, err = self._run_local_text(
+            ["curl", "-kfsSI", "--max-time", "5", url],
+            timeout=10,
+        )
+        if code != 0:
+            return False, (err or out or "curl failed").strip()[:400] or None
+        lower = out.lower()
+        if "content-type:" not in lower:
+            return False, "response has no Content-Type header"
+        if expected_type_substring.lower() not in lower:
+            # Trim to the content-type line for a focused error message.
+            for line in out.splitlines():
+                if line.lower().startswith("content-type:"):
+                    return False, (
+                        f"expected Content-Type containing "
+                        f"'{expected_type_substring}', got: {line.strip()}"
+                    )
+            return False, f"expected Content-Type containing '{expected_type_substring}'"
+        return True, None
+
+    def _probe_external_domain_html(
+        self, domain: str, smoke_path: str = "/"
+    ) -> Tuple[bool, Optional[str]]:
+        """GET ``https://<domain><smoke_path>`` and require ``text/html`` plus a non-trivial body.
+
+        Follows redirects: a login-required app routinely 302s the path to a login
         URL, so ``-L`` lets the probe land on the rendered HTML before measuring
         the body. The header dump (``-D -``) reflects the *final* response after
         redirects, which is what we want for content-type and body checks.
         """
-        url = f"https://{domain}/"
+        url = f"https://{domain}{self._normalized_smoke_path(smoke_path)}"
         code, out, err = self._run_local_text(
             [
                 "curl",
@@ -598,6 +634,46 @@ echo OK
         # the entire window of probe attempts timed out before convergence.
         return "Post-deploy smoke checks did not converge before timeout."
 
+    def _wait_for_dns_resolution(
+        self,
+        domain: str,
+        expected_ip: Optional[str],
+        timeout_seconds: int = 120,
+    ) -> bool:
+        """Block until *domain* resolves via the system resolver.
+
+        For a fresh A record on a brand-new zone, the local resolver may have a
+        negative cache or the record may not have propagated yet. We poll
+        ``socket.gethostbyname`` with backoff. When *expected_ip* is provided
+        we also require a matching answer; otherwise any answer is accepted.
+
+        Returns True on resolution, False on timeout.
+        """
+        import socket
+
+        deadline = time.time() + max(0, timeout_seconds)
+        attempt = 0
+        last_error: Optional[str] = None
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                resolved = socket.gethostbyname(domain)
+            except socket.gaierror as exc:
+                last_error = str(exc)
+                resolved = None
+            if resolved and (expected_ip is None or resolved == expected_ip):
+                if attempt > 1:
+                    log_info(f"DNS resolved {domain} -> {resolved}")
+                return True
+            if resolved and expected_ip and resolved != expected_ip:
+                last_error = f"resolved {resolved}, expected {expected_ip}"
+            time.sleep(min(8, 1 + attempt))
+        log_warning(
+            f"DNS for {domain} did not resolve within {timeout_seconds}s "
+            f"({last_error or 'no answer'}); external smoke checks may fail."
+        )
+        return False
+
     def _run_smoke_checks(
         self,
         *,
@@ -609,12 +685,23 @@ echo OK
         timeout_seconds: int = 60,
     ) -> Tuple[bool, Dict[str, Any]]:
         started_at = time.time()
+        dns_ready = True
+        if domain:
+            dns_ready = self._wait_for_dns_resolution(
+                domain, expected_ip=ip, timeout_seconds=120
+            )
+            if not dns_ready:
+                log_warning(
+                    "Skipping external smoke checks until this machine resolves the "
+                    f"deploy domain ({domain}). Local checks still validate the server."
+                )
         delays = [0, 1, 2, 4, 8, 15]
         checks: List[Dict[str, Any]] = []
         via_web = self._remote_service_exists(username, server, self.services.web_service)
-        local_url = f"http://127.0.0.1:{self.services.web_port}{self._normalized_smoke_path(smoke_path)}"
+        normalized = self._normalized_smoke_path(smoke_path)
+        local_url = f"http://127.0.0.1:{self.services.web_port}{normalized}"
         probe_target = "web_container" if via_web else "host_local"
-        external_url = f"https://{domain}/" if domain else None
+        external_url = f"https://{domain}{normalized}" if domain else None
 
         for attempt, delay in enumerate(delays, start=1):
             if delay:
@@ -644,7 +731,7 @@ echo OK
             external_ok = True
             redirect_ok = True
             external_html_ok = True
-            if local_ok and external_url:
+            if local_ok and external_url and dns_ready:
                 redirect_ok, redirect_err = self._probe_http_redirects_to_https(domain)
                 redirect_result = {
                     "name": "external_http_to_https_redirect",
@@ -666,7 +753,7 @@ echo OK
                     "error": external_err.strip() or None,
                 }
                 if external_ok and domain:
-                    html_ok, html_err = self._probe_external_domain_html(domain)
+                    html_ok, html_err = self._probe_external_domain_html(domain, smoke_path)
                     external_html_ok = html_ok
                     external_html_result = {
                         "name": "external_domain_html",
@@ -676,6 +763,36 @@ echo OK
                         "error": html_err,
                     }
 
+            # Footprint-driven advisory probes: catch SPA-fallback traps that
+            # the generic root-path smoke can't see (a broken Caddy route or
+            # missing collectstatic both produce 200 text/html on the SPA's
+            # index page). Logged as warnings so a project without
+            # django.contrib.admin doesn't fail-block the deploy.
+            advisory_results: List[Dict[str, Any]] = []
+            if local_ok and external_url and dns_ready:
+                from ...utils.project_footprint import detect_project_footprint
+                fp = detect_project_footprint(self.project_root)
+                if fp.has_django:
+                    css_ok, css_err = self._probe_external_path_content_type(
+                        domain, "/static/admin/css/base.css", "text/css"
+                    )
+                    advisory_results.append({
+                        "name": "django_static_admin_css",
+                        "target": f"https://{domain}/static/admin/css/base.css",
+                        "attempt": attempt,
+                        "success": css_ok,
+                        "error": css_err,
+                        "advisory": True,
+                    })
+                    if not css_ok:
+                        log_warning(
+                            "Django static admin assets aren't being served as "
+                            f"text/css (probed /static/admin/css/base.css): {css_err}. "
+                            "Either collectstatic didn't run (add it to your compose "
+                            "command) or path routing isn't directing /static/* to "
+                            "the backend (check deploy.api_paths)."
+                        )
+
             checks = [local_result]
             if redirect_result is not None:
                 checks.append(redirect_result)
@@ -683,6 +800,7 @@ echo OK
                 checks.append(external_result)
             if external_html_result is not None:
                 checks.append(external_html_result)
+            checks.extend(advisory_results)
             if local_ok and redirect_ok and external_ok and external_html_ok:
                 report = {
                     "success": True,
@@ -690,6 +808,8 @@ echo OK
                     "checks": checks,
                     "duration_seconds": round(time.time() - started_at, 3),
                 }
+                if domain and not dns_ready:
+                    report["external_checks_skipped"] = "dns_not_ready_locally"
                 self._last_report["smoke_checks"] = report
                 return True, report
 
@@ -730,12 +850,10 @@ echo OK
             timeout=15,
         )
 
-    @staticmethod
-    def _normalized_smoke_path(smoke_path: str) -> str:
-        p = (smoke_path or "/").strip()
-        if not p.startswith("/"):
-            p = "/" + p
-        return p or "/"
+    # Thin instance-method shim over the shared normalizer in ``http_probe``;
+    # kept so existing call sites (``self._normalized_smoke_path(...)``)
+    # don't need to be touched. Marked staticmethod for the same callability.
+    _normalized_smoke_path = staticmethod(_normalize_http_path)
 
     def _build_smoke_probe_command(
         self,
@@ -748,17 +866,24 @@ echo OK
 
         Caddy-only setups often do not publish the app port on the host; the
         listener lives inside the web container. When ``via_compose_web`` is
-        true, run curl inside that service via ``docker compose exec``.
+        true, run the probe inside that service via ``docker compose exec``.
+
+        Strategy chain (curl → wget → python → ``/dev/tcp``) lives in
+        ``http_probe.build_probe_shell_chain`` so the in-deploy smoke and
+        the in-remote-deploy health check share one source of truth.
         """
         norm = self._normalized_smoke_path(smoke_path)
         url = f"http://127.0.0.1:{self.services.web_port}{norm}"
         tail = " >/dev/null" if quiet else " 2>&1"
-        inner_curl = f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
+        inner_probe = build_probe_shell_chain(
+            port=self.services.web_port, path=norm, timeout=5, tail=tail,
+        )
+
         if via_compose_web:
             root = shlex.quote(self.REMOTE_APP_ROOT)
             service = shlex.quote(self.services.web_service)
             return (
-                f"cd {root} && docker compose --env-file .env exec -T {service} sh -c {shlex.quote(inner_curl)}"
+                f"cd {root} && docker compose --env-file .env {self.COMPOSE_FLAGS} exec -T {service} sh -c {shlex.quote(inner_probe)}"
             )
         return f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
 
@@ -830,7 +955,6 @@ echo OK
         no_disk_check: bool = False,
         skip_volume_backup: bool = False,
         strict_deploy_drift: bool = False,
-        strict_env_contract: bool = True,
         smoke_timeout: int = 60,
         expected_ssh_fingerprint: Optional[str] = None,
         restore_volumes: bool = False,
@@ -861,7 +985,6 @@ echo OK
         preflight = self._run_deploy_preflight(
             branch_name,
             strict_deploy_drift=strict_deploy_drift,
-            strict_env_contract=strict_env_contract,
         )
         if preflight is None:
             render_deploy_report(self._last_report)
@@ -1107,13 +1230,29 @@ echo OK
                     failure_category="remote_setup_error",
                 )
                 return False
-            auto_build_missing = bool(web_image) and not image_exists and not no_build and not build
+            web_is_buildable = compose_service_is_buildable(
+                deploy_dir / "docker-compose.yml",
+                compose_env,
+                self.services.web_service,
+            )
+            auto_build_missing = (
+                bool(web_image)
+                and not image_exists
+                and not no_build
+                and not build
+                and web_is_buildable
+            )
             if auto_build_missing:
                 msg = (
                     f"Remote image {web_image!r} not found; will run `docker compose build` "
                     "before starting the app."
                 )
                 self._note(msg)
+            elif bool(web_image) and not image_exists and not web_is_buildable:
+                self._note(
+                    f"Remote image {web_image!r} will be pulled by `docker compose up` "
+                    "(no `build:` directive in compose; nothing to build)."
+                )
 
             stage_started = time.time()
             restore_ok = True
@@ -1121,6 +1260,20 @@ echo OK
 
             # Phase 1: restore volumes + start caddy (in parallel)
             log_step("Starting remote services")
+            if volume_tar and self._last_backup_volume_names:
+                self._warn_about_existing_remote_volumes(
+                    username, server, self._last_backup_volume_names
+                )
+            # Detect orphan stacks from a previous deploy that used a
+            # different COMPOSE_PROJECT_NAME (typically a BYO migration).
+            from ...config.settings import get_project_name as _get_project_name
+            from ...config.settings import sanitize_project_name as _sanitize
+            self._warn_about_orphan_compose_project(
+                username, server,
+                active_compose_project=self.services_resolved_compose_project_name(branch_name),
+                sanitized_project_name=_sanitize(_get_project_name()),
+                branch_name=branch_name,
+            )
             with ThreadPoolExecutor(max_workers=2) as executor:
                 phase1_futures = {}
                 if volume_tar:
@@ -1536,15 +1689,16 @@ echo OK
 
         Layout:
           deploy_dir/
-          ├── code/              # worktree source code
+          ├── code/                            # worktree source code
           ├── caddy/
-          │   ├── docker-compose.yml   # global caddy compose
+          │   ├── docker-compose.yml           # global caddy compose
           │   ├── Caddyfile
           │   ├── caddy-docker-monitor.py
-          │   └── caddy-dynamic-config.py  (if exists)
-          ├── docker-compose.yml # worktree compose (renamed from worktree yml)
-          ├── .env               # merged env with overrides applied
-          └── volumes/           # (populated later if needed)
+          │   └── caddy-dynamic-config.py      (if exists)
+          ├── docker-compose.yml               # the user's compose (base, copied verbatim)
+          ├── docker-compose.overlay.yml       # ilha's overlay deltas
+          ├── .env                             # merged env with overrides applied
+          └── volumes/                         # (populated later if needed)
         """
         log_info("Assembling deploy directory...")
         if not validate_branch_name(branch_name):
@@ -1561,10 +1715,16 @@ echo OK
                 log_error(f"Worktree directory not found: {worktree_path}")
                 return None
 
-            worktree_ilha = worktree_path / ".ilha"
-            worktree_compose = worktree_ilha / "docker-compose.worktree.yml"
+            worktree_compose = worktree_path / "docker-compose.yml"
+            worktree_overlay = worktree_path / ".ilha" / "docker-compose.overlay.yml"
             if not worktree_compose.exists():
-                log_error(f"Worktree compose file not found: {worktree_compose}")
+                log_error(f"docker-compose.yml not found in worktree: {worktree_compose}")
+                return None
+            if not worktree_overlay.exists():
+                log_error(
+                    f"ilha overlay not found at {worktree_overlay}. "
+                    f"Re-run `ilha setup` to regenerate."
+                )
                 return None
 
             # ── code/ ────────────────────────────────────────────────
@@ -1589,15 +1749,21 @@ echo OK
                     )
             log_success(f"Code copied ({_dir_size_mb(code_dir):.1f} MB)")
 
-            # ── docker-compose.yml (app) ─────────────────────────────
+            # ── compose files (base + overlay) ───────────────────────
             shutil.copy2(worktree_compose, deploy_dir / "docker-compose.yml")
-            log_info("Copied worktree compose file")
+            shutil.copy2(worktree_overlay, deploy_dir / "docker-compose.overlay.yml")
+            log_info("Copied base + overlay compose files")
 
-            # Apply domain/IP to Caddy labels in compose
+            # Apply domain/IP to Caddy labels in the OVERLAY (ilha owns those).
             if domain or ip:
                 self._apply_compose_overrides(
-                    deploy_dir / "docker-compose.yml", domain=domain, ip=ip
+                    deploy_dir / "docker-compose.overlay.yml", domain=domain, ip=ip
                 )
+
+            # Strip elevated privileges from the BASE COPY (privileges are user-
+            # defined; the overlay never carries them). This mutates the deploy
+            # copy, never the user's source.
+            self._strip_privileges_in_compose(deploy_dir / "docker-compose.yml")
 
             # ── .env (merged) ────────────────────────────────────────
             self._build_merged_env(
@@ -1632,7 +1798,7 @@ echo OK
         domain: Optional[str] = None,
         ip: Optional[str] = None,
     ) -> None:
-        """Update Caddy labels and network config in the compose file."""
+        """Update Caddy labels and ``restart`` policy in the OVERLAY compose."""
         try:
             import yaml
 
@@ -1641,7 +1807,32 @@ echo OK
                 return
             normalized_domain = normalize_deploy_host(domain) if domain else None
             normalized_ip = normalize_deploy_host(ip) if ip else None
-            ensure_caddy_labels_and_network(data, domain=normalized_domain, ip=normalized_ip)
+
+            # Django+SPA: route API paths to the backend, everything else to
+            # the frontend. Skip when only one tier exists or the user hasn't
+            # provided api_paths (None means "no path constraints").
+            path_routes: Dict[str, List[str]] = {}
+            if (
+                self.services.frontend_service
+                and self.services.api_paths
+                and self.services.frontend_service in (data.get("services") or {})
+                and self.services.web_service in (data.get("services") or {})
+            ):
+                path_routes[self.services.web_service] = list(self.services.api_paths)
+                # Frontend explicitly has no path constraint (catch-all).
+                path_routes[self.services.frontend_service] = []
+                log_info(
+                    f"Django+SPA routing: {self.services.web_service} handles "
+                    f"{', '.join(self.services.api_paths)}; "
+                    f"{self.services.frontend_service} handles everything else."
+                )
+
+            ensure_caddy_labels_and_network(
+                data,
+                domain=normalized_domain,
+                ip=normalized_ip,
+                path_routes=path_routes or None,
+            )
             # Production deploy: ensure web service restarts on exit (e.g. OOM 137)
             if normalized_domain or normalized_ip:
                 services = data.get("services") or {}
@@ -1649,17 +1840,39 @@ echo OK
                 if web_config is not None and "restart" not in web_config:
                     web_config["restart"] = "unless-stopped"
 
-            # Strip elevated container privileges from services that don't need them.
-            # Only services matching _PRIVILEGED_SERVICE_PATTERNS (Playwright/browser
-            # services) keep SYS_ADMIN, seccomp:unconfined, ipc:host, etc.
-            self._strip_unnecessary_privileges(data)
-
             compose_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
             log_info(f"Applied {'domain' if normalized_domain else 'IP'} override to compose labels")
         except ImportError:
             log_warning("PyYAML not available — skipping compose label override")
         except Exception as exc:
             log_warning(f"Could not update compose labels: {exc}")
+
+    def _strip_host_port_publishes(self, compose_data: dict) -> None:
+        """Remove ``ports:`` from every service in the (base) compose copy.
+
+        Caddy reaches each service over the ``ilha_caddy_proxy`` docker
+        network, so dropping host port publishes never breaks routing — it
+        only closes the surface that bots scan. Postgres/Redis on
+        ``0.0.0.0:5433/6379`` is the exact attack surface this prevents.
+
+        Applied to the BASE compose copy (not the overlay) because compose
+        v2's merge ignores ``ports: []`` from a later file — the only
+        reliable wipe is to remove the key from the source compose itself.
+        """
+        services = compose_data.get("services") or {}
+        stripped: List[str] = []
+        for svc_name, svc_config in services.items():
+            if not isinstance(svc_config, dict):
+                continue
+            if "ports" not in svc_config:
+                continue
+            del svc_config["ports"]
+            stripped.append(svc_name)
+        if stripped:
+            log_info(
+                f"Closed host port publishes for prod deploy: {', '.join(stripped)} "
+                f"(Caddy reaches services over the docker network, not host ports)"
+            )
 
     # Services matching these patterns keep elevated privileges (Playwright/Chromium).
     _PRIVILEGED_SERVICE_PATTERNS = ("web", "rq-worker")
@@ -1692,9 +1905,162 @@ echo OK
             if removed:
                 log_info(f"Stripped privileges from service '{svc_name}': {', '.join(removed)}")
 
+    # Subdirectory (relative to the deploy root) where the worktree code is
+    # copied. The base compose lives one level above, so user-written relative
+    # paths must be retargeted into this subdirectory before deploy.
+    _CODE_SUBDIR = "./code"
+
+    def _retarget_relative_path(self, value: str) -> str:
+        """Prefix ``./code/`` onto a relative path; leave absolute/var refs alone.
+
+        Callers must ensure the value is unambiguously a path (e.g. an
+        ``env_file`` entry, ``build.context``, or a volume source already
+        confirmed to start with ``.``). For volume short-syntax, bare names
+        like ``foo:/x`` are named volumes — caller filters those out before
+        calling here.
+        """
+        if not isinstance(value, str) or not value:
+            return value
+        if value.startswith(("/", "~", "$")):
+            return value
+        if value == ".":
+            return self._CODE_SUBDIR
+        if value.startswith("./"):
+            return f"{self._CODE_SUBDIR}/{value[2:]}"
+        if value.startswith("../"):
+            return f"{self._CODE_SUBDIR}/{value}"
+        return f"{self._CODE_SUBDIR}/{value}"
+
+    def _retarget_paths_to_code_subdir(self, compose_data: dict) -> None:
+        """Rewrite relative paths in each service so they resolve under ``./code/``.
+
+        Why: the base compose is copied to ``<deploy_dir>/docker-compose.yml`` but
+        the worktree code is copied to ``<deploy_dir>/code/``. Without this
+        retarget, ``build.context: .`` resolves to the deploy root (no Dockerfile
+        there) and bind-mount sources like ``./frontend`` miss the project files.
+        """
+        services = compose_data.get("services") or {}
+        for svc in services.values():
+            if not isinstance(svc, dict):
+                continue
+
+            build = svc.get("build")
+            if isinstance(build, str):
+                svc["build"] = self._retarget_relative_path(build)
+            elif isinstance(build, dict) and "context" in build:
+                build["context"] = self._retarget_relative_path(build["context"])
+
+            volumes = svc.get("volumes")
+            if isinstance(volumes, list):
+                new_volumes = []
+                for vol in volumes:
+                    if isinstance(vol, str):
+                        # Short form: SOURCE:TARGET[:MODE]. Only retarget when the
+                        # source is a path (starts with '.'); named volumes have
+                        # no leading dot/slash and are left alone.
+                        if vol.startswith("."):
+                            head, sep, tail = vol.partition(":")
+                            if sep:
+                                vol = f"{self._retarget_relative_path(head)}:{tail}"
+                        new_volumes.append(vol)
+                    elif isinstance(vol, dict):
+                        if vol.get("type") == "bind" and isinstance(vol.get("source"), str):
+                            vol["source"] = self._retarget_relative_path(vol["source"])
+                        new_volumes.append(vol)
+                    else:
+                        new_volumes.append(vol)
+                svc["volumes"] = new_volumes
+
+            env_file = svc.get("env_file")
+            if isinstance(env_file, str):
+                svc["env_file"] = self._retarget_relative_path(env_file)
+            elif isinstance(env_file, list):
+                svc["env_file"] = [
+                    self._retarget_relative_path(p) if isinstance(p, str) else p
+                    for p in env_file
+                ]
+
+            extends = svc.get("extends")
+            if isinstance(extends, dict) and isinstance(extends.get("file"), str):
+                extends["file"] = self._retarget_relative_path(extends["file"])
+
+    def _strip_privileges_in_compose(self, compose_path: Path) -> None:
+        """Load the base compose, apply deploy transforms, and rewrite it in place.
+
+        Transforms applied:
+        - strip elevated privileges from non-privileged services
+        - retarget user-written relative paths into the ``./code/`` subdir
+        """
+        try:
+            import yaml
+            data = yaml.safe_load(compose_path.read_text())
+            if not data:
+                return
+            self._strip_unnecessary_privileges(data)
+            self._retarget_paths_to_code_subdir(data)
+            self._strip_host_port_publishes(data)
+            compose_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+        except ImportError:
+            log_warning("PyYAML not available — skipping base compose finalization")
+        except Exception as exc:
+            log_warning(f"Could not finalize base compose {compose_path}: {exc}")
+
     # ──────────────────────────────────────────────────────────────────
     # Internal: merged .env
     # ──────────────────────────────────────────────────────────────────
+    def _extract_compose_db_env_defaults(self, worktree_path: Path) -> Dict[str, str]:
+        """Read ``services.db.environment`` from the worktree compose and
+        return the ``${VAR:-default}`` defaults (or literal values).
+
+        Returns a ``{POSTGRES_USER: ..., POSTGRES_DB: ..., POSTGRES_PASSWORD: ...}``
+        mapping containing only the keys the compose explicitly defaults. The
+        caller layers these in *under* the ``.env``/``env.ilha`` values so an
+        explicit user-set value still wins.
+        """
+        try:
+            import yaml
+        except ImportError:
+            return {}
+        compose_path = worktree_path / "docker-compose.yml"
+        if not compose_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(compose_path.read_text()) or {}
+        except yaml.YAMLError:
+            return {}
+
+        services = data.get("services") or {}
+        # The DB service's compose key may follow user naming; ``self.services``
+        # already resolved it via footprint detection and config.
+        db_key = self.services.db_service or "db"
+        db_svc = services.get(db_key)
+        if not isinstance(db_svc, dict):
+            return {}
+        environment = db_svc.get("environment") or {}
+        # Compose accepts both dict and list forms.
+        if isinstance(environment, list):
+            env_dict: Dict[str, str] = {}
+            for entry in environment:
+                if isinstance(entry, str) and "=" in entry:
+                    k, v = entry.split("=", 1)
+                    env_dict[k.strip()] = v.strip()
+            environment = env_dict
+
+        out: Dict[str, str] = {}
+        # Match `${VAR:-default}` / `${VAR-default}` / literal value.
+        var_default_re = re.compile(r"^\s*\$\{([^}:?-]+)(?::?[-?])([^}]*)\}\s*$")
+        for postgres_key in ("POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD"):
+            if postgres_key not in environment:
+                continue
+            raw = str(environment[postgres_key])
+            m = var_default_re.match(raw)
+            if m and m.group(1) == postgres_key:
+                out[postgres_key] = m.group(2)
+            elif "${" not in raw:
+                out[postgres_key] = raw
+            # else: a non-default ${OTHER_VAR} reference — caller's env layers handle it.
+        return out
+
     def _build_merged_env(
         self,
         deploy_dir: Path,
@@ -1734,11 +2100,43 @@ echo OK
         if env_ilha.exists():
             merged.update(load_env_file(env_ilha))
 
+        # Layer 2.5: compose ``db`` service environment defaults.
+        # If a project declares ``POSTGRES_USER: ${POSTGRES_USER:-pivot}`` in
+        # its compose, the ``pivot`` default is baked into the running
+        # container but never lands in the deployed ``.env`` — leaving ilha's
+        # post-restore Postgres validator (which sources the .env to find
+        # the right -U/-d args) falling back to ``postgres``/``postgres``.
+        # Pull the compose defaults forward into merged so the .env on the
+        # server reflects what the db container actually uses.
+        for key, value in self._extract_compose_db_env_defaults(worktree_path).items():
+            merged.setdefault(key, value)
+
         # Layer 3: deployment overrides
         # PROJECT_ROOT must point to the code directory on the server so that
         # ${PROJECT_ROOT}:/app bind mounts and ${PROJECT_ROOT}/.env env_file
-        # references in docker-compose.worktree.yml resolve correctly.
+        # references in docker-compose.overlay.yml resolve correctly.
         merged["PROJECT_ROOT"] = REMOTE_CODE_DIR
+
+        # COMPOSE_PROJECT_NAME: for BYO-main projects (the project pre-dated
+        # ilha and uses the bare-project namespace locally), unify the prod
+        # namespace with local so the backed-up tar restores into volumes
+        # that the prod compose actually mounts. Cheap host-volume probe;
+        # only triggers for main/master.
+        from ...utils.compose_external_volumes import resolve_compose_project_name
+        from ...config.settings import get_project_name, sanitize_project_name
+        sanitized_project = sanitize_project_name(get_project_name())
+        resolved_project_name = resolve_compose_project_name(
+            self.project_root,
+            branch_name,
+            sanitized_project_name=sanitized_project,
+        )
+        if resolved_project_name != merged.get("COMPOSE_PROJECT_NAME"):
+            log_info(
+                f"COMPOSE_PROJECT_NAME resolved to '{resolved_project_name}' "
+                f"(was '{merged.get('COMPOSE_PROJECT_NAME')}' from env layers); "
+                f"matches the bare-project namespace where local volumes live."
+            )
+        merged["COMPOSE_PROJECT_NAME"] = resolved_project_name
 
         from ...config.settings import build_allowed_hosts_with_container
 
@@ -1786,8 +2184,16 @@ echo OK
         if use_staging_certificates:
             merged["USE_STAGING_CERTIFICATES"] = "1"
 
-        # Fallback: worktree compose often expects DATABASE_URL; synthesize from POSTGRES_* if missing
-        if "DATABASE_URL" not in merged or not merged["DATABASE_URL"]:
+        from ...utils.project_footprint import detect_project_footprint
+
+        footprint = detect_project_footprint(worktree_path)
+        # Worktree compose often expects DATABASE_URL; synthesize from POSTGRES_*
+        # only when this project actually ships a Postgres tier. Static/Caddy-only
+        # projects must not get a phantom DATABASE_URL with bipassword leaked into
+        # their .env.
+        if footprint.has_postgres and (
+            "DATABASE_URL" not in merged or not merged["DATABASE_URL"]
+        ):
             user = merged.get("POSTGRES_USER", "biuser")
             password = merged.get("POSTGRES_PASSWORD", "bipassword")
             db = merged.get("POSTGRES_DB", "business_intelligence")
@@ -1847,6 +2253,11 @@ echo OK
         if helper_src.exists():
             shutil.copy2(helper_src, caddy_dir / "caddy_admin_utils.py")
 
+        # Shared routing module: both monitor and dynamic-config import this.
+        routing_src = script_dir / "scripts" / "caddy_routing.py"
+        if routing_src.exists():
+            shutil.copy2(routing_src, caddy_dir / "caddy_routing.py")
+
         # Build a concrete caddy compose (resolve path placeholders)
         caddy_compose_template = config_dir / "docker-compose.global-caddy.yml"
         if caddy_compose_template.exists():
@@ -1864,6 +2275,10 @@ echo OK
                 "{HELPER_UTILS_PATH}",
                 f"{self.REMOTE_CADDY_DIR}/caddy_admin_utils.py",
             )
+            content = content.replace(
+                "{ROUTING_MODULE_PATH}",
+                f"{self.REMOTE_CADDY_DIR}/caddy_routing.py",
+            )
             (caddy_dir / "docker-compose.yml").write_text(content)
             log_info("Caddy compose file assembled with server-side paths")
 
@@ -1871,30 +2286,78 @@ echo OK
     # Internal: volume backup / restore
     # ──────────────────────────────────────────────────────────────────
     def _backup_volumes_locally(self, branch_name: str, deploy_dir: Path) -> Optional[Path]:
-        """Backup worktree Docker volumes into deploy_dir/volumes/.
+        """Backup the project's named volumes into deploy_dir/volumes/.
 
-        Returns path to the tar file, or None if no volumes backed up.
+        Discovers volumes by parsing the project's ``docker-compose.yml`` +
+        overlay (the only source of truth) instead of guessing from a
+        hardcoded suffix list. This handles projects that name their volumes
+        differently from ilha's convention (e.g. ``pgdata`` vs
+        ``postgres_data``) and respects ``external: true`` ownership.
+
+        Returns path to the tar file, or None if there's nothing to back up.
         """
         from ...core.docker_manager import DockerManager
+        from ...utils.compose_external_volumes import discover_named_volumes
+        from ...utils.validation import validate_volume_exists
 
-        docker_mgr = DockerManager(project_root=self.project_root)
+        compose_files = [
+            self.project_root / "docker-compose.yml",
+            self.project_root / ".ilha" / "docker-compose.overlay.yml",
+        ]
         env_mgr = EnvironmentManager(project_root=self.project_root)
-        volume_names = env_mgr.get_worktree_volume_names(branch_name)
+        env_vars = env_mgr.get_environment_variables(branch_name)
 
-        if not volume_names:
-            log_info("No volumes to backup")
+        discovered = discover_named_volumes(compose_files, env=env_vars)
+        if not discovered:
+            log_info("No named volumes declared in compose; skipping volume backup")
+            return None
+
+        # Skip externally-managed volumes — the project owns their lifecycle
+        # (could be shared across projects, mounted from host paths, etc.).
+        # Backup what ilha-deployed compose actually creates: the non-external
+        # named volumes, plus their host-resolved docker names.
+        candidates = {v.key: v.docker_name for v in discovered if not v.is_external}
+        external_keys = [v.key for v in discovered if v.is_external]
+        if external_keys:
+            log_info(
+                f"Skipping external volume(s) (project-owned): {', '.join(external_keys)}"
+            )
+
+        if not candidates:
+            log_info("No backup-able named volumes (all external); skipping")
+            return None
+
+        existing = {
+            key: name
+            for key, name in candidates.items()
+            if validate_volume_exists(name)
+        }
+        if not existing:
+            log_info(
+                "No declared volumes present on host; skipping volume backup "
+                f"(candidates: {', '.join(candidates.values())})"
+            )
             return None
 
         volumes_dir = deploy_dir / "volumes"
         volumes_dir.mkdir(exist_ok=True)
-        tar_path = volumes_dir / f"backup_{branch_name}.tar"
 
-        log_info(f"Backing up {len(volume_names)} volume(s)...")
+        log_info(
+            f"Backing up {len(existing)} named volume(s) "
+            f"discovered from compose: {', '.join(existing.values())}"
+        )
+        docker_mgr = DockerManager(project_root=self.project_root)
         try:
-            backup_path = docker_mgr.backup_volumes(branch_name, volumes_dir)
+            backup_path = docker_mgr.backup_volumes(
+                branch_name, volumes_dir, volume_names_override=existing
+            )
             if backup_path is not None and backup_path.exists():
                 size_mb = backup_path.stat().st_size / 1024 / 1024
                 log_success(f"Volumes backed up ({size_mb:.1f} MB)")
+                # Stash the actual volume names so the restore-warning step
+                # can probe the server for which already exist (so we can
+                # tell the operator exactly which volumes will be overwritten).
+                self._last_backup_volume_names = list(existing.values())
                 return backup_path
             else:
                 log_warning("Volume backup returned no data")
@@ -1902,6 +2365,102 @@ echo OK
         except Exception as exc:
             log_warning(f"Volume backup failed: {exc}")
             return None
+
+    def services_resolved_compose_project_name(self, branch_name: str) -> str:
+        """Return the effective ``COMPOSE_PROJECT_NAME`` for this deploy.
+
+        Resolves through the same path as ``_build_merged_env`` so callers
+        (orphan detection, future doctor checks) see the same value the
+        deploy will write to ``.env`` on the server.
+        """
+        from ...utils.compose_external_volumes import resolve_compose_project_name
+        from ...config.settings import get_project_name, sanitize_project_name
+        sanitized = sanitize_project_name(get_project_name())
+        return resolve_compose_project_name(
+            self.project_root, branch_name, sanitized_project_name=sanitized
+        )
+
+    def _probe_remote_existing_volumes(
+        self, username: str, server: str, volume_names: Iterable[str]
+    ) -> List[str]:
+        """Return the subset of ``volume_names`` that already exist on the
+        server. Cheap: one ``docker volume inspect`` invocation, exits 0 only
+        for volumes that do exist (silently skips missing).
+        """
+        names = [n for n in volume_names if n]
+        if not names:
+            return []
+        # ``docker volume inspect`` accepts multiple names; ``-f`` per-volume
+        # name output, with one line per volume that exists. Missing volumes
+        # surface as stderr (we ignore) and a non-zero exit (also ignored —
+        # we just consume the existing-volume lines from stdout).
+        quoted = " ".join(shlex.quote(n) for n in names)
+        cmd = f"docker volume inspect -f '{{{{.Name}}}}' {quoted} 2>/dev/null || true"
+        code, out, _ = self._run_remote_text(username, server, cmd, timeout=15)
+        existing = [line.strip() for line in (out or "").splitlines() if line.strip()]
+        # Preserve caller order, only return those actually requested.
+        wanted = set(names)
+        return [n for n in existing if n in wanted]
+
+    def _warn_about_orphan_compose_project(
+        self,
+        username: str,
+        server: str,
+        *,
+        active_compose_project: str,
+        sanitized_project_name: str,
+        branch_name: str,
+    ) -> None:
+        """Surface a cleanup hint when a previous deploy used a different
+        ``COMPOSE_PROJECT_NAME`` and left orphan containers/volumes on the
+        droplet. The most common case is a BYO project where ilha previously
+        deployed under ``<project>-<branch>`` and now resolves to bare
+        ``<project>`` after BYO-main detection.
+        """
+        convention = f"{sanitized_project_name}-{branch_name}"
+        if convention == active_compose_project:
+            return  # already aligned, nothing to check
+        cmd = (
+            f"docker ps -a --filter label=com.docker.compose.project={shlex.quote(convention)} "
+            "--format '{{.Names}}'"
+        )
+        code, out, _ = self._run_remote_text(username, server, cmd, timeout=15)
+        if code != 0:
+            return
+        names = [n.strip() for n in (out or "").splitlines() if n.strip()]
+        if not names:
+            return
+        log_warning(
+            f"Found {len(names)} orphan container(s) on the server from a "
+            f"previous deploy under '{convention}': {', '.join(names)}. "
+            f"This deploy uses '{active_compose_project}' so the old stack "
+            f"will be left running until cleaned up. Run on the server: "
+            f"`cd /app && docker compose --env-file .env "
+            f"-f docker-compose.yml -f docker-compose.overlay.yml "
+            f"-p {shlex.quote(convention)} down -v`"
+        )
+
+    def _warn_about_existing_remote_volumes(
+        self,
+        username: str,
+        server: str,
+        backup_volume_names: Iterable[str],
+    ) -> None:
+        """Surface a clear warning before ``_restore_volumes_remote`` overwrites
+        existing server-side volumes. Doesn't block — slim deploy is often
+        run unattended and the user has ``--no-restore-volumes`` as the
+        explicit opt-out — but the message lands in the deploy log so an
+        operator sees what's about to be overwritten.
+        """
+        existing = self._probe_remote_existing_volumes(username, server, backup_volume_names)
+        if not existing:
+            return
+        log_warning(
+            f"Volume restore will OVERWRITE existing server-side volumes: "
+            f"{', '.join(existing)}. Pass --no-restore-volumes to keep "
+            f"server data and let the app fail-fast if its compose can't "
+            f"start without local data."
+        )
 
     def _restore_volumes_remote(self, username: str, server: str, branch_name: str) -> bool:
         """Restore volumes on the remote server using docker run + alpine."""
@@ -1925,7 +2484,7 @@ echo "Restoring volumes from $BACKUP_TAR..."
 
 # Stop application containers before restoring volumes to prevent data corruption.
 # Running containers (e.g. Postgres) crash if their data volume is overwritten underneath them.
-cd {self.REMOTE_APP_ROOT}/code 2>/dev/null && docker compose --env-file ../.env down 2>/dev/null || true
+cd {self.REMOTE_APP_ROOT} 2>/dev/null && docker compose --env-file .env {self.COMPOSE_FLAGS} down 2>/dev/null || true
 
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
@@ -1964,6 +2523,36 @@ echo "Volume restore complete"
             return False
 
     # ──────────────────────────────────────────────────────────────────
+    # Internal: helper for uploading a single file via stdin → ssh cat
+    # ──────────────────────────────────────────────────────────────────
+    def _upload_remote_file(
+        self,
+        username: str,
+        server: str,
+        local_path: Path,
+        remote_path: str,
+        *,
+        label: Optional[str] = None,
+        timeout: int = 30,
+    ) -> bool:
+        """Pipe a local file's contents to the remote via ``ssh ... cat >``.
+
+        Used for the small Python helpers shipped to ``/tmp/ilha-<session>/``
+        for server prep and remote deploy. Returns True on success.
+        """
+        content = local_path.read_text()
+        cat_cmd = self.ssh.build_ssh_command(
+            username, server, f"cat > {shlex.quote(remote_path)}"
+        )
+        result = subprocess.run(
+            cat_cmd, input=content, capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            log_error(f"Failed to upload {label or local_path.name}: {result.stderr}")
+            return False
+        return True
+
+    # ──────────────────────────────────────────────────────────────────
     # Internal: server prep (slim)
     # ──────────────────────────────────────────────────────────────────
     def _prepare_server_slim(self, username: str, server: str) -> bool:
@@ -1974,6 +2563,7 @@ echo "Volume restore complete"
         script_dir = get_script_dir() / "scripts"
         server_prep_path = script_dir / "server_prep.py"
         deploy_utils_path = script_dir / "deploy_utils.py"
+        http_probe_path = script_dir / "http_probe.py"
 
         if not server_prep_path.exists():
             log_error(f"Slim prep script not found: {server_prep_path}")
@@ -1981,11 +2571,15 @@ echo "Volume restore complete"
         if not deploy_utils_path.exists():
             log_error(f"Deploy utilities not found: {deploy_utils_path}")
             return False
+        if not http_probe_path.exists():
+            log_error(f"HTTP probe helpers not found: {http_probe_path}")
+            return False
 
-        # Upload both files to remote /tmp directory
+        # Upload all files to remote /tmp directory
         remote_tmp_dir = f"/tmp/ilha-{self._session_id}"
         remote_prep_path = f"{remote_tmp_dir}/server_prep.py"
         remote_utils_path = f"{remote_tmp_dir}/deploy_utils.py"
+        remote_probe_path = f"{remote_tmp_dir}/http_probe.py"
 
         # Create remote tmp directory
         mkdir_cmd = self.ssh.build_ssh_command(
@@ -1996,28 +2590,18 @@ echo "Volume restore complete"
             log_error(f"Failed to create remote temp directory: {result.stderr}")
             return False
 
-        # Upload deploy_utils.py first (it's a dependency)
-        utils_content = deploy_utils_path.read_text()
-        upload_utils_cmd = self.ssh.build_ssh_command(
-            username, server, f"cat > {shlex.quote(remote_utils_path)}"
-        )
-        result = subprocess.run(
-            upload_utils_cmd, input=utils_content, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log_error(f"Failed to upload deploy_utils.py: {result.stderr}")
+        # Upload http_probe.py and deploy_utils.py first (dependencies of server_prep.py)
+        if not self._upload_remote_file(
+            username, server, http_probe_path, remote_probe_path, label="http_probe.py"
+        ):
             return False
-
-        # Upload server_prep.py
-        prep_content = server_prep_path.read_text()
-        upload_prep_cmd = self.ssh.build_ssh_command(
-            username, server, f"cat > {shlex.quote(remote_prep_path)}"
-        )
-        result = subprocess.run(
-            upload_prep_cmd, input=prep_content, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log_error(f"Failed to upload server_prep.py: {result.stderr}")
+        if not self._upload_remote_file(
+            username, server, deploy_utils_path, remote_utils_path, label="deploy_utils.py"
+        ):
+            return False
+        if not self._upload_remote_file(
+            username, server, server_prep_path, remote_prep_path, label="server_prep.py"
+        ):
             return False
 
         # Execute server_prep.py with PYTHONPATH set to find deploy_utils
@@ -2194,7 +2778,7 @@ echo "Volume restore complete"
         script = f"""#!/bin/bash
 set -euo pipefail
 cd {self.REMOTE_APP_ROOT}
-docker compose --env-file .env down --remove-orphans 2>&1 || true
+docker compose --env-file .env {self.COMPOSE_FLAGS} down --remove-orphans 2>&1 || true
 echo "App services stopped"
 """
         tmp_script = self._remote_tmp("stop-app.sh")
@@ -2214,7 +2798,15 @@ echo "App services stopped"
         return False
 
     def _start_caddy_remote(self, username: str, server: str) -> bool:
-        """Start global Caddy proxy on the server."""
+        """Start global Caddy proxy on the server.
+
+        ``--force-recreate`` is intentional: it tears down ``caddy_monitor`` so
+        any updates to its bind-mounted scripts (``caddy-docker-monitor.py``,
+        ``caddy_routing.py``, ``caddy_admin_utils.py``) are re-imported by a
+        fresh Python process. Without this, label-schema or routing-logic
+        fixes would silently sit on disk while the running daemon kept its
+        old in-memory copy.
+        """
         log_info("Starting Caddy proxy on server...")
         self.ssh.ensure_host_key(server)
         script = f"""#!/bin/bash
@@ -2431,7 +3023,7 @@ set -a
 [ -f .env ] && source .env
 set +a
 
-docker compose --env-file .env build 2>&1
+docker compose --env-file .env {self.COMPOSE_FLAGS} build 2>&1
 echo "Build complete"
 """
         return self._run_nohup_remote(
@@ -2459,6 +3051,7 @@ echo "Build complete"
         db_service = self.services.db_service
         deps_args = " ".join(shlex.quote(s) for s in self.services.dependency_services)
         worker_args = " ".join(shlex.quote(s) for s in self.services.worker_services)
+        frontend_service = self.services.frontend_service or ""
         return "\n".join(
             [
                 "#!/bin/bash",
@@ -2470,6 +3063,7 @@ echo "Build complete"
                 f"export DB_SERVICE={shlex.quote(db_service)}",
                 f"export DEPS_SERVICES={shlex.quote(deps_args)}",
                 f"export WORKER_SERVICES={shlex.quote(worker_args)}",
+                f"export FRONTEND_SERVICE={shlex.quote(frontend_service)}",
                 f"export BUILD_WEB={'1' if build else '0'}",
                 f"export PYTHONPATH={remote_tmp_dir}:${{PYTHONPATH:-}}",
                 f"cd {remote_tmp_dir}",
@@ -2499,21 +3093,21 @@ echo "Build complete"
             f"App start watchdog: {start_max_wait}s "
             f"({'includes embedded compose build web' if build else 'no embedded image build'})"
         )
-        # Upload remote_deploy.py and deploy_utils.py to remote /tmp
+        # Upload remote_deploy.py + its imports to remote /tmp
         script_dir = get_script_dir() / "scripts"
         remote_deploy_path = script_dir / "remote_deploy.py"
         deploy_utils_path = script_dir / "deploy_utils.py"
+        http_probe_path = script_dir / "http_probe.py"
 
-        if not remote_deploy_path.exists():
-            log_error(f"Remote deploy script not found: {remote_deploy_path}")
-            return False
-        if not deploy_utils_path.exists():
-            log_error(f"Deploy utilities not found: {deploy_utils_path}")
-            return False
+        for required in (remote_deploy_path, deploy_utils_path, http_probe_path):
+            if not required.exists():
+                log_error(f"Required deploy script missing: {required}")
+                return False
 
         remote_tmp_dir = f"/tmp/ilha-{self._session_id}"
         remote_deploy_file = f"{remote_tmp_dir}/remote_deploy.py"
         remote_utils_file = f"{remote_tmp_dir}/deploy_utils.py"
+        remote_probe_file = f"{remote_tmp_dir}/http_probe.py"
 
         # Create remote tmp directory
         mkdir_cmd = self.ssh.build_ssh_command(
@@ -2524,28 +3118,18 @@ echo "Build complete"
             log_error(f"Failed to create remote temp directory: {result.stderr}")
             return False
 
-        # Upload deploy_utils.py first (it's a dependency)
-        utils_content = deploy_utils_path.read_text()
-        upload_utils_cmd = self.ssh.build_ssh_command(
-            username, server, f"cat > {shlex.quote(remote_utils_file)}"
-        )
-        result = subprocess.run(
-            upload_utils_cmd, input=utils_content, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log_error(f"Failed to upload deploy_utils.py: {result.stderr}")
+        # Upload dependencies before the entry script.
+        if not self._upload_remote_file(
+            username, server, http_probe_path, remote_probe_file, label="http_probe.py"
+        ):
             return False
-
-        # Upload remote_deploy.py
-        deploy_content = remote_deploy_path.read_text()
-        upload_deploy_cmd = self.ssh.build_ssh_command(
-            username, server, f"cat > {shlex.quote(remote_deploy_file)}"
-        )
-        result = subprocess.run(
-            upload_deploy_cmd, input=deploy_content, capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            log_error(f"Failed to upload remote_deploy.py: {result.stderr}")
+        if not self._upload_remote_file(
+            username, server, deploy_utils_path, remote_utils_file, label="deploy_utils.py"
+        ):
+            return False
+        if not self._upload_remote_file(
+            username, server, remote_deploy_path, remote_deploy_file, label="remote_deploy.py"
+        ):
             return False
 
         wrapper_script = self._compose_remote_deploy_wrapper_script(
@@ -2571,7 +3155,7 @@ echo "Build complete"
         web_service = self.services.web_service
         web_cid_cmd = self.ssh.build_ssh_command(
             username, server,
-            f"cd {app_root} && docker compose --env-file .env ps -q {shlex.quote(web_service)} 2>/dev/null | head -1",
+            f"cd {app_root} && docker compose --env-file .env {self.COMPOSE_FLAGS} ps -q {shlex.quote(web_service)} 2>/dev/null | head -1",
         )
         web_cid_result = subprocess.run(web_cid_cmd, capture_output=True, text=True, timeout=10)
         web_cid = (web_cid_result.stdout or "").strip()

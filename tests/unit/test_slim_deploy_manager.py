@@ -99,7 +99,7 @@ def test_gather_source_manifest_collects_checksums(tmp_path: Path, monkeypatch):
     worktree = root / "worktrees" / "demo"
     (worktree / ".ilha").mkdir(parents=True)
     (worktree / "Dockerfile").write_text("FROM python:3.12-slim\n")
-    (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: app\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: app\n")
     (worktree / "pyproject.toml").write_text("[project]\nname='demo'\n")
     (worktree / "uv.lock").write_text("version = 1\n")
 
@@ -114,7 +114,7 @@ def test_gather_source_manifest_collects_checksums(tmp_path: Path, monkeypatch):
     assert manifest["git_branch"] == "demo"
     assert manifest["git_dirty"] is True
     assert manifest["checksums"]["Dockerfile"] is not None
-    assert manifest["checksums"][".ilha/docker-compose.worktree.yml"] is not None
+    assert manifest["checksums"][".ilha/docker-compose.overlay.yml"] is not None
     assert manifest["checksums"]["pyproject.toml"] is not None
     assert manifest["checksums"]["uv.lock"] is not None
 
@@ -126,8 +126,8 @@ def test_build_drift_report_warns_for_dockerfile_and_fails_for_compose(tmp_path:
     (worktree / ".ilha").mkdir(parents=True)
     (root / "Dockerfile").write_text("FROM python:3.12\n")
     (worktree / "Dockerfile").write_text("FROM python:3.13\n")
-    (root / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: root\n")
-    (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: worktree\n")
+    (root / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: root\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: worktree\n")
 
     mgr = SlimDeployManager(project_root=root)
     report = mgr.preflight.build_drift_report(worktree, root)
@@ -135,7 +135,7 @@ def test_build_drift_report_warns_for_dockerfile_and_fails_for_compose(tmp_path:
     assert report["status"] == "error"
     severities = {entry["file"]: entry["severity"] for entry in report["differences"]}
     assert severities["Dockerfile"] == "warning"
-    assert severities[".ilha/docker-compose.worktree.yml"] == "error"
+    assert severities[".ilha/docker-compose.overlay.yml"] == "error"
 
 
 def test_build_drift_report_skips_cross_tree_drift_when_heads_differ(tmp_path: Path, monkeypatch):
@@ -143,8 +143,8 @@ def test_build_drift_report_skips_cross_tree_drift_when_heads_differ(tmp_path: P
     worktree = root / "worktrees" / "demo"
     (root / ".ilha").mkdir(parents=True)
     (worktree / ".ilha").mkdir(parents=True)
-    (root / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: root\n")
-    (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: worktree\n")
+    (root / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: root\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: worktree\n")
 
     mgr = SlimDeployManager(project_root=root)
     monkeypatch.setattr(mgr.preflight, "_git_rev_parse_head", lambda path: "root-head" if path == root else "worktree-head")
@@ -162,8 +162,8 @@ def test_build_drift_report_strict_mode_keeps_drift_enforcement(tmp_path: Path, 
     worktree = root / "worktrees" / "demo"
     (root / ".ilha").mkdir(parents=True)
     (worktree / ".ilha").mkdir(parents=True)
-    (root / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: root\n")
-    (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: worktree\n")
+    (root / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: root\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: worktree\n")
 
     mgr = SlimDeployManager(project_root=root)
     monkeypatch.setattr(mgr.preflight, "_git_rev_parse_head", lambda _path: "same-head")
@@ -172,7 +172,7 @@ def test_build_drift_report_strict_mode_keeps_drift_enforcement(tmp_path: Path, 
 
     assert report["status"] == "error"
     assert report["skipped"] is False
-    assert any(entry["file"] == ".ilha/docker-compose.worktree.yml" for entry in report["differences"])
+    assert any(entry["file"] == ".ilha/docker-compose.overlay.yml" for entry in report["differences"])
 
 
 def test_run_deploy_preflight_fails_on_critical_drift(tmp_path: Path, monkeypatch):
@@ -180,8 +180,8 @@ def test_run_deploy_preflight_fails_on_critical_drift(tmp_path: Path, monkeypatc
     worktree = root / "worktrees" / "demo"
     (root / ".ilha").mkdir(parents=True)
     (worktree / ".ilha").mkdir(parents=True)
-    (root / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: root\n")
-    (worktree / ".ilha" / "docker-compose.worktree.yml").write_text("services:\n  web:\n    image: worktree\n")
+    (root / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: root\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text("services:\n  web:\n    image: worktree\n")
 
     mgr = SlimDeployManager(project_root=root)
     monkeypatch.setattr(mgr.preflight, "_get_git_branch", lambda _path: "demo")
@@ -197,7 +197,7 @@ def test_detect_smoke_path_prefers_compose_label_then_repo_convention(tmp_path: 
     root = tmp_path / "repo"
     worktree = root / "worktrees" / "demo"
     (worktree / ".ilha").mkdir(parents=True)
-    compose = worktree / ".ilha" / "docker-compose.worktree.yml"
+    compose = worktree / ".ilha" / "docker-compose.overlay.yml"
     compose.write_text(
         "services:\n"
         "  web:\n"
@@ -214,18 +214,36 @@ def test_detect_smoke_path_prefers_compose_label_then_repo_convention(tmp_path: 
     assert mgr.preflight._detect_smoke_path(compose, root) == "/api/health/"
 
 
-def test_detect_env_contract_issues_warns_on_schemed_site_domain(tmp_path: Path):
-    root = tmp_path / "repo"
-    worktree = root / "worktrees" / "demo"
-    (worktree / ".ilha").mkdir(parents=True)
-    (worktree / ".ilha" / "env.ilha").write_text("SITE_DOMAIN=https://staging.example.com/login/\n")
+def test_run_smoke_checks_skips_external_when_dns_not_ready(tmp_path: Path, monkeypatch):
+    """Deploy should not fail when the local resolver lags behind DNS propagation."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    local_calls: list[list[str]] = []
 
-    mgr = SlimDeployManager(project_root=root)
-    warnings = mgr.preflight.detect_env_contract_issues(worktree)
+    def capture_local(cmd, timeout=10):
+        local_calls.append(list(cmd) if isinstance(cmd, list) else [])
+        return 0, "", ""
 
-    assert len(warnings) == 1
-    assert warnings[0]["variable"] == "SITE_DOMAIN"
-    assert warnings[0]["normalized_value"] == "staging.example.com"
+    monkeypatch.setattr(mgr, "_remote_service_exists", lambda *a, **k: False)
+    monkeypatch.setattr(mgr, "_run_remote_text", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(mgr, "_run_local_text", capture_local)
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(mgr, "_wait_for_dns_resolution", lambda *a, **k: False)
+
+    ok, report = mgr._run_smoke_checks(
+        username="root",
+        server="1.2.3.4",
+        smoke_path="/",
+        domain="slow.example.com",
+        ip="1.2.3.4",
+    )
+
+    assert ok is True
+    assert report.get("external_checks_skipped") == "dns_not_ready_locally"
+    assert {check["name"] for check in report["checks"]} == {"local_app"}
+    # No local curl to the public domain (would fail the same as deploy host).
+    for cmd in local_calls:
+        joined = " ".join(cmd)
+        assert "slow.example.com" not in joined
 
 
 def test_run_smoke_checks_retries_until_success(tmp_path: Path, monkeypatch):
@@ -256,6 +274,7 @@ def test_run_smoke_checks_retries_until_success(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(mgr, "_run_remote_text", fake_remote)
     monkeypatch.setattr(mgr, "_run_local_text", fake_local)
     monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(mgr, "_wait_for_dns_resolution", lambda *a, **k: True)
 
     ok, report = mgr._run_smoke_checks(
         username="root",
@@ -425,3 +444,183 @@ def test_doctor_skips_missing_worker_service(tmp_path: Path, monkeypatch):
     assert report["success"] is True
     assert report["smoke_path"] == "/api/health/"
     assert any(check["title"] == "rq-worker-1_logs" for check in skipped)
+
+
+def test_wait_for_dns_resolution_returns_true_on_resolve(tmp_path: Path, monkeypatch):
+    """Polling exits as soon as ``socket.gethostbyname`` returns an answer."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+
+    import socket as _socket
+
+    answers = iter([
+        _socket.gaierror(8, "nodename nor servname provided"),
+        _socket.gaierror(8, "nodename nor servname provided"),
+        "203.0.113.7",
+    ])
+
+    def fake_gethostbyname(host: str) -> str:
+        nxt = next(answers)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+    monkeypatch.setattr("socket.gethostbyname", fake_gethostbyname)
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.time.sleep", lambda _s: None)
+
+    assert mgr._wait_for_dns_resolution("demo.example.com", expected_ip=None, timeout_seconds=5) is True
+
+
+def test_wait_for_dns_resolution_returns_false_on_timeout(tmp_path: Path, monkeypatch):
+    """Returns False when the deadline passes without a successful answer."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+
+    def fake_gethostbyname(host: str) -> str:
+        import socket as _socket
+        raise _socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr("socket.gethostbyname", fake_gethostbyname)
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.time.sleep", lambda _s: None)
+
+    assert mgr._wait_for_dns_resolution("demo.example.com", expected_ip=None, timeout_seconds=0) is False
+
+
+def test_build_merged_env_does_not_synthesize_database_url_for_static_site(tmp_path: Path):
+    """Caddy-only worktrees must not get a phantom DATABASE_URL with bipassword."""
+    repo = tmp_path / "repo"
+    worktree = repo / "worktrees" / "demo"
+    deploy_dir = tmp_path / "deploy"
+    (worktree / ".ilha").mkdir(parents=True)
+    (worktree / ".ilha" / "env.ilha").write_text("COMPOSE_PROJECT_NAME=demo\n")
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text(
+        "services:\n  caddy:\n    image: caddy:2-alpine\n"
+    )
+    (deploy_dir / "code" / ".ilha").mkdir(parents=True)
+
+    mgr = SlimDeployManager(project_root=repo)
+    mgr._build_merged_env(
+        deploy_dir=deploy_dir,
+        worktree_path=worktree,
+        branch_name="demo",
+        domain="static.example.com",
+    )
+
+    text = (deploy_dir / ".env").read_text()
+    assert "DATABASE_URL" not in text
+    assert "bipassword" not in text
+
+
+def test_build_merged_env_synthesizes_database_url_for_django_postgres(tmp_path: Path):
+    """Postgres-bearing worktrees still get the DATABASE_URL fallback."""
+    repo = tmp_path / "repo"
+    worktree = repo / "worktrees" / "demo"
+    deploy_dir = tmp_path / "deploy"
+    (worktree / ".ilha").mkdir(parents=True)
+    (worktree / ".ilha" / "env.ilha").write_text(
+        "COMPOSE_PROJECT_NAME=demo\nPOSTGRES_PASSWORD=secret\nPOSTGRES_USER=u\nPOSTGRES_DB=app\n"
+    )
+    (worktree / ".ilha" / "docker-compose.overlay.yml").write_text(
+        "services:\n  web:\n    image: app\n  db:\n    image: postgres:16\n"
+    )
+    (worktree / "manage.py").write_text("")
+    (deploy_dir / "code" / ".ilha").mkdir(parents=True)
+
+    mgr = SlimDeployManager(project_root=repo)
+    mgr._build_merged_env(
+        deploy_dir=deploy_dir,
+        worktree_path=worktree,
+        branch_name="demo",
+        domain="app.example.com",
+    )
+
+    text = (deploy_dir / ".env").read_text()
+    assert 'DATABASE_URL="postgres://u:secret@db:5432/app"' in text
+
+
+def test_backup_volumes_locally_skips_when_no_volumes_on_host(tmp_path: Path, monkeypatch):
+    """Static-site projects (no real volumes) must skip cleanly, not error."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+
+    monkeypatch.setattr(
+        "ilha.utils.validation.validate_volume_exists",
+        lambda _name: False,
+    )
+
+    backup_called = {"count": 0}
+
+    class _StubDocker:
+        def __init__(self, project_root):
+            pass
+
+        def backup_volumes(self, *args, **kwargs):
+            backup_called["count"] += 1
+            return None
+
+    monkeypatch.setattr(
+        "ilha.core.docker_manager.DockerManager", _StubDocker
+    )
+
+    result = mgr._backup_volumes_locally("demo", deploy_dir)
+
+    assert result is None
+    assert backup_called["count"] == 0, (
+        "DockerManager.backup_volumes must NOT be invoked when zero volumes exist on the host"
+    )
+
+
+def test_retarget_paths_to_code_subdir_rewrites_build_volumes_env_file(tmp_path: Path):
+    """Base compose lives one level above the code/ dir on the droplet, so
+    user-written relative paths must be retargeted into ./code/."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    data = {
+        "services": {
+            "web": {
+                "build": {"context": ".", "dockerfile": "Dockerfile"},
+                "volumes": [".:/app", "/var/run/docker.sock:/var/run/docker.sock"],
+                "env_file": [".env", "./config/extra.env"],
+            },
+            "frontend": {
+                "build": "./frontend",
+                "volumes": [
+                    "./frontend:/app/frontend",
+                    "frontend_node_modules:/app/frontend/node_modules",
+                ],
+            },
+            "db": {
+                "image": "postgres:16-alpine",
+                "volumes": [{"type": "bind", "source": "./pgdata", "target": "/var/lib/postgresql/data"}],
+            },
+        }
+    }
+
+    mgr._retarget_paths_to_code_subdir(data)
+
+    web = data["services"]["web"]
+    assert web["build"]["context"] == "./code"
+    assert web["build"]["dockerfile"] == "Dockerfile"  # left alone
+    assert web["volumes"] == ["./code:/app", "/var/run/docker.sock:/var/run/docker.sock"]
+    assert web["env_file"] == ["./code/.env", "./code/config/extra.env"]
+
+    frontend = data["services"]["frontend"]
+    assert frontend["build"] == "./code/frontend"
+    assert frontend["volumes"] == [
+        "./code/frontend:/app/frontend",
+        "frontend_node_modules:/app/frontend/node_modules",  # named volume untouched
+    ]
+
+    db = data["services"]["db"]
+    assert db["volumes"][0]["source"] == "./code/pgdata"
+
+
+def test_retarget_relative_path_leaves_absolute_and_named_refs():
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "/abs/path") == "/abs/path"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "~/foo") == "~/foo"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "$VAR/foo") == "$VAR/foo"
+    # Bare relative names get the prefix too (caller is responsible for
+    # only passing values that are unambiguously paths).
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "named_thing") == "./code/named_thing"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, ".") == "./code"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "./x") == "./code/x"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "../x") == "./code/../x"
+    assert SlimDeployManager._retarget_relative_path(SlimDeployManager, ".env") == "./code/.env"

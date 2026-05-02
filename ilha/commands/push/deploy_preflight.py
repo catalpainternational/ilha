@@ -5,21 +5,18 @@ Extracted from SlimDeployManager to keep deploy orchestration and pre-deploy
 validation in separate modules.
 """
 
-import os
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 from ...config.settings import get_worktree_dir
 from ...utils.checksum import calculate_file_checksum
-from ...utils.deploy_hosts import normalize_deploy_host
-from ...utils.env_loader import load_env_file
 from ...utils.logging import (
-    log_info,
     log_warning,
     log_error,
     print_plain,
 )
+from ...utils.project_footprint import detect_project_footprint
 
 
 class DeployPreflight:
@@ -27,22 +24,11 @@ class DeployPreflight:
 
     _DRIFT_RULES: List[Tuple[str, str]] = [
         ("Dockerfile", "warning"),
-        (".ilha/docker-compose.worktree.yml", "error"),
+        ("docker-compose.yml", "error"),
+        (".ilha/docker-compose.overlay.yml", "error"),
         ("pyproject.toml", "error"),
         ("uv.lock", "error"),
     ]
-
-    # Environment variables and their known-insecure default values.
-    # Deploy is blocked if any of these match, unless ILHA_ALLOW_INSECURE_DEFAULTS=1.
-    # Values are exact matches; prefixes are checked separately below.
-    _INSECURE_DEFAULTS: Dict[str, List[str]] = {
-        "DJANGO_SECRET_KEY": ["django-insecure-secret-key", ""],
-        "POSTGRES_PASSWORD": ["bipassword", ""],
-    }
-    # Values starting with these prefixes are also considered insecure.
-    _INSECURE_PREFIXES: Dict[str, List[str]] = {
-        "DJANGO_SECRET_KEY": ["django-insecure-"],
-    }
 
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root).resolve()
@@ -54,7 +40,7 @@ class DeployPreflight:
         candidate = self.project_root / worktree_dir / branch_name
         if candidate.exists():
             return candidate.resolve()
-        current_candidate = self.project_root / ".ilha" / "docker-compose.worktree.yml"
+        current_candidate = self.project_root / ".ilha" / "docker-compose.overlay.yml"
         if current_candidate.exists():
             return self.project_root.resolve()
         return candidate.resolve()
@@ -119,6 +105,59 @@ class DeployPreflight:
         except (FileNotFoundError, IOError):
             return None
 
+    def _warn_if_django_missing_collectstatic(
+        self, worktree_path: Path, footprint: Any,
+    ) -> None:
+        """Surface the ``/static/admin/*`` 404 trap early.
+
+        Django's prod static (admin CSS, app statics) requires ``collectstatic``
+        to populate ``STATIC_ROOT`` before the server starts. Whitenoise
+        respects the ``DEBUG`` flag — on a prod deploy (DEBUG=False, which
+        ilha sets) it serves only the collected files, not the source tree.
+        Projects that forget the ``collectstatic`` step in their compose
+        ``command`` end up with a working Django admin login *page* but
+        unstyled assets.
+        """
+        if not getattr(footprint, "has_django", False):
+            return
+        backend_service = getattr(footprint, "backend_service", None) or "web"
+
+        try:
+            import yaml
+
+            compose_path = worktree_path / "docker-compose.yml"
+            if not compose_path.exists():
+                return
+            data = yaml.safe_load(compose_path.read_text()) or {}
+        except Exception:
+            return
+
+        service = (data.get("services") or {}).get(backend_service)
+        if not isinstance(service, dict):
+            return
+
+        cmd = service.get("command")
+        if isinstance(cmd, list):
+            cmd_str = " ".join(str(part) for part in cmd)
+        else:
+            cmd_str = str(cmd or "")
+
+        if not cmd_str:
+            # No command means the image's entrypoint runs; we can't see what
+            # it does. Stay quiet rather than nag with a false-positive.
+            return
+
+        if "collectstatic" in cmd_str.lower():
+            return
+
+        log_warning(
+            f"Django backend '{backend_service}' command does not invoke "
+            "`manage.py collectstatic`. Static admin assets (e.g. "
+            "/static/admin/css/base.css) will 404 in prod. Add "
+            "`python manage.py collectstatic --noinput &&` to the compose "
+            "`command` before your server start."
+        )
+
     def _detect_smoke_path(self, worktree_compose: Path, comparison_root: Path) -> str:
         try:
             import yaml
@@ -152,106 +191,6 @@ class DeployPreflight:
                     continue
         return "/"
 
-    def detect_env_contract_issues(self, worktree_path: Path) -> List[Dict[str, Any]]:
-        warnings: List[Dict[str, Any]] = []
-        env_candidates = [
-            worktree_path / ".env",
-            worktree_path / ".ilha" / "env.ilha",
-        ]
-
-        for env_path in env_candidates:
-            if not env_path.exists():
-                continue
-            try:
-                env_values = load_env_file(env_path)
-            except Exception as exc:
-                log_warning(f"Could not parse env file {env_path} for contract check: {exc}")
-                continue
-
-            site_domain = (env_values.get("SITE_DOMAIN") or "").strip()
-            normalized_site_domain = normalize_deploy_host(site_domain)
-            if site_domain and normalized_site_domain and site_domain != normalized_site_domain:
-                warnings.append(
-                    {
-                        "file": str(env_path),
-                        "variable": "SITE_DOMAIN",
-                        "current_value": site_domain,
-                        "normalized_value": normalized_site_domain,
-                        "message": (
-                            f"{env_path} stores SITE_DOMAIN={site_domain!r}; "
-                            f"expected bare host {normalized_site_domain!r}"
-                        ),
-                    }
-                )
-
-        return warnings
-
-    # ── insecure defaults ────────────────────────────────────────────
-
-    def _check_insecure_defaults(self, worktree_path: Path) -> List[Dict[str, Any]]:
-        """Check merged environment for known-insecure default values.
-
-        Returns a list of issues (empty = all clear).  Each issue is a dict
-        with keys: variable, value, file, message.
-        """
-        issues: List[Dict[str, Any]] = []
-        env_candidates = [
-            worktree_path / ".env",
-            worktree_path / ".ilha" / "env.ilha",
-        ]
-        merged: Dict[str, str] = {}
-        source_file: Dict[str, str] = {}
-        for env_path in env_candidates:
-            if not env_path.exists():
-                continue
-            try:
-                env_values = load_env_file(env_path)
-            except Exception:
-                continue
-            for k, v in env_values.items():
-                merged[k] = v
-                source_file[k] = str(env_path)
-
-        for var_name, bad_values in self._INSECURE_DEFAULTS.items():
-            value = merged.get(var_name)
-            if value is None:
-                # Variable not set at all — likely relying on compose-level default
-                issues.append({
-                    "variable": var_name,
-                    "value": "(unset)",
-                    "file": "N/A",
-                    "message": (
-                        f"{var_name} is not set in any env file. "
-                        f"It will fall back to the insecure compose default. "
-                        f"Set it explicitly before deploying."
-                    ),
-                })
-            elif value in bad_values:
-                issues.append({
-                    "variable": var_name,
-                    "value": value or "(empty)",
-                    "file": source_file.get(var_name, "unknown"),
-                    "message": (
-                        f"{var_name} is set to a known-insecure default ({value!r}). "
-                        f"Set a strong, unique value before deploying."
-                    ),
-                })
-            else:
-                # Check insecure prefixes (e.g. django-insecure-*)
-                for prefix in self._INSECURE_PREFIXES.get(var_name, []):
-                    if value.startswith(prefix):
-                        issues.append({
-                            "variable": var_name,
-                            "value": value[:40] + ("..." if len(value) > 40 else ""),
-                            "file": source_file.get(var_name, "unknown"),
-                            "message": (
-                                f"{var_name} starts with insecure prefix {prefix!r}. "
-                                f"Set a strong, unique value before deploying."
-                            ),
-                        })
-                        break
-        return issues
-
     # ── manifest & drift ─────────────────────────────────────────────
 
     def gather_source_manifest(
@@ -262,7 +201,8 @@ class DeployPreflight:
     ) -> Dict[str, Any]:
         files = {
             "Dockerfile": worktree_path / "Dockerfile",
-            ".ilha/docker-compose.worktree.yml": worktree_path / ".ilha" / "docker-compose.worktree.yml",
+            "docker-compose.yml": worktree_path / "docker-compose.yml",
+            ".ilha/docker-compose.overlay.yml": worktree_path / ".ilha" / "docker-compose.overlay.yml",
             "pyproject.toml": worktree_path / "pyproject.toml",
             "uv.lock": worktree_path / "uv.lock",
         }
@@ -336,7 +276,7 @@ class DeployPreflight:
         manifest: Dict[str, Any],
         drift_report: Dict[str, Any],
         smoke_path: str,
-        env_contract_warnings: List[Dict[str, Any]],
+        footprint: Optional[Any] = None,
     ) -> None:
         print_plain("")
         print_plain("Deploy source manifest:")
@@ -348,7 +288,24 @@ class DeployPreflight:
         print_plain(f"  Dirty: {dirty if dirty is not None else 'unknown'}")
         for name, checksum in manifest.get("checksums", {}).items():
             print_plain(f"  {name}: {checksum or 'missing'}")
+        wt = Path(manifest["source_path"])
+        if (
+            not (wt / "Dockerfile").exists()
+            and (wt / "docker-compose.yml").exists()
+        ):
+            print_plain(
+                "  Note: No Dockerfile is OK when "
+                "`docker-compose.yml` defines an image-based app "
+                "(e.g. a Caddy-based static site)."
+            )
         print_plain(f"  Smoke path: {smoke_path}")
+        if footprint is not None:
+            arche = getattr(footprint.archetype, "value", footprint.archetype)
+            print_plain(f"  Archetype: {arche}")
+            if footprint.backend_service:
+                print_plain(f"  Backend service: {footprint.backend_service}")
+            if footprint.frontend_service:
+                print_plain(f"  Frontend service: {footprint.frontend_service}")
         if drift_report.get("differences"):
             print_plain("  Drift detected:")
             for entry in drift_report["differences"]:
@@ -358,8 +315,6 @@ class DeployPreflight:
                 )
         if drift_report.get("skipped") and drift_report.get("skip_reason") == "different_git_heads":
             print_plain("  Drift check skipped: comparison root and worktree are on different git commits")
-        for warning in env_contract_warnings:
-            print_plain(f"  Warning: {warning['message']}")
         print_plain("")
 
     # ── orchestrator ─────────────────────────────────────────────────
@@ -368,22 +323,18 @@ class DeployPreflight:
         self,
         branch_name: str,
         strict_deploy_drift: bool = False,
-        strict_env_contract: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        """Run all preflight checks and return context dict, or None on failure.
+        """Run preflight checks and return context dict, or None on failure.
 
         The returned dict contains:
-          - worktree_path, comparison_root, manifest, drift_report, smoke_path
+          - worktree_path, comparison_root, manifest, drift_report, smoke_path,
+            footprint
 
-        On failure, returns None and populates ``errors`` (a list of dicts with
-        error_code / stage / root_cause / suggested_actions / failure_category).
-        Callers are responsible for forwarding those into the deploy report.
-
-        When ``strict_env_contract`` is True, env-contract issues (e.g.
-        ``SITE_DOMAIN`` with an ``http://``/``https://`` prefix) block the
-        deploy rather than just warning. This catches the CSRF-breakage class
-        documented in STAGING_DROPLET_FIXES.md before a deploy can reach the
-        server.
+        Checks performed are scoped to ilha-owned concerns: source manifest,
+        critical-file drift between worktree and comparison root, and smoke-path
+        detection. App-owned env values (DJANGO_SECRET_KEY, POSTGRES_PASSWORD,
+        SITE_DOMAIN shape) are not policed here — the user owns their compose
+        and .env.
         """
         worktree_path = self.resolve_worktree_path(branch_name)
         if not worktree_path.exists():
@@ -391,16 +342,20 @@ class DeployPreflight:
             return None
 
         comparison_root = self.resolve_comparison_root(worktree_path)
+        footprint = detect_project_footprint(worktree_path)
         manifest = self.gather_source_manifest(branch_name, worktree_path, comparison_root)
         drift_report = self.build_drift_report(
             worktree_path,
             comparison_root,
             strict_deploy_drift=strict_deploy_drift,
         )
-        smoke_path = self._detect_smoke_path(worktree_path / ".ilha" / "docker-compose.worktree.yml", comparison_root)
-        env_contract_warnings = self.detect_env_contract_issues(worktree_path)
+        smoke_path = self._detect_smoke_path(worktree_path / ".ilha" / "docker-compose.overlay.yml", comparison_root)
 
-        self._print_source_manifest(manifest, drift_report, smoke_path, env_contract_warnings)
+        self._print_source_manifest(manifest, drift_report, smoke_path, footprint=footprint)
+
+        # Project-side checks: warn early so the user has a chance to fix the
+        # compose before sitting through a full deploy that surfaces a 404.
+        self._warn_if_django_missing_collectstatic(worktree_path, footprint)
 
         for entry in drift_report.get("differences", []):
             message = (
@@ -412,40 +367,8 @@ class DeployPreflight:
             else:
                 log_error(message)
 
-        for warning in env_contract_warnings:
-            if strict_env_contract:
-                log_error(warning["message"])
-            else:
-                log_warning(warning["message"])
-
         if drift_report.get("status") == "error":
             return None
-
-        if strict_env_contract and env_contract_warnings:
-            log_error(
-                "Deploy blocked: env-contract issues detected. Fix the values above "
-                "(e.g. set SITE_DOMAIN to a bare host, not a URL) or pass "
-                "--no-strict-env-contract to bypass. Mis-formed SITE_DOMAIN "
-                "breaks CSRF_TRUSTED_ORIGINS on the server."
-            )
-            return None
-
-        # ── Insecure default credential check ─────────────────────────
-        insecure_issues = self._check_insecure_defaults(worktree_path)
-        if insecure_issues:
-            allow = os.environ.get("ILHA_ALLOW_INSECURE_DEFAULTS", "").lower() in ("1", "true", "yes")
-            for issue in insecure_issues:
-                if allow:
-                    log_warning(f"[insecure-defaults] {issue['message']} (allowed via ILHA_ALLOW_INSECURE_DEFAULTS)")
-                else:
-                    log_error(f"[insecure-defaults] {issue['message']}")
-            if not allow:
-                log_error(
-                    "Deploy blocked: insecure default credentials detected. "
-                    "Set strong values in .env or .ilha/env.ilha, or set "
-                    "ILHA_ALLOW_INSECURE_DEFAULTS=1 to bypass (not recommended for production)."
-                )
-                return None
 
         return {
             "worktree_path": worktree_path,
@@ -453,5 +376,5 @@ class DeployPreflight:
             "manifest": manifest,
             "drift_report": drift_report,
             "smoke_path": smoke_path,
-            "env_contract_warnings": env_contract_warnings,
+            "footprint": footprint,
         }

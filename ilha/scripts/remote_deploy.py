@@ -6,17 +6,20 @@ Runs on the TARGET server. Configuration comes from environment variables:
 - WEB_SERVICE: Compose service name for primary web app
 - WEB_PORT: Port web app listens on inside container
 - HEALTH_PATH: HTTP path for health checks
-- DB_SERVICE: Compose service for database (used for readiness check)
-- DEPS_SERVICES: Space-separated list of dependency services to bring up first
-- WORKER_SERVICES: Space-separated worker services
+- DB_SERVICE: Compose service for database (empty = no database tier)
+- DEPS_SERVICES: Space-separated list of dependency services (empty = none)
+- WORKER_SERVICES: Space-separated worker services (empty = none)
+- FRONTEND_SERVICE: Compose service for the SPA frontend (empty = none)
 - BUILD_WEB: "1" to build the web image before deploy, "" to skip
 
 Strategy (brief downtime accepted):
-1. Bring up dependency services and wait for the database to be ready.
+1. (Optional) Bring up dependency services and wait for the database. Static
+   sites and other db-less projects skip this step entirely.
 2. (Optional) Build the web image.
 3. ``compose up -d`` for the web service and any workers — compose recreates
-   anything whose image or config changed. The container's own entrypoint is
-   responsible for running migrations before serving traffic.
+   anything whose image or config changed. Apps with their own entrypoint
+   (e.g. Django containers running migrations) are responsible for being
+   ready before answering health checks.
 4. Health-check the resulting web container.
 """
 
@@ -31,7 +34,7 @@ from deploy_utils import DeployLogger, DockerCommand
 
 
 class RemoteDeployer:
-    """Bring up dependencies, run migrations, then start web/workers."""
+    """Bring up dependencies (if any), run migrations, then start web/workers."""
 
     def __init__(self):
         self.logger = DeployLogger()
@@ -41,9 +44,12 @@ class RemoteDeployer:
         self.web_service = self._require_env("WEB_SERVICE")
         self.web_port = self._require_env("WEB_PORT")
         self.health_path = self._require_env("HEALTH_PATH")
-        self.db_service = self._require_env("DB_SERVICE")
-        self.deps_services = self._require_env("DEPS_SERVICES").split()
-        self.worker_services = os.getenv("WORKER_SERVICES", "").split()
+        # db / deps / workers are now optional. An empty string here is the
+        # convention for "no database tier" / "no dependencies".
+        self.db_service = (os.getenv("DB_SERVICE") or "").strip()
+        self.deps_services = [s for s in (os.getenv("DEPS_SERVICES") or "").split() if s]
+        self.worker_services = [s for s in (os.getenv("WORKER_SERVICES") or "").split() if s]
+        self.frontend_service = (os.getenv("FRONTEND_SERVICE") or "").strip()
         self.build_web = os.getenv("BUILD_WEB", "0") == "1"
         self.env_file = ".env"
 
@@ -79,7 +85,11 @@ class RemoteDeployer:
         self.logger.info(f"Writing failure diagnostics to {diag_dir}")
         _write_cmd(
             "docker_compose_ps",
-            ["docker", "compose", "--env-file", self.env_file, "ps", "-a"],
+            [
+                "docker", "compose", "--env-file", self.env_file,
+                *DockerCommand.COMPOSE_FLAGS,
+                "ps", "-a",
+            ],
         )
         if container_id:
             _write_cmd(
@@ -95,15 +105,21 @@ class RemoteDeployer:
     def run(self) -> bool:
         self.logger.info("=== Deployment ===")
 
-        self.logger.info(f"Step 1: Bringing up dependencies: {self.deps_services}")
-        self.docker.compose(
-            "up", ["-d"] + self.deps_services, env_file=self.env_file, check=False
-        )
+        if self.deps_services:
+            self.logger.info(f"Step 1: Bringing up dependencies: {self.deps_services}")
+            self.docker.compose(
+                "up", ["-d"] + self.deps_services, env_file=self.env_file, check=False
+            )
+        else:
+            self.logger.info("Step 1: No dependency services configured; skipping")
 
-        self.logger.info(f"Step 1: Waiting for {self.db_service} readiness...")
-        if not self.docker.wait_for_postgres(self.db_service, env_file=self.env_file):
-            self.logger.error("Database not ready")
-            return False
+        if self.db_service:
+            self.logger.info(f"Step 1: Waiting for {self.db_service} readiness...")
+            if not self.docker.wait_for_postgres(self.db_service, env_file=self.env_file):
+                self.logger.error("Database not ready")
+                return False
+        else:
+            self.logger.info("Step 1: No database service configured; skipping readiness wait")
 
         if self.build_web:
             self.logger.info(f"Step 2: Building {self.web_service} image...")
@@ -119,6 +135,8 @@ class RemoteDeployer:
             self.logger.info("Step 2: Skipping image build (using existing image)")
 
         services = [self.web_service] + self.worker_services
+        if self.frontend_service:
+            services.append(self.frontend_service)
         self.logger.info(f"Step 3: Bringing up {services}...")
         if (
             self.docker.compose(
@@ -131,6 +149,8 @@ class RemoteDeployer:
 
         if not self.worker_services:
             self.logger.info("No workers configured")
+        if not self.frontend_service:
+            self.logger.info("No frontend service configured")
 
         # The container's entrypoint may run migrations + collectstatic before
         # uvicorn answers /health-check/. Allow up to 180s (90 × 2s) before

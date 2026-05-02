@@ -168,8 +168,14 @@ def test_deploy_service_config_invalid_port_falls_back(caplog):
 
 
 def test_load_deploy_service_config_missing_file_returns_defaults(tmp_path: Path):
+    """No config and no compose file → empty deps/workers/db (nothing to infer)."""
     cfg = load_deploy_service_config(tmp_path)
-    assert cfg == DeployServiceConfig()
+    assert cfg.web_service == "web"
+    assert cfg.web_port == 8000
+    assert cfg.health_path == "/health-check/"
+    assert cfg.dependency_services == []
+    assert cfg.db_service == ""
+    assert cfg.worker_services == []
 
 
 def test_load_deploy_service_config_reads_yaml(tmp_path: Path):
@@ -186,6 +192,46 @@ def test_load_deploy_service_config_reads_yaml(tmp_path: Path):
     assert cfg.web_port == 3000
     assert cfg.health_path == "/healthz"
     assert cfg.worker_services == []
+
+
+def test_load_deploy_service_config_smoke_path_default_and_override(tmp_path: Path):
+    """``smoke_path`` defaults to ``None`` (= use detection); explicit value wins."""
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.smoke_path is None  # no override → preflight detection runs
+
+    (tmp_path / ".ilha").mkdir()
+    (tmp_path / ".ilha" / "config.yml").write_text(
+        "deploy:\n"
+        "  smoke_path: /api/health/\n"
+    )
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.smoke_path == "/api/health/"
+
+
+def test_smoke_path_env_var_overrides_config_and_detection(tmp_path: Path, monkeypatch):
+    """``ILHA_SMOKE_PATH`` wins over ``deploy.smoke_path`` and preflight detection."""
+    (tmp_path / ".ilha").mkdir()
+    (tmp_path / ".ilha" / "config.yml").write_text(
+        "deploy:\n"
+        "  smoke_path: /from/config/\n"
+    )
+    monkeypatch.setenv("ILHA_SMOKE_PATH", "/from/env/")
+    mgr = SlimDeployManager(project_root=tmp_path)
+    # Stub preflight to isolate the override layer.
+    monkeypatch.setattr(
+        mgr.preflight,
+        "run_deploy_preflight",
+        lambda *a, **kw: {
+            "manifest": {}, "drift_report": {}, "smoke_path": "/detected/",
+        },
+    )
+    result = mgr._run_deploy_preflight("main")
+    assert result["smoke_path"] == "/from/env/"
+
+    # Without env var: config.yml wins over detection.
+    monkeypatch.delenv("ILHA_SMOKE_PATH", raising=False)
+    result = mgr._run_deploy_preflight("main")
+    assert result["smoke_path"] == "/from/config/"
 
 
 # ── B6: config flows into the remote start-app script ───────────────────
@@ -235,10 +281,24 @@ def test_start_app_script_honors_custom_service_config(tmp_path: Path):
     assert "rq-worker-1" not in script
 
 
-def test_start_app_script_default_config_preserves_historical_behavior(tmp_path: Path):
-    """Phase 5 must not regress deploys for projects that have not adopted the
-    new config block — defaults are web/8000//health-check/ and db/redis."""
-    mgr = SlimDeployManager(project_root=tmp_path)  # no .ilha/config.yml
+def test_start_app_script_infers_services_from_compose_without_config(tmp_path: Path):
+    """No .ilha/config.yml, but a compose file declaring db/redis/rq-worker-1
+    should yield those services in the start-app script via pure inference —
+    no historical hardcoded names required."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    depends_on: [db, redis]\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+        "  redis:\n"
+        "    image: redis:7-alpine\n"
+        "  rq-worker-1:\n"
+        "    build: .\n"
+        "    command: rq worker default\n"
+    )
+    mgr = SlimDeployManager(project_root=tmp_path)
     script = _render_start_app_script(mgr)
     assert "export WEB_SERVICE=web" in script
     assert "export WEB_PORT=8000" in script
@@ -246,6 +306,28 @@ def test_start_app_script_default_config_preserves_historical_behavior(tmp_path:
     assert "export DB_SERVICE=db" in script
     assert "export DEPS_SERVICES='db redis'" in script
     assert "export WORKER_SERVICES=rq-worker-1" in script
+
+
+def test_start_app_script_omits_services_not_in_compose(tmp_path: Path):
+    """No config, and a compose without redis/workers → script must not export
+    them (regression for projects that previously had db/redis/rq-worker-1
+    forced on them by hardcoded defaults)."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    depends_on: [db]\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+    )
+    mgr = SlimDeployManager(project_root=tmp_path)
+    script = _render_start_app_script(mgr)
+    assert "export DB_SERVICE=db" in script
+    assert "export DEPS_SERVICES=db" in script  # shlex.quote omits quotes for single bare token
+    # No redis / no workers in compose → must not appear.
+    assert "redis" not in script
+    assert "rq-worker" not in script
+    assert "export WORKER_SERVICES=''" in script
 
 
 def test_start_app_script_no_worker_services_skips_phase10(tmp_path: Path):
@@ -260,3 +342,300 @@ def test_start_app_script_no_worker_services_skips_phase10(tmp_path: Path):
     assert "export WORKER_SERVICES=" in script
     remote_body = (Path(__file__).resolve().parents[2] / "ilha" / "scripts" / "remote_deploy.py").read_text()
     assert "No workers configured" in remote_body
+
+
+# ── Phase 3: Django+SPA Caddy path routing ──────────────────────────────
+
+def test_django_spa_inference_populates_frontend_and_api_paths(tmp_path: Path):
+    """A django_spa project gets ``frontend_service`` + default ``api_paths``."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: daphne config.asgi:application\n"
+        "  frontend:\n"
+        "    image: node:20-alpine\n"
+        "    command: npm run dev\n"
+    )
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.web_service == "web"
+    assert cfg.frontend_service == "frontend"
+    assert cfg.api_paths is not None
+    assert "/api/*" in cfg.api_paths
+    assert "/admin" in cfg.api_paths and "/admin/*" in cfg.api_paths
+
+
+def test_probe_content_type_matches(tmp_path: Path, monkeypatch):
+    """Headers contain the expected Content-Type substring → success."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    headers = (
+        "HTTP/2 200\r\n"
+        "content-type: text/css; charset=utf-8\r\n"
+        "content-length: 4242\r\n\r\n"
+    )
+    monkeypatch.setattr(
+        mgr, "_run_local_text", lambda *a, **kw: (0, headers, "")
+    )
+    ok, err = mgr._probe_external_path_content_type(
+        "ex.com", "/static/admin/css/base.css", "text/css"
+    )
+    assert ok is True
+    assert err is None
+
+
+def test_probe_content_type_rejects_html_when_css_expected(tmp_path: Path, monkeypatch):
+    """SPA-fallback trap: path returns 200 but as text/html (the index.html).
+    Probe must catch this even though curl ``-fsS`` says success."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    headers = "HTTP/2 200\r\ncontent-type: text/html; charset=utf-8\r\n\r\n"
+    monkeypatch.setattr(
+        mgr, "_run_local_text", lambda *a, **kw: (0, headers, "")
+    )
+    ok, err = mgr._probe_external_path_content_type(
+        "ex.com", "/static/admin/css/base.css", "text/css"
+    )
+    assert ok is False
+    assert "text/css" in err
+    assert "text/html" in err  # surfaces what was actually returned
+
+
+def test_probe_content_type_curl_failure(tmp_path: Path, monkeypatch):
+    mgr = SlimDeployManager(project_root=tmp_path)
+    monkeypatch.setattr(
+        mgr, "_run_local_text",
+        lambda *a, **kw: (22, "", "curl: (22) HTTP 404"),
+    )
+    ok, err = mgr._probe_external_path_content_type(
+        "ex.com", "/static/admin/css/base.css", "text/css"
+    )
+    assert ok is False
+    assert "404" in err
+
+
+def test_django_spa_with_asgi_backend_includes_ws_in_api_paths(tmp_path: Path):
+    """Backend on Daphne/Uvicorn → ``/ws/*`` joins api_paths so websocket
+    upgrades route to the backend instead of falling into the SPA catch-all."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: daphne -b 0.0.0.0 -p 8000 config.asgi:application\n"
+        "  frontend:\n"
+        "    image: node:20-alpine\n"
+        "    command: npm run dev\n"
+    )
+    cfg = load_deploy_service_config(tmp_path)
+    assert "/ws/*" in cfg.api_paths
+
+
+def test_django_spa_without_asgi_omits_ws(tmp_path: Path):
+    """Gunicorn (WSGI) backend → no ``/ws/*`` in defaults (conservative;
+    user can still add it via deploy.api_paths if their frontend doesn't
+    need /ws/*)."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: gunicorn config.wsgi:application\n"
+        "  frontend:\n"
+        "    image: node:20-alpine\n"
+        "    command: npm run dev\n"
+    )
+    cfg = load_deploy_service_config(tmp_path)
+    assert "/ws/*" not in (cfg.api_paths or [])
+
+
+def test_solo_django_inference_leaves_api_paths_none(tmp_path: Path):
+    """No frontend → no SPA routing → api_paths stays None."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: gunicorn config.wsgi\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+    )
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.frontend_service is None
+    assert cfg.api_paths is None
+
+
+def test_start_app_script_exports_frontend_service_for_django_spa(tmp_path: Path):
+    """A django_spa project must export FRONTEND_SERVICE so remote_deploy.py
+    brings up the SPA container alongside web + workers."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: daphne config.asgi:application\n"
+        "  frontend:\n"
+        "    image: node:20-alpine\n"
+        "    command: npm run dev\n"
+    )
+    mgr = SlimDeployManager(project_root=tmp_path)
+    script = mgr._compose_remote_deploy_wrapper_script(
+        app_root=mgr.REMOTE_APP_ROOT,
+        remote_tmp_dir="/tmp/ilha-test",
+        remote_deploy_file="/tmp/ilha-test/remote_deploy.py",
+        build=False,
+    )
+    assert "export FRONTEND_SERVICE=frontend" in script
+
+
+def test_start_app_script_frontend_service_empty_for_solo_django(tmp_path: Path):
+    """Solo-django project: FRONTEND_SERVICE is empty so remote_deploy skips
+    the frontend bring-up step."""
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: gunicorn config.wsgi\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+    )
+    mgr = SlimDeployManager(project_root=tmp_path)
+    script = mgr._compose_remote_deploy_wrapper_script(
+        app_root=mgr.REMOTE_APP_ROOT,
+        remote_tmp_dir="/tmp/ilha-test",
+        remote_deploy_file="/tmp/ilha-test/remote_deploy.py",
+        build=False,
+    )
+    assert "export FRONTEND_SERVICE=''" in script
+
+
+def test_probe_remote_existing_volumes_filters_to_requested(tmp_path: Path, monkeypatch):
+    """The probe filters ``docker volume inspect`` output back to the names
+    the caller asked about — protects against any stray volume on the
+    droplet bleeding into the warning."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    monkeypatch.setattr(
+        mgr, "_run_remote_text",
+        lambda *a, **kw: (0, "time_pgdata\nunrelated_volume\n", ""),
+    )
+    existing = mgr._probe_remote_existing_volumes(
+        "root", "1.2.3.4", ["time_pgdata", "time_frontend_node_modules"]
+    )
+    assert existing == ["time_pgdata"]
+
+
+def test_warn_about_existing_remote_volumes_emits_when_any_exist(tmp_path: Path, monkeypatch):
+    """Operator-visible warning fires when restore is about to overwrite
+    a server-side volume that's already present."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    monkeypatch.setattr(
+        mgr, "_run_remote_text",
+        lambda *a, **kw: (0, "time_pgdata\n", ""),
+    )
+
+    captured: List[str] = []
+    monkeypatch.setattr(
+        "ilha.commands.push.slim_deploy_manager.log_warning",
+        captured.append,
+    )
+
+    mgr._warn_about_existing_remote_volumes(
+        "root", "1.2.3.4", ["time_pgdata", "time_frontend_node_modules"]
+    )
+    joined = " ".join(captured)
+    assert "OVERWRITE" in joined
+    assert "time_pgdata" in joined
+    assert "--no-restore-volumes" in joined
+
+
+def test_warn_about_existing_remote_volumes_silent_when_none_exist(tmp_path: Path, monkeypatch):
+    """First-deploy migration (server has no volumes yet) → no warning,
+    no log noise."""
+    mgr = SlimDeployManager(project_root=tmp_path)
+    monkeypatch.setattr(
+        mgr, "_run_remote_text",
+        lambda *a, **kw: (0, "", ""),  # no volumes exist on server
+    )
+
+    captured: List[str] = []
+    monkeypatch.setattr(
+        "ilha.commands.push.slim_deploy_manager.log_warning",
+        captured.append,
+    )
+
+    mgr._warn_about_existing_remote_volumes(
+        "root", "1.2.3.4", ["time_pgdata"]
+    )
+    assert captured == []
+
+
+def test_strip_privileges_in_compose_also_strips_host_port_publishes(tmp_path: Path):
+    """Slim deploy should never expose db/redis/etc. on host ports — Caddy
+    reaches them via the docker network. Compose v2's merge ignores
+    ``ports: []`` from an overlay, so the only reliable wipe is to remove
+    the key from the BASE compose copy at deploy assembly time."""
+    import yaml
+    base_path = tmp_path / "docker-compose.yml"
+    base_path.write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: gunicorn config.wsgi\n"
+        "    ports:\n"
+        "      - 8000:8000\n"
+        "  db:\n"
+        "    image: postgres:16-alpine\n"
+        "    ports:\n"
+        "      - 5433:5432\n"
+        "  redis:\n"
+        "    image: redis:7-alpine\n"
+        "    ports:\n"
+        "      - 6379:6379\n"
+    )
+
+    mgr = SlimDeployManager(project_root=tmp_path)
+    mgr._strip_privileges_in_compose(base_path)
+
+    data = yaml.safe_load(base_path.read_text())
+    for svc_name, svc_config in (data.get("services") or {}).items():
+        assert "ports" not in svc_config, (
+            f"Service '{svc_name}' must not declare host ports in the deploy "
+            f"compose copy; got: {svc_config.get('ports')!r}"
+        )
+
+
+def test_caddy_path_label_emitted_for_django_spa_overlay(tmp_path: Path, monkeypatch):
+    """``_apply_compose_overrides`` emits ``caddy.proxy.path`` for the backend
+    in a django_spa project, leaving the frontend as the catch-all."""
+    import yaml
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n"
+        "  web:\n"
+        "    build: .\n"
+        "    command: daphne config.asgi:application\n"
+        "  frontend:\n"
+        "    image: node:20-alpine\n"
+        "    command: npm run dev\n"
+    )
+    overlay_path = tmp_path / ".ilha" / "docker-compose.overlay.yml"
+    overlay_path.parent.mkdir(parents=True)
+    overlay_path.write_text(
+        "services:\n"
+        "  web:\n"
+        "    labels:\n"
+        "      - caddy.proxy=time.localhost\n"
+        "      - caddy.proxy.reverse_proxy=time-web:8000\n"
+        "  frontend:\n"
+        "    labels:\n"
+        "      - caddy.proxy=time.localhost\n"
+        "      - caddy.proxy.reverse_proxy=time-frontend:5173\n"
+    )
+
+    mgr = SlimDeployManager(project_root=tmp_path)
+    mgr._apply_compose_overrides(overlay_path, domain="example.com")
+
+    data = yaml.safe_load(overlay_path.read_text())
+    web_labels = data["services"]["web"]["labels"]
+    fe_labels = data["services"]["frontend"]["labels"]
+
+    web_path_labels = [l for l in web_labels if l.startswith("caddy.proxy.path=")]
+    assert len(web_path_labels) == 1
+    assert "/api/*" in web_path_labels[0]
+    assert "/admin/*" in web_path_labels[0]
+
+    # Frontend gets no path label = catch-all.
+    assert not any(l.startswith("caddy.proxy.path=") for l in fe_labels)

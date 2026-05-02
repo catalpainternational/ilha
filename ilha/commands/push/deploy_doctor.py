@@ -10,12 +10,17 @@ import shlex
 import subprocess
 from typing import Dict, Any, List, Optional, Tuple
 
+from ...scripts.http_probe import build_probe_shell_chain, normalize_path as _normalize_http_path
 from ...utils.ssh_manager import SSHConnectionManager
 from .remote_compose_probe import remote_compose_service_known
 
 
 class DeployDoctor:
     """Runs diagnostic checks against a remote slim deployment."""
+
+    # Compose flags shared with slim_deploy_manager: every remote `docker
+    # compose` call passes both the user's compose (base) and ilha's overlay.
+    COMPOSE_FLAGS = "-f docker-compose.yml -f docker-compose.overlay.yml"
 
     def __init__(self, ssh: SSHConnectionManager, remote_app_root: str) -> None:
         self.ssh = ssh
@@ -65,12 +70,8 @@ class DeployDoctor:
 
     # ── smoke-probe helpers ──────────────────────────────────────────
 
-    @staticmethod
-    def _normalized_smoke_path(smoke_path: str) -> str:
-        p = (smoke_path or "/").strip()
-        if not p.startswith("/"):
-            p = "/" + p
-        return p or "/"
+    # Shared normalizer; instance-method shim keeps existing call sites stable.
+    _normalized_smoke_path = staticmethod(_normalize_http_path)
 
     def _build_smoke_probe_command(
         self,
@@ -79,15 +80,24 @@ class DeployDoctor:
         via_compose_web: bool,
         quiet: bool = True,
     ) -> str:
-        """Shell command to verify the app responds on port 8000."""
+        """Shell command to verify the app responds on port 8000.
+
+        For ``via_compose_web``, runs the multi-strategy probe from
+        ``http_probe`` so slim images that ship neither curl nor wget still
+        get a real HTTP probe (instead of the doctor falsely reporting "down").
+        Outside-the-container probes still use curl directly because the host
+        is expected to have it.
+        """
         norm = self._normalized_smoke_path(smoke_path)
         url = f"http://127.0.0.1:8000{norm}"
         tail = " >/dev/null" if quiet else " 2>&1"
-        inner_curl = f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
         if via_compose_web:
+            inner_probe = build_probe_shell_chain(
+                port=8000, path=norm, timeout=5, tail=tail,
+            )
             root = shlex.quote(self.remote_app_root)
             return (
-                f"cd {root} && docker compose --env-file .env exec -T web sh -c {shlex.quote(inner_curl)}"
+                f"cd {root} && docker compose --env-file .env {self.COMPOSE_FLAGS} exec -T web sh -c {shlex.quote(inner_probe)}"
             )
         return f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
 
@@ -139,7 +149,7 @@ class DeployDoctor:
         report["checks"].append(
             self._doctor_collect_command(
                 "docker_compose_ps",
-                f"cd {self.remote_app_root} && docker compose --env-file .env ps 2>&1",
+                f"cd {self.remote_app_root} && docker compose --env-file .env {self.COMPOSE_FLAGS} ps 2>&1",
                 username=username,
                 server=server,
                 timeout=20,
@@ -151,7 +161,7 @@ class DeployDoctor:
                 report["checks"].append(
                     self._doctor_collect_command(
                         f"{service}_logs",
-                        f"cd {self.remote_app_root} && docker compose --env-file .env logs --tail 100 {shlex.quote(service)} 2>&1",
+                        f"cd {self.remote_app_root} && docker compose --env-file .env {self.COMPOSE_FLAGS} logs --tail 100 {shlex.quote(service)} 2>&1",
                         username=username,
                         server=server,
                         timeout=20,
