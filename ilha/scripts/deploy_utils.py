@@ -2,12 +2,23 @@
 
 import subprocess
 import json
+import os
+import shlex
 import time
 import sys
 import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+# Probe strategies live in a sibling module so both the long-running
+# ``remote_deploy`` (subprocess.run per strategy) and the in-deploy smoke
+# probe (single ``sh -c`` chain in slim_deploy_manager) build from the
+# same primitives. Slot the script directory onto ``sys.path`` so this
+# import works whether the file is invoked from the repo or from the
+# remote tmpdir on a droplet.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from http_probe import build_probe_steps  # noqa: E402
 
 
 def apt_stderr_indicates_lock(stderr: str, stdout: str = "") -> bool:
@@ -48,6 +59,10 @@ class DeployLogger:
 
 class DockerCommand:
     """Wrapper for docker commands with error handling."""
+
+    # Compose flags shared with slim_deploy_manager: every remote `docker
+    # compose` call passes both the user's compose (base) and ilha's overlay.
+    COMPOSE_FLAGS = ["-f", "docker-compose.yml", "-f", "docker-compose.overlay.yml"]
 
     def __init__(self, logger: Optional[DeployLogger] = None):
         self.logger = logger or DeployLogger()
@@ -116,7 +131,12 @@ class DockerCommand:
         Returns:
             Output if capture_output=True, else None
         """
-        cmd = ["docker", "compose", "--env-file", env_file, subcommand] + args
+        cmd = (
+            ["docker", "compose", "--env-file", env_file]
+            + self.COMPOSE_FLAGS
+            + [subcommand]
+            + args
+        )
         return self.run(cmd, capture_output=capture_output, check=check)
 
     def ps_json(
@@ -224,7 +244,11 @@ class DockerCommand:
         interval: int = 2,
         timeout: int = 5,
     ) -> bool:
-        """Health check service via HTTP curl inside container.
+        """Health check service via HTTP from inside the container.
+
+        Strategies (curl → wget → python → ``/dev/tcp``) live in
+        ``http_probe.build_probe_steps`` so the in-deploy smoke probe and
+        this remote-deploy health check share one source of truth.
 
         Args:
             container: Container name or ID
@@ -232,30 +256,25 @@ class DockerCommand:
             path: HTTP path to check
             max_attempts: Max number of checks
             interval: Seconds between checks
-            timeout: Curl timeout in seconds
+            timeout: HTTP timeout in seconds
 
         Returns:
             True if healthy, False if timeout
         """
+        steps = build_probe_steps(port=port, path=path, timeout=timeout)
+
         for attempt in range(1, max_attempts + 1):
-            try:
-                self.exec(
-                    container,
-                    [
-                        "curl",
-                        "-fsS",
-                        f"--max-time",
-                        str(timeout),
-                        f"http://127.0.0.1:{port}{path}",
-                    ],
-                    check=True,
-                )
-                self.logger.success(f"Health check passed (attempt {attempt})")
-                return True
-            except subprocess.CalledProcessError:
-                self.logger.info(f"Health check attempt {attempt}/{max_attempts} failed")
-                if attempt < max_attempts:
-                    time.sleep(interval)
+            for step in steps:
+                argv = ["sh", "-c", step.standalone()]
+                try:
+                    self.exec(container, argv, check=True)
+                    self.logger.success(f"Health check passed via {step.name} (attempt {attempt})")
+                    return True
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    continue
+            self.logger.info(f"Health check attempt {attempt}/{max_attempts} failed")
+            if attempt < max_attempts:
+                time.sleep(interval)
 
         self.logger.error(f"Health check failed after {max_attempts} attempts")
         return False
