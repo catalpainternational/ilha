@@ -50,6 +50,7 @@ services:
     volumes:
       - {MONITOR_SCRIPT_PATH}:/app/monitor.py
       - {HELPER_UTILS_PATH}:/app/caddy_admin_utils.py
+      - {ROUTING_MODULE_PATH}:/app/caddy_routing.py
     command: ["sh", "-c", "pip install --no-cache-dir docker==7.1.0 requests==2.32.3 && python /app/monitor.py"]
     depends_on:
       - caddy

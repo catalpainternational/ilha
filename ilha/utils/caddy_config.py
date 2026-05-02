@@ -6,6 +6,7 @@ configuration logic, used by SetupManager, EnvironmentManager, and PackageManage
 """
 
 from typing import Optional, Dict, Any, List
+
 from ..utils.deploy_hosts import normalize_deploy_host
 from ..utils.logging import log_info, log_warning
 
@@ -13,21 +14,47 @@ from ..utils.logging import log_info, log_warning
 # Web service names that should get Caddy labels
 WEB_SERVICE_NAMES = ['web', 'app', 'frontend', 'api', 'backend']
 
+# Static / file-server image prefixes. A service whose image starts with one
+# of these is treated as a routable web service even if its name is not in
+# WEB_SERVICE_NAMES (e.g. a static-site project whose only service is
+# `caddy: { image: caddy:2-alpine }`).
+STATIC_WEB_IMAGE_PREFIXES = ('caddy', 'nginx', 'httpd')
+
 # Default port for web services
 DEFAULT_WEB_PORT = 8000
 
 
-def _detect_service_port(service_config: Dict[str, Any]) -> int:
+def _is_static_web_service(service_config: Dict[str, Any]) -> bool:
+    """Return True if the service uses a known static/file-server image."""
+    image = service_config.get('image') if isinstance(service_config, dict) else None
+    if not image:
+        return False
+    base = str(image).lower().split(':', 1)[0].split('/', 1)[-1]
+    return any(base.startswith(prefix) for prefix in STATIC_WEB_IMAGE_PREFIXES)
+
+
+def _detect_service_port(
+    service_config: Dict[str, Any],
+    *,
+    service_name: Optional[str] = None,
+) -> int:
     """
     Detect the service's port from expose or ports configuration.
     
     Priority:
     1. First port from 'expose' list (container port)
     2. Container port from 'ports' mapping (e.g., "8000:8000" -> 8000)
-    3. Default to DEFAULT_WEB_PORT (8000)
+    3. Static-image default (Caddy/Nginx/httpd → 80) when the service is
+       NOT one of the conventional Django/app names. This keeps existing
+       Django-style projects on port 8000 even if they happen to use nginx
+       as a placeholder image, while still picking up port 80 for a static
+       site whose only service is `caddy`.
+    4. Default to DEFAULT_WEB_PORT (8000)
     
     Args:
         service_config: Service configuration from docker-compose.yml
+        service_name: Optional service key (used to scope the static-image
+            port heuristic to non-Django service names).
     
     Returns:
         Detected port number
@@ -66,7 +93,16 @@ def _detect_service_port(service_config: Dict[str, Any]) -> int:
                     pass
             elif isinstance(first_port, int):
                 return first_port
-    
+
+    # Static-image default — caddy/nginx/httpd typically listen on :80.
+    # Skip this when the service name matches a conventional app slot
+    # (web/app/api/...) to preserve the port-8000 default for Django-style
+    # projects that placeholder-mount nginx without declaring expose/ports.
+    if _is_static_web_service(service_config) and (
+        service_name is None or service_name not in WEB_SERVICE_NAMES
+    ):
+        return 80
+
     # Default fallback
     return DEFAULT_WEB_PORT
 
@@ -107,23 +143,29 @@ def ensure_caddy_labels_and_network(
     compose_data: Dict[str, Any],
     domain: Optional[str] = None,
     ip: Optional[str] = None,
-    use_localhost_pattern: bool = True
+    use_localhost_pattern: bool = True,
+    path_routes: Optional[Dict[str, List[str]]] = None,
 ) -> bool:
     """
     Ensure Caddy labels and network are configured for web services.
-    
+
     This is the single source of truth for Caddy configuration logic.
     Used by:
     - SetupManager._transform_compose_file() - during project setup
     - EnvironmentManager.apply_domain_overrides() - during domain override
     - PackageManager._standalone_import() - during package import
-    
+
     Args:
         compose_data: Docker Compose data structure (dict with 'services' key)
         domain: Optional domain override (e.g., "example.com")
         ip: Optional IP override (e.g., "192.168.1.1")
         use_localhost_pattern: If True and no domain/IP, use ${COMPOSE_PROJECT_NAME}.localhost
-    
+        path_routes: Optional ``{service_name: [path1, path2, ...]}``. When set
+            for a service, that service's Caddy route only matches the listed
+            paths (e.g. ``/api/*``); routes without path constraints act as
+            the catch-all for the same domain. The Caddy dynamic config
+            sorts path-specific routes ahead of catch-alls so this works.
+
     Returns:
         True if any changes were made, False otherwise
     """
@@ -133,12 +175,15 @@ def ensure_caddy_labels_and_network(
     updated = False
     
     for service_name, service_config in compose_data['services'].items():
-        # Configure web services OR services that already have Caddy labels
-        # This ensures services like 'backend' with Caddy labels are processed
+        # Configure web services OR services that already have Caddy labels.
+        # This ensures services like 'backend' with Caddy labels are processed.
+        # A service running a static/file-server image (caddy/nginx/httpd) is
+        # also treated as routable so Caddy-only static sites are picked up.
         is_web_service = service_name in WEB_SERVICE_NAMES
+        is_static_web = _is_static_web_service(service_config)
         has_labels = _has_caddy_labels(service_config)
-        
-        if not is_web_service and not has_labels:
+
+        if not is_web_service and not is_static_web and not has_labels:
             continue
         
         # Determine proxy domain
@@ -157,7 +202,7 @@ def ensure_caddy_labels_and_network(
             continue
         
         # Detect service port from expose or ports configuration
-        service_port = _detect_service_port(service_config)
+        service_port = _detect_service_port(service_config, service_name=service_name)
         
         # Get container name pattern (will be resolved by Docker Compose at runtime)
         # Pattern: ${COMPOSE_PROJECT_NAME}-{service_name}
@@ -224,6 +269,36 @@ def ensure_caddy_labels_and_network(
             existing_labels.append(reverse_proxy_label)
             updated = True
             log_info(f"Added Caddy reverse proxy label to {service_name}: {reverse_proxy_label} (port: {service_port})")
+
+        # Path-based routing: when this service has path constraints, emit a
+        # ``caddy.proxy.path=p1,p2,...`` label. The dynamic config script
+        # sorts path-specific routes ahead of path-less catch-alls so the
+        # backend gets API paths and the frontend serves everything else.
+        if path_routes and service_name in path_routes and path_routes[service_name]:
+            paths_value = ",".join(path_routes[service_name])
+            path_label = f"caddy.proxy.path={paths_value}"
+            path_index = None
+            for i, existing_label in enumerate(existing_labels):
+                if existing_label.startswith("caddy.proxy.path="):
+                    path_index = i
+                    break
+            if path_index is not None:
+                if existing_labels[path_index] != path_label:
+                    existing_labels[path_index] = path_label
+                    updated = True
+                    log_info(f"Updated Caddy path label for {service_name}: {path_label}")
+            else:
+                existing_labels.append(path_label)
+                updated = True
+                log_info(f"Added Caddy path label to {service_name}: {path_label}")
+        elif path_routes is not None and service_name in (path_routes or {}):
+            # Empty list explicitly means "drop any existing path label"
+            for i, existing_label in enumerate(list(existing_labels)):
+                if existing_label.startswith("caddy.proxy.path="):
+                    existing_labels.pop(i)
+                    updated = True
+                    log_info(f"Removed Caddy path label from {service_name}")
+                    break
         
         # Connect web services to ilha_caddy_proxy network
         # Important: Web containers need BOTH:

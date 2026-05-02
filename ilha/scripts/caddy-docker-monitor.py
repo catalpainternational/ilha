@@ -8,12 +8,20 @@ updates Caddy configuration via the admin API.
 
 import json
 import os
+import sys
 import time
 import requests
 import docker
 import logging
 import re
 from typing import Dict, List, Optional, Any
+
+# Allow ``from caddy_routing import ...`` whether the script runs from the
+# repo (sibling layout) or as ``/app/monitor.py`` on the droplet (where
+# ``caddy_routing.py`` is bind-mounted alongside).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from caddy_routing import build_routes_from_containers
 
 try:
     from .caddy_admin_utils import (
@@ -232,107 +240,17 @@ class CaddyDockerMonitor:
         if domains:
             routes.append(build_http_to_https_redirect_route(domains))
             logger.info(f"Added HTTP to HTTPS redirect for domains: {', '.join(domains)}")
-        
-        # Group containers by domain to handle path-based routing
-        domain_containers = {}
-        for container in containers:
-            labels = container.get('Labels', {})
-            if 'caddy.proxy' in labels:
-                domain = labels['caddy.proxy']
-                if domain not in domain_containers:
-                    domain_containers[domain] = []
-                domain_containers[domain].append((container, labels))
-        
-        # Add routes for each domain (with path-based routing support)
-        for domain, container_list in domain_containers.items():
-            if len(container_list) == 1:
-                # Single container for this domain - simple route
-                container, labels = container_list[0]
-                target = labels.get('caddy.proxy.reverse_proxy', f"{container['Names']}:8000")
-                
-                route = {
-                    "match": [{"host": [domain]}],
-                    "handle": [{
-                        "handler": "reverse_proxy",
-                        "upstreams": [{"dial": target}]
-                    }]
-                }
-                
-                # Add health check if specified
-                if 'caddy.proxy.health_check' in labels:
-                    route["handle"][0]["health_checks"] = {
-                        "active": {
-                            "path": labels['caddy.proxy.health_check']
-                        }
-                    }
-                
-                routes.append(route)
-                route_type = "HTTPS" if self._is_domain(domain) else "HTTP"
-                logger.info(f"Added {route_type} route for {domain} -> {target}")
-            else:
-                # Multiple containers for same domain - use subroute with path matching
-                # Sort containers: specific paths first (longest first), then catch-all
-                def sort_key(x):
-                    labels = x[1]
-                    path = labels.get('caddy.proxy.path', '/')
-                    except_path = labels.get('caddy.proxy.except', '')
-                    # Priority: specific paths > except paths > catch-all
-                    if path and path != '/':
-                        return (0, -len(path))  # Specific path, longer = higher priority
-                    elif except_path:
-                        return (1, 0)  # Except path
-                    else:
-                        return (2, 0)  # Catch-all
-                
-                container_list_sorted = sorted(container_list, key=sort_key)
-                
-                # Create subroutes - Caddy evaluates subroutes in order within a subroute handler
-                subroutes = []
-                for container, labels in container_list_sorted:
-                    target = labels.get('caddy.proxy.reverse_proxy', f"{container['Names']}:8000")
-                    path = labels.get('caddy.proxy.path', '/')
-                    except_path = labels.get('caddy.proxy.except', '')
-                    
-                    # Create match conditions for subroute
-                    # Subroutes are evaluated in order, so specific paths must come first
-                    match_conditions = []
-                    if path and path != '/':
-                        # Specific path pattern (e.g., /api/*) - must come first
-                        match_conditions.append({"path": [path]})
-                    # For catch-all, no path condition - matches everything not matched above
-                    
-                    subroute = {
-                        "match": match_conditions if match_conditions else [],
-                        "handle": [{
-                            "handler": "reverse_proxy",
-                            "upstreams": [{"dial": target}]
-                        }]
-                    }
-                    
-                    # Add health check if specified
-                    if 'caddy.proxy.health_check' in labels:
-                        subroute["handle"][0]["health_checks"] = {
-                            "active": {
-                                "path": labels['caddy.proxy.health_check']
-                            }
-                        }
-                    
-                    subroutes.append(subroute)
-                    route_type = "HTTPS" if self._is_domain(domain) else "HTTP"
-                    logger.info(f"Added subroute for {domain} path {path} (except: {except_path}) -> {target}")
-                
-                # Create main route with subroute handler
-                # Subroutes are evaluated in order, so /api/* matches first, then catch-all
-                route = {
-                    "match": [{"host": [domain]}],
-                    "handle": [{
-                        "handler": "subroute",
-                        "routes": subroutes
-                    }]
-                }
-                routes.append(route)
-                route_type = "HTTPS" if self._is_domain(domain) else "HTTP"
-                logger.info(f"Added {route_type} route with subroutes for {domain}")
+
+        # Container routes are generated by ``caddy_routing`` (single source of
+        # truth for both this monitor and the one-shot ``caddy-dynamic-config``
+        # script). Logging stays here so the daemon's stdout shows what shipped.
+        container_routes = build_routes_from_containers(containers)
+        for route in container_routes:
+            routes.append(route)
+            host = (route.get("match") or [{}])[0].get("host", ["?"])[0]
+            handler = (route.get("handle") or [{}])[0].get("handler", "?")
+            route_type = "HTTPS" if self._is_domain(host) else "HTTP"
+            logger.info(f"Added {route_type} {handler} route for {host}")
         
         # Add default wildcard route at the end (must be last for proper matching)
         routes.append({

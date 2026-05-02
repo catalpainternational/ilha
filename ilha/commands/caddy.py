@@ -31,17 +31,19 @@ class CaddyManager:
     def _get_compose_content_with_paths(self) -> str:
         """Get compose file content with runtime path substitutions."""
         template_content = self.compose_file.read_text()
-        
+
         # Substitute paths
         caddyfile_path = str(self.caddyfile)
         script_dir = get_script_dir()
         monitor_script_path = str(script_dir / "scripts" / "caddy-docker-monitor.py")
         helper_utils_path = str(script_dir / "scripts" / "caddy_admin_utils.py")
+        routing_module_path = str(script_dir / "scripts" / "caddy_routing.py")
 
         return (
             template_content.replace("{CADDYFILE_PATH}", caddyfile_path)
             .replace("{MONITOR_SCRIPT_PATH}", monitor_script_path)
             .replace("{HELPER_UTILS_PATH}", helper_utils_path)
+            .replace("{ROUTING_MODULE_PATH}", routing_module_path)
         )
     
     def start_global_caddy(self) -> bool:
