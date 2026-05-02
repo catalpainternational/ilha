@@ -393,14 +393,27 @@ class DockerManager:
         
         return success
     
-    def backup_volumes(self, branch_name: str, backup_dir: Path) -> Optional[Path]:
+    def backup_volumes(
+        self,
+        branch_name: str,
+        backup_dir: Path,
+        volume_names_override: Optional[Dict[str, str]] = None,
+    ) -> Optional[Path]:
         """Backup worktree volumes to a tar file using file-level copy for all volumes.
-        
+
         Stops containers safely before backup, then restarts them if they were running.
         All volumes (including PostgreSQL) are backed up using file-level copy.
+
+        ``volume_names_override`` (``{key: actual_docker_volume_name}``) wins
+        over the legacy ``get_volume_names_for_project_root`` convention.
+        Callers that have done compose-based discovery should pass it; the
+        legacy lookup is kept only as a fallback for older code paths.
         """
         backup_file = Path(backup_dir) / f"backup_{branch_name}.tar"
-        volume_names = get_volume_names_for_project_root(self.project_root, branch_name)
+        if volume_names_override is not None:
+            volume_names = volume_names_override
+        else:
+            volume_names = get_volume_names_for_project_root(self.project_root, branch_name)
         
         log_info(f"Backing up volumes for {branch_name} to {backup_file}")
         
@@ -557,19 +570,20 @@ class DockerManager:
             log_error(f"Could not find worktree path for '{branch_name}'")
             return []
         
-        # Find docker-compose.worktree.yml file
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-        
+        # Inspect the user's docker-compose.yml — it's authoritative for
+        # service shape (volumes, image, etc.). The ilha overlay only adds
+        # deltas, so reading the base is the right source for volume listing.
+        compose_file = worktree_path / "docker-compose.yml"
+
         if not compose_file.exists():
-            log_error(f"No docker-compose.worktree.yml found for worktree '{branch_name}'")
+            log_error(f"No docker-compose.yml found for worktree '{branch_name}'")
             return []
-        
-        # Load compose file
+
         try:
             with open(compose_file) as f:
                 compose_data = yaml.safe_load(f) or {}
         except Exception as e:
-            log_error(f"Failed to parse docker-compose.worktree.yml for worktree '{branch_name}': {e}")
+            log_error(f"Failed to parse docker-compose.yml for worktree '{branch_name}': {e}")
             return []
         
         # Get service definition
@@ -659,22 +673,23 @@ class DockerManager:
         Returns:
             True if containers are stopped (or were not running), False on error
         """
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-        if not compose_file.exists():
-            # No compose file means no containers to stop
+        from ..utils.path_utils import compose_files_for_invocation
+        base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
+        if base_compose is None and overlay_compose is None:
+            # No compose files means no containers to stop
             return True
-        
+
         log_info("Ensuring containers are stopped before volume restoration...")
         try:
             from ..config.settings import sanitize_project_name
             import yaml
-            
+
             # Get project name from config file in worktree's project root
             # Worktree path structure: <project_root>/worktrees/<branch_name>
             # So project root is worktree_path.parent.parent
             project_root = worktree_path.parent.parent
             config_file = project_root / ".ilha" / "config.yml"
-            
+
             if config_file.exists():
                 with open(config_file) as f:
                     config = yaml.safe_load(f) or {}
@@ -682,13 +697,19 @@ class DockerManager:
             else:
                 # Fallback to directory name
                 project_name = project_root.name
-            
+
             project_name = sanitize_project_name(project_name)
             compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-            
+
+            cmd = ["docker", "compose"]
+            if base_compose is not None:
+                cmd += ["-f", str(base_compose)]
+            if overlay_compose is not None:
+                cmd += ["-f", str(overlay_compose)]
+            cmd += ["-p", compose_project_name, "down"]
             result = subprocess.run(
-                ["docker", "compose", "-f", str(compose_file), "-p", compose_project_name, "down"],
-                cwd=worktree_path / ".ilha",
+                cmd,
+                cwd=worktree_path,
                 check=False,
                 capture_output=True,
                 timeout=60
@@ -1160,53 +1181,71 @@ class DockerManager:
         if e.stderr:
             log_error(f"STDERR: {e.stderr}")
     
-    def run_compose_command(self, 
-                          compose_file: Path, 
-                          command: List[str], 
+    def run_compose_command(self,
+                          compose_file: Path,
+                          command: List[str],
                           env_file: Optional[Path] = None,
                           project_name: Optional[str] = None,
                           working_dir: Optional[Path] = None,
                           extra_flags: Optional[List[str]] = None,
-                          profile: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+                          profile: Optional[str] = None,
+                          base_compose_file: Optional[Path] = None) -> Tuple[bool, Optional[str]]:
         """Run a docker compose command.
 
+        Compose merges files in the order given; the LAST ``-f`` wins on
+        conflicts. In the overlay model that means callers pass the user's
+        ``docker-compose.yml`` as ``base_compose_file`` (first) and the ilha
+        overlay as ``compose_file`` (second, wins on Caddy labels etc.).
+
         Args:
-            compose_file: Path to the compose file
-            command: Command to run (e.g., ["up", "-d"])
-            env_file: Optional environment file
-            project_name: Optional project name
-            working_dir: Optional working directory
-            extra_flags: Optional list of additional flags to append to the command
-            profile: Optional Docker Compose profile to use
+            compose_file: Compose file passed last; overrides anything in
+                ``base_compose_file`` on conflicts.
+            command: Command to run (e.g., ["up", "-d"]).
+            env_file: Optional ``--env-file``.
+            project_name: Optional ``-p`` value.
+            working_dir: Optional working directory; cwd of the subprocess.
+            extra_flags: Optional flags appended after ``command``.
+            profile: Optional ``--profile`` value.
+            base_compose_file: Compose file passed first; "the base." When
+                None, only ``compose_file`` is passed.
 
         Returns:
             (True, None) on success; (False, stderr_text) on failure.
         """
         # Build base command
         cmd = self._build_compose_base_command()
-        
+
         # Resolve working directory
         working_dir = self._resolve_working_directory(working_dir)
-        ensure_entrypoint_executable(compose_file, working_dir)
+        # Set +x on entrypoint scripts referenced by the base compose's /app
+        # mounts (the user's docker-compose.yml has the volume bindings; the
+        # overlay does not).
+        ensure_entrypoint_executable(base_compose_file or compose_file, working_dir)
 
         # Explicitly load .env from the working directory first, if it exists
         main_env_file = working_dir / ".env"
         if main_env_file.exists():
             cmd.extend(["--env-file", str(main_env_file)])
-        
+
         # Then, load the worktree-specific env.ilha, which will override .env
         if env_file and env_file.exists():
             cmd.extend(["--env-file", str(env_file)])
-        
+
         if project_name:
             cmd.extend(["-p", project_name])
-        
+
+        # Compose merges files in the order given; the LAST -f wins on conflicts.
+        # In the overlay model we want the user's compose first (base) and ilha's
+        # overlay second so the overlay's deltas win — callers pass the user's
+        # compose as ``base_compose_file`` and the overlay as ``compose_file``.
+        if base_compose_file is not None:
+            cmd.extend(["-f", str(base_compose_file)])
         cmd.extend(["-f", str(compose_file)])
-        
+
         # Add profile flag if provided
         if profile:
             cmd.extend(["--profile", profile])
-        
+
         cmd.extend(command)
         
         # Add any extra flags at the end
@@ -1230,63 +1269,13 @@ class DockerManager:
             self._handle_compose_error(e)
             return (False, e.stderr or "")
 
-    def run_compose_command_with_profile(self, compose_file: Path, compose_override: Path,
-                                       command: List[str], env_file: Optional[Path] = None,
-                                       project_name: Optional[str] = None,
-                                       working_dir: Optional[Path] = None) -> bool:
-        """Run a docker compose command with override file and ilha profile."""
-        # Build base command
-        cmd = self._build_compose_base_command()
-
-        if env_file and env_file.exists():
-            cmd.extend(["--env-file", str(env_file)])
-
-        if project_name:
-            cmd.extend(["-p", project_name])
-
-        # Add main compose file and override file with ilha profile
-        cmd.extend(["-f", str(compose_file)])
-        cmd.extend(["-f", str(compose_override)])
-        cmd.extend(["--profile", "ilha"])
-        cmd.extend(command)
-
-        # Resolve working directory
-        working_dir = self._resolve_working_directory(working_dir)
-        ensure_entrypoint_executable(compose_file, working_dir)
-
-        # Prepare environment variables
-        env = self._prepare_compose_environment(working_dir, project_name)
-
-        # Debug logging for path resolution
-        log_info(f"Docker Compose execution context (with profile):")
-        log_info(f"  Working directory: {working_dir}")
-        log_info(f"  PROJECT_ROOT: {env['PROJECT_ROOT']}")
-        log_info(f"  Compose file: {compose_file}")
-        log_info(f"  Override file: {compose_override}")
-        log_info(f"  Command: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=working_dir, env=env)
-            return True
-        except subprocess.CalledProcessError as e:
-            self._handle_compose_error(e, "Docker compose command with override failed")
-            log_error(f"Command executed: {' '.join(cmd)}")
-            log_error(f"Working directory: {working_dir}")
-            return False
-
     def start_services(self, compose_file: Path, env_file: Optional[Path] = None,
                       project_name: Optional[str] = None, working_dir: Optional[Path] = None) -> bool:
         """Start services using docker compose."""
         success, _ = self.run_compose_command(compose_file, ["up", "-d"], env_file, project_name, working_dir)
         return success
 
-    def start_services_with_override(self, compose_file: Path, compose_override: Path,
-                                   env_file: Optional[Path] = None, project_name: Optional[str] = None,
-                                   working_dir: Optional[Path] = None) -> bool:
-        """Start services using docker compose with override file and ilha profile."""
-        return self.run_compose_command_with_profile(compose_file, compose_override, ["up", "-d"],
-                                                   env_file, project_name, working_dir)
-    
+
     def stop_services(self, compose_file: Path, env_file: Optional[Path] = None,
                      project_name: Optional[str] = None, working_dir: Optional[Path] = None) -> bool:
         """Stop services using docker compose."""
@@ -1337,37 +1326,43 @@ class DockerManager:
         return volumes
     
     def run_compose_passthrough(self, branch_name: str, compose_args: List[str]) -> bool:
-        """Run docker compose command with automatic override file resolution.
-        
+        """Run docker compose command with automatic base+overlay resolution.
+
         Args:
             branch_name: Name of the worktree/branch
             compose_args: Docker compose arguments to pass through
-            
+
         Returns:
             True if command succeeded, False otherwise
         """
         from ..core.git_manager import GitManager
-        from ..utils.path_utils import get_compose_override_path, get_env_compose_file_path
+        from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
         from ..config.settings import get_project_name, sanitize_project_name
-        
+
         # Validate worktree exists
         git_manager = GitManager()
         if not git_manager.validate_worktree_exists(branch_name):
             log_error(f"Worktree for branch '{branch_name}' does not exist")
             return False
-        
+
         # Get worktree path
         worktree_path = git_manager.find_worktree_path(branch_name)
         if not worktree_path:
             log_error(f"Could not find worktree directory for branch '{branch_name}'")
             return False
-        
-        # Get compose override file
-        compose_override_path = get_compose_override_path(worktree_path)
-        if not compose_override_path or not compose_override_path.exists():
-            log_error(f"Compose override file not found for worktree '{branch_name}'")
+
+        # Get base + overlay compose files
+        base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
+        if base_compose is None:
+            log_error(f"docker-compose.yml not found in worktree: {worktree_path}")
             return False
-        
+        if overlay_compose is None:
+            log_error(
+                f"ilha overlay not found at {worktree_path}/.ilha/docker-compose.overlay.yml. "
+                f"Re-run `ilha setup` to regenerate."
+            )
+            return False
+
         # Get environment file
         env_file = get_env_compose_file_path(worktree_path)
         if not env_file.exists():
@@ -1405,28 +1400,30 @@ class DockerManager:
         
         # Build base command
         cmd = self._build_compose_base_command()
-        
+
         # Add environment file
         cmd.extend(["--env-file", str(env_file)])
-        
+
         # Add project name
         cmd.extend(["-p", compose_project_name])
-        
-        # Add compose override file
-        cmd.extend(["-f", str(compose_override_path)])
-        
+
+        # Pass user's compose first (base) then ilha's overlay (wins on merges)
+        cmd.extend(["-f", str(base_compose)])
+        cmd.extend(["-f", str(overlay_compose)])
+
         # Add the passthrough arguments
         cmd.extend(compose_args)
-        
+
         # Resolve working directory (already resolved as worktree_path, but ensure consistency)
         working_dir = self._resolve_working_directory(worktree_path)
-        
+
         # Prepare environment variables
         env = self._prepare_compose_environment(working_dir, compose_project_name)
-        
+
         log_info(f"Running docker compose command for worktree '{branch_name}':")
         log_info(f"  Working directory: {working_dir}")
-        log_info(f"  Compose file: {compose_override_path}")
+        log_info(f"  Base compose: {base_compose}")
+        log_info(f"  Overlay compose: {overlay_compose}")
         log_info(f"  Environment file: {env_file}")
         log_info(f"  Project name: {compose_project_name}")
         log_info(f"  Command: {' '.join(cmd)}")
@@ -1439,33 +1436,33 @@ class DockerManager:
             log_error(f"Failed to run docker compose command: {e}")
             return False
 
-    async def start_worktree_containers(self, branch_name: str, worktree_path: Path, 
+    async def start_worktree_containers(self, branch_name: str, worktree_path: Path,
                                        project_root: Path) -> Dict[str, Any]:
         """Start containers for a worktree asynchronously."""
         try:
-            from ..utils.path_utils import get_compose_override_path, get_env_compose_file_path
+            from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
             from ..config.settings import get_project_name, sanitize_project_name
-            
-            # Get compose files
-            compose_override = get_compose_override_path(worktree_path)
+
+            base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
             env_file = get_env_compose_file_path(worktree_path)
-            
-            if not compose_override or not compose_override.exists():
-                return {"success": False, "error": f"Compose file not found for worktree '{branch_name}'"}
-            
-            # Get project name
+
+            if base_compose is None:
+                return {"success": False, "error": f"docker-compose.yml not found in worktree '{branch_name}'"}
+            if overlay_compose is None:
+                return {"success": False, "error": f"ilha overlay missing for worktree '{branch_name}' — re-run `ilha setup`"}
+
             project_name = sanitize_project_name(get_project_name())
             compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-            
-            # Start services
+
             success, _ = self.run_compose_command(
-                compose_override, 
-                ["up", "-d"], 
+                overlay_compose,
+                ["up", "-d"],
                 env_file=env_file,
                 project_name=compose_project_name,
-                working_dir=worktree_path
+                working_dir=worktree_path,
+                base_compose_file=base_compose,
             )
-            
+
             return {
                 "success": success,
                 "message": f"Started containers for worktree '{branch_name}'" if success else "Failed to start containers"
@@ -1477,32 +1474,44 @@ class DockerManager:
         """Stop containers for a worktree asynchronously."""
         try:
             from ..core.git_manager import GitManager
-            from ..utils.path_utils import get_compose_override_path, get_env_compose_file_path
+            from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
             from ..config.settings import get_project_name, sanitize_project_name
-            
-            # Find worktree path
+
             git_manager = GitManager(validate=False)
             worktree_path = git_manager.find_worktree_path(branch_name)
-            
+
             if not worktree_path:
                 return {"success": False, "error": f"Worktree for branch '{branch_name}' not found"}
-            
-            # Get compose files
-            compose_override = get_compose_override_path(worktree_path)
+
+            base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
             env_file = get_env_compose_file_path(worktree_path)
-            
-            # Get project name
+
             project_name = sanitize_project_name(get_project_name())
             compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-            
-            # Stop services
-            success = self.stop_services(
-                compose_override,
-                env_file=env_file,
-                project_name=compose_project_name,
-                working_dir=worktree_path
-            )
-            
+
+            if overlay_compose is None or base_compose is None:
+                # Without overlay we can still try to stop using whatever compose
+                # is at the worktree root; missing files are non-fatal for `down`.
+                compose_to_use = overlay_compose or base_compose
+                if compose_to_use is None:
+                    return {"success": True, "message": "No compose files; nothing to stop"}
+                success, _ = self.run_compose_command(
+                    compose_to_use,
+                    ["down"],
+                    env_file=env_file,
+                    project_name=compose_project_name,
+                    working_dir=worktree_path,
+                )
+            else:
+                success, _ = self.run_compose_command(
+                    overlay_compose,
+                    ["down"],
+                    env_file=env_file,
+                    project_name=compose_project_name,
+                    working_dir=worktree_path,
+                    base_compose_file=base_compose,
+                )
+
             return {
                 "success": success,
                 "message": f"Stopped containers for worktree '{branch_name}'" if success else "Failed to stop containers"

@@ -335,11 +335,17 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
             log_warning(f"Failed to create default .env file: {e}")
             return False
     
-    def _generate_env_compose_content(self, branch_name: str) -> str:
-        """Generate env.ilha content for a worktree using self.project_root."""
+    def _generate_env_compose_content(self, branch_name: str, *, has_django: Optional[bool] = None) -> str:
+        """Generate env.ilha content for a worktree using self.project_root.
+
+        Always emits ilha-owned plumbing. Emits Django-specific siblings only when
+        ``has_django`` is True. If ``has_django`` is None, detect against
+        ``self.project_root``.
+        """
         from ..config.settings import ILHA_DIR, sanitize_project_name, get_allowed_hosts_for_worktree
+        from ..utils.project_footprint import detect_project_footprint
         import yaml
-        
+
         # Get project name from config in self.project_root
         project_name = None
         config_path = self.project_root / ILHA_DIR / "config.yml"
@@ -350,30 +356,39 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
                     project_name = config.get("project_name")
             except Exception:
                 pass
-        
+
         # Fallback to project root directory name if config doesn't have project_name
         if not project_name:
             project_name = self.project_root.name
-        
+
         project_name = sanitize_project_name(project_name)
         compose_project_name = f"{project_name}-{branch_name}"
-        site_domain = f"http://{compose_project_name}.localhost"  # RFC-compliant hostname with protocol
-        allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
-        
+        site_domain = f"{compose_project_name}.localhost"  # bare host
+
+        if has_django is None:
+            has_django = detect_project_footprint(self.project_root).has_django
+
         internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
         base_content = f"""# ilha environment configuration for {branch_name}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={self.project_root}
 SITE_DOMAIN={site_domain}
-ALLOWED_HOSTS={allowed_hosts}
-DEBUG=True
-USE_X_FORWARDED_HOST=True
-CSRF_TRUSTED_ORIGINS={site_domain}
 
-# Per-worktree network subnets (avoid pool overlap; use in docker-compose.worktree.yml)
+# Per-worktree network subnets (avoid pool overlap; use in docker-compose overlay)
 ILHA_SUBNET_INTERNAL={internal_subnet}
 ILHA_SUBNET_WEB={web_subnet}
 """
+
+        if has_django:
+            allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
+            csrf_trusted_origins = f"http://{site_domain},https://{site_domain}"
+            base_content += f"""
+# Django-specific (emitted because Django was detected in this project)
+ALLOWED_HOSTS={allowed_hosts}
+CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
+USE_X_FORWARDED_HOST=True
+"""
+
         host_port_section = self._build_host_port_section(branch_name)
         if host_port_section:
             base_content = f"{base_content}\n{host_port_section}"
@@ -404,9 +419,18 @@ ILHA_SUBNET_WEB={web_subnet}
     def get_environment_variables(self, branch_name: str) -> Dict[str, str]:
         """Get environment variables for a worktree."""
         from ..config.settings import get_project_name, sanitize_project_name, get_allowed_hosts_for_worktree
-        
+        from ..utils.compose_external_volumes import resolve_compose_project_name
+
         project_name = sanitize_project_name(get_project_name())
-        compose_project_name = f"{project_name}-{branch_name}"
+        compose_project_name = resolve_compose_project_name(
+            self.project_root,
+            branch_name,
+            sanitized_project_name=project_name,
+        )
+        # Site domain still follows the deterministic ``<project>-<branch>``
+        # convention so worktrees on the same host don't collide on
+        # ``*.localhost`` even when COMPOSE_PROJECT_NAME unifies under the
+        # bare project namespace for main/master.
         site_domain = f"{project_name}-{branch_name}.localhost"
         
         env_vars = DEFAULT_ENV_VARS.copy()
@@ -516,24 +540,23 @@ ILHA_SUBNET_WEB={web_subnet}
         site_domain: str,
         allowed_hosts: str,
         csrf_trusted_origins: str,
-        debug: bool,
+        has_django: bool,
     ) -> str:
-        """Apply the shared env variable overrides used by both domain and IP deployments."""
-        import re
+        """Apply the shared env variable overrides used by both domain and IP deployments.
+
+        SITE_DOMAIN is always rewritten because it drives Caddy proxy labels. Django
+        siblings (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST) and the
+        secure-cookie hint are written only when ``has_django`` is True. App-owned
+        vars like DEBUG are not touched — those belong to the user's .env.
+        """
         content = self._update_env_var_in_content(content, 'SITE_DOMAIN', site_domain)
-        content = self._update_env_var_in_content(content, 'ALLOWED_HOSTS', allowed_hosts)
-        debug_value = 'True' if debug else 'False'
-        # DEBUG uses case-insensitive matching for legacy compat
-        pattern = r'^DEBUG=.*$'
-        if re.search(pattern, content, flags=re.MULTILINE | re.IGNORECASE):
-            content = re.sub(pattern, f'DEBUG={debug_value}', content, flags=re.MULTILINE | re.IGNORECASE)
-        else:
-            content += f"\nDEBUG={debug_value}\n"
-        use_secure_cookies = self._should_use_secure_cookies(site_domain)
-        content = self._update_env_var_in_content(content, 'USE_SECURE_COOKIES', str(use_secure_cookies))
-        content = self._update_env_var_in_content(content, 'USE_X_FORWARDED_HOST', 'True')
-        content = self._update_env_var_in_content(content, 'CSRF_TRUSTED_ORIGINS', csrf_trusted_origins)
         content = self._update_env_var_in_content(content, 'BUILD_MODE', 'prod')
+        if has_django:
+            content = self._update_env_var_in_content(content, 'ALLOWED_HOSTS', allowed_hosts)
+            content = self._update_env_var_in_content(content, 'CSRF_TRUSTED_ORIGINS', csrf_trusted_origins)
+            content = self._update_env_var_in_content(content, 'USE_X_FORWARDED_HOST', 'True')
+            use_secure_cookies = self._should_use_secure_cookies(site_domain)
+            content = self._update_env_var_in_content(content, 'USE_SECURE_COOKIES', str(use_secure_cookies))
         return content
     
     def get_domain_name(self, branch_name: str) -> str:
@@ -672,19 +695,19 @@ ILHA_SUBNET_WEB={web_subnet}
     
     def generate_compose_environment(self, branch_name: str) -> Dict[str, str]:
         """Generate environment variables for docker compose."""
-        from ..config.settings import get_project_name, sanitize_project_name
-        
         env_vars = self.get_environment_variables(branch_name)
-        
-        # Add database and Redis URLs with project prefix
-        project_name = sanitize_project_name(get_project_name())
-        compose_project_name = f"{project_name}-{branch_name}"
-        
+
+        # Reuse the resolved project name so REDIS_HOST and friends point at
+        # the correct container — e.g. ``time-redis`` for a BYO main branch
+        # rather than the convention-based ``time-main-redis`` that no
+        # container actually has.
+        compose_project_name = env_vars["COMPOSE_PROJECT_NAME"]
+
         env_vars["DATABASE_URL"] = self.get_database_url(branch_name)
         env_vars["REDIS_HOST"] = f"{compose_project_name}-redis"
         env_vars["REDIS_PORT"] = "6379"
         env_vars["REDIS_DB"] = "0"
-        
+
         return env_vars
     
     def create_env_file_from_template(self, template_path: Path, 
@@ -747,19 +770,19 @@ ILHA_SUBNET_WEB={web_subnet}
     
     def _generate_env_compose_with_domain(self, branch_name: str, domain: str) -> str:
         """Generate env.ilha content with domain override.
-        
-        Args:
-            branch_name: Branch name
-            domain: Domain override (subdomain.domain.tld)
-            
-        Returns:
-            Environment file content with domain overrides
+
+        SITE_DOMAIN is always emitted (Caddy proxy target). Django siblings
+        (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST,
+        SECURE_PROXY_SSL_HEADER, USE_SECURE_COOKIES) are emitted only when the
+        project is detected as Django.
         """
         from ..config.settings import ILHA_DIR, sanitize_project_name
         from ..utils.logging import log_warning
+        from ..utils.project_footprint import detect_project_footprint
         import yaml
-        
+
         project_root = self.project_root
+        has_django = detect_project_footprint(self.project_root).has_django
         
         # Get project name from config in self.project_root (not current directory)
         project_name = None
@@ -808,23 +831,26 @@ ILHA_SUBNET_WEB={web_subnet}
             log_warning("This email is used for Let's Encrypt certificate notifications.")
             log_warning("To customize, add CADDY_EMAIL=your-email@example.com to .ilha/env.ilha")
         
-        # Determine secure cookie setting (bare domain is fine)
-        use_secure_cookies = self._should_use_secure_cookies(site_domain)
-        
         base_content = f"""# ilha environment configuration for {branch_name}
 # Domain override: {site_domain}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
 SITE_DOMAIN={site_domain}
+BUILD_MODE=prod
+CADDY_EMAIL={caddy_email}
+"""
+
+        if has_django:
+            use_secure_cookies = self._should_use_secure_cookies(site_domain)
+            base_content += f"""
+# Django-specific (emitted because Django was detected in this project)
 ALLOWED_HOSTS={allowed_hosts}
-DEBUG=False
 USE_X_FORWARDED_HOST=True
 SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
 CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
 USE_SECURE_COOKIES={str(use_secure_cookies)}
-BUILD_MODE=prod
-CADDY_EMAIL={caddy_email}
 """
+
         host_port_section = self._build_host_port_section(branch_name)
         if host_port_section:
             base_content = f"{base_content}\n{host_port_section}"
@@ -915,8 +941,10 @@ CADDY_EMAIL={caddy_email}
         try:
             from ..config.settings import build_allowed_hosts_with_container
             from ..utils.path_utils import get_env_compose_file_path
+            from ..utils.project_footprint import detect_project_footprint
 
             branch_name = self._resolve_branch_name_from_worktree(worktree_path)
+            has_django = detect_project_footprint(worktree_path).has_django
 
             # Use DRY production domain values (bare SITE_DOMAIN, comma-separated CSRF)
             domain_vars = self._production_domain_env_values(domain)
@@ -957,28 +985,29 @@ CADDY_EMAIL={caddy_email}
                     site_domain=site_domain_bare,
                     allowed_hosts=allowed_hosts,
                     csrf_trusted_origins=csrf_trusted_origins,
-                    debug=debug,
+                    has_django=has_django,
                 )
 
-                # Domain-specific: SECURE_PROXY_SSL_HEADER (HTTPS only)
-                content = self._update_env_var_in_content(content, 'SECURE_PROXY_SSL_HEADER', 'HTTP_X_FORWARDED_PROTO,https')
+                # Domain-specific: SECURE_PROXY_SSL_HEADER (HTTPS only) — Django-only
+                if has_django:
+                    content = self._update_env_var_in_content(content, 'SECURE_PROXY_SSL_HEADER', 'HTTP_X_FORWARDED_PROTO,https')
 
                 env_ilha.write_text(content)
                 log_info(f"Applied domain overrides to env.ilha: {site_domain_bare}")
             
             # Update docker-compose override file to add/update Caddy labels and ALLOWED_HOSTS
-            # IMPORTANT: Only modify the .ilha/docker-compose.worktree.yml override file,
+            # IMPORTANT: Only modify the .ilha/docker-compose.overlay.yml override file,
             # never modify the base docker-compose.yml file
-            from ..utils.path_utils import get_compose_override_path
+            from ..utils.path_utils import get_compose_overlay_path
             import yaml
             from ..utils.file_utils import clean_compose_version_field
             
             # Only modify the override file in .ilha directory
-            compose_file = get_compose_override_path(worktree_path)
+            compose_file = get_compose_overlay_path(worktree_path)
             
             if not compose_file or not compose_file.exists():
                 log_warning(f"Could not find docker-compose override file for worktree at {worktree_path}")
-                log_warning(f"Expected: {worktree_path / '.ilha' / 'docker-compose.worktree.yml'}")
+                log_warning(f"Expected: {worktree_path / '.ilha' / 'docker-compose.overlay.yml'}")
             else:
                 # Only process the override file, never the base compose file
                 try:
@@ -1112,11 +1141,11 @@ CADDY_EMAIL={caddy_email}
             True if successful, False otherwise
         """
         try:
-            from ..utils.path_utils import get_compose_override_path
+            from ..utils.path_utils import get_compose_overlay_path
             import yaml
             from ..utils.file_utils import clean_compose_version_field
             
-            compose_file = get_compose_override_path(worktree_path)
+            compose_file = get_compose_overlay_path(worktree_path)
             if not compose_file or not compose_file.exists():
                 log_warning(f"Compose file not found: {compose_file}")
                 return False
@@ -1183,8 +1212,8 @@ CADDY_EMAIL={caddy_email}
         
         try:
             # Check compose file labels
-            from ..utils.path_utils import get_compose_override_path
-            compose_file = get_compose_override_path(worktree_path)
+            from ..utils.path_utils import get_compose_overlay_path
+            compose_file = get_compose_overlay_path(worktree_path)
             if compose_file and compose_file.exists():
                 import yaml
                 compose_content = compose_file.read_text()
@@ -1235,16 +1264,17 @@ CADDY_EMAIL={caddy_email}
     def apply_ip_overrides(self, worktree_path: Path, ip: str, debug: bool = False) -> bool:
         """Apply IP overrides to existing environment files (HTTP-only).
 
-        Sets SITE_DOMAIN to http://{ip}, updates ALLOWED_HOSTS to include
-        the IP, and sets DEBUG based on debug parameter (default: False for production).
+        Sets SITE_DOMAIN to the bare IP (Caddy proxy target). Django siblings
+        (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS) are emitted only when the project
+        is Django.
         """
         try:
             from ..config.settings import build_allowed_hosts_with_container
             from ..utils.path_utils import get_env_compose_file_path
+            from ..utils.project_footprint import detect_project_footprint
 
             branch_name = self._resolve_branch_name_from_worktree(worktree_path)
-
-            http_url = f"http://{ip}"
+            has_django = detect_project_footprint(worktree_path).has_django
 
             if branch_name:
                 allowed_hosts = build_allowed_hosts_with_container(branch_name, [ip])
@@ -1257,17 +1287,17 @@ CADDY_EMAIL={caddy_email}
                 content = env_ilha.read_text()
                 content = self._apply_common_env_overrides(
                     content,
-                    site_domain=http_url,
+                    site_domain=ip,
                     allowed_hosts=allowed_hosts,
                     csrf_trusted_origins=f"http://{ip}",
-                    debug=debug,
+                    has_django=has_django,
                 )
                 env_ilha.write_text(content)
                 log_info(f"Applied IP overrides to env.ilha: {ip}")
             
-            # Update docker-compose.worktree.yml to replace localhost patterns with IP
-            from ..utils.path_utils import get_compose_override_path
-            compose_file = get_compose_override_path(worktree_path)
+            # Update docker-compose.overlay.yml to replace localhost patterns with IP
+            from ..utils.path_utils import get_compose_overlay_path
+            compose_file = get_compose_overlay_path(worktree_path)
             if compose_file and compose_file.exists():
                 try:
                     import yaml
@@ -1307,9 +1337,9 @@ CADDY_EMAIL={caddy_email}
                             clean_compose_version_field(compose_data)
                             
                             compose_file.write_text(yaml.dump(compose_data, default_flow_style=False, sort_keys=False))
-                            log_info(f"Updated docker-compose.worktree.yml with IP: {ip}")
+                            log_info(f"Updated docker-compose.overlay.yml with IP: {ip}")
                 except Exception as e:
-                    log_warning(f"Failed to update docker-compose.worktree.yml: {e}")
+                    log_warning(f"Failed to update docker-compose.overlay.yml: {e}")
             
             return True
         except Exception as e:
