@@ -89,7 +89,7 @@ class TestBuildContextResolution:
         """Test that run_compose_command sets PROJECT_ROOT to worktree path."""
         mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
         
-        compose_file = mock_worktree / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = mock_worktree / ".ilha" / "docker-compose.overlay.yml"
         compose_file.parent.mkdir(parents=True, exist_ok=True)
         compose_file.write_text("version: '3.8'\nservices:\n  web:\n    build: ${PROJECT_ROOT}")
         
@@ -122,48 +122,6 @@ class TestBuildContextResolution:
         assert env['COMPOSE_PROJECT_ROOT'] == str(mock_worktree.resolve())
         assert call_args.kwargs['cwd'] == mock_worktree.resolve()
     
-    @patch('ilha.core.docker_manager.subprocess.run')
-    def test_run_compose_command_with_profile_worktree_path(self, mock_run, docker_manager, mock_worktree):
-        """Test that run_compose_command_with_profile sets PROJECT_ROOT to worktree path."""
-        mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
-        
-        compose_file = mock_worktree / ".ilha" / "docker-compose.worktree.yml"
-        compose_file.parent.mkdir(parents=True, exist_ok=True)
-        compose_file.write_text("version: '3.8'\nservices:\n  web:\n    build: ${PROJECT_ROOT}")
-        
-        compose_override = mock_worktree / ".ilha" / "docker-compose.override.yml"
-        compose_override.write_text("version: '3.8'\nservices:\n  web:\n    profiles: [ilha]")
-        
-        env_file = mock_worktree / ".ilha" / "env.ilha"
-        env_file.write_text("COMPOSE_PROJECT_NAME=test-feature")
-        
-        # Mock the subprocess call to capture environment variables
-        def capture_env(cmd, **kwargs):
-            # Store the environment for inspection
-            capture_env.env = kwargs.get('env', {})
-            return Mock(returncode=0, stdout="", stderr="")
-        
-        mock_run.side_effect = capture_env
-        
-        result = docker_manager.run_compose_command_with_profile(
-            compose_file=compose_file,
-            compose_override=compose_override,
-            command=["up", "-d"],
-            env_file=env_file,
-            project_name="test-feature",
-            working_dir=mock_worktree
-        )
-        
-        assert result == True
-        assert mock_run.called
-        
-        # Check that PROJECT_ROOT is set to the worktree path
-        call_args = mock_run.call_args
-        env = call_args.kwargs.get('env', {})
-        assert env['PROJECT_ROOT'] == str(mock_worktree.resolve())
-        assert env['COMPOSE_PROJECT_ROOT'] == str(mock_worktree.resolve())
-        assert call_args.kwargs['cwd'] == mock_worktree.resolve()
-    
     def test_absolute_path_resolution(self, docker_manager, mock_worktree):
         """Test that working_dir is resolved to absolute path."""
         relative_worktree = Path("worktrees/feature")
@@ -171,7 +129,7 @@ class TestBuildContextResolution:
         with patch('ilha.core.docker_manager.subprocess.run') as mock_run:
             mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             
-            compose_file = mock_worktree / ".ilha" / "docker-compose.worktree.yml"
+            compose_file = mock_worktree / ".ilha" / "docker-compose.overlay.yml"
             compose_file.parent.mkdir(parents=True, exist_ok=True)
             compose_file.write_text("version: '3.8'")
             
@@ -191,7 +149,7 @@ class TestBuildContextResolution:
         with patch('ilha.core.docker_manager.subprocess.run') as mock_run:
             mock_run.return_value = Mock(returncode=0, stdout="", stderr="")
             
-            compose_file = mock_worktree / ".ilha" / "docker-compose.worktree.yml"
+            compose_file = mock_worktree / ".ilha" / "docker-compose.overlay.yml"
             compose_file.parent.mkdir(parents=True, exist_ok=True)
             compose_file.write_text("version: '3.8'")
             

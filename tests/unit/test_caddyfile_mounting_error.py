@@ -38,8 +38,7 @@ class TestCaddyfileMountingError:
         mock_orchestrator.start_worktree.return_value = {'success': False, 'error': 'Caddyfile error'}
         
         with patch('ilha.commands.worktree.WorktreeOrchestrator', return_value=mock_orchestrator), \
-             patch('ilha.commands.worktree.get_project_root', return_value=Path('/test/project')), \
-             patch('ilha.utils.path_utils.get_compose_override_path', return_value=Path('/test/compose.yml')):
+             patch('ilha.commands.worktree.get_project_root', return_value=Path('/test/project')):
             
             manager = WorktreeManager(project_root=Path('/test/project'))
             # Pre-set the orchestrator to avoid _ensure_orchestrator creating a new one
@@ -88,7 +87,7 @@ Error response from daemon: failed to create task for container: failed to creat
     @patch('subprocess.run')
     def test_docker_compose_caddyfile_mounting_failure(self, mock_run, docker_manager):
         """Test Docker Compose failure due to Caddyfile mounting error."""
-        compose_file = Path("/test/docker-compose.worktree.yml")
+        compose_file = Path("/test/docker-compose.overlay.yml")
         env_file = Path("/test/.ilha/env.ilha")
         project_name = "test"
         
@@ -171,7 +170,7 @@ Error response from daemon: failed to create task for container: failed to creat
     @patch('subprocess.run')
     def test_docker_compose_command_with_caddyfile_error(self, mock_run, docker_manager):
         """Test Docker Compose command execution with Caddyfile mounting error."""
-        compose_file = Path("/test/docker-compose.worktree.yml")
+        compose_file = Path("/test/docker-compose.overlay.yml")
         command = ["up", "-d"]
         env_file = Path("/test/.ilha/env.ilha")
         project_name = "test"
@@ -256,7 +255,7 @@ Error response from daemon: failed to create task for container: failed to creat
     @patch('subprocess.run')
     def test_volume_warnings_with_caddyfile_error(self, mock_run, docker_manager):
         """Test that volume warnings are present alongside Caddyfile mounting error."""
-        compose_file = Path("/test/docker-compose.worktree.yml")
+        compose_file = Path("/test/docker-compose.overlay.yml")
         env_file = Path("/test/.ilha/env.ilha")
         project_name = "test"
         

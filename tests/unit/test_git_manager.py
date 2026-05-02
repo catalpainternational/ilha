@@ -37,13 +37,17 @@ class TestGitManager:
     
     @patch('subprocess.run')
     def test_init_validation_failure(self, mock_run):
-        """Test GitManager initialization with invalid git repo."""
+        """Test GitManager initialization with invalid git repo.
+
+        ``GitManager._validate_git_repo`` raises ``PrerequisiteError`` (an
+        ``ilhaError`` subclass) when ``git rev-parse --git-dir`` fails.
+        """
+        from ilha.exceptions import PrerequisiteError
         mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Not a git repository")
-        
-        with pytest.raises(RuntimeError, match="Not in a git repository"):
+
+        with pytest.raises(PrerequisiteError, match="Not in a git repository"):
             GitManager()
-        
-        # Get the project root from the manager that was created before the exception
+
         from ilha.config.settings import get_project_root
         project_root = get_project_root()
         mock_run.assert_called_once_with(

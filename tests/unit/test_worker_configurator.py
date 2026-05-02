@@ -278,7 +278,7 @@ class TestConfigureWorkerEnvironment:
     def test_replaces_service_hostname_with_central_ip(self, wc, tmp_path):
         ilha_dir = tmp_path / ".ilha"
         ilha_dir.mkdir()
-        (ilha_dir / "docker-compose.worktree.yml").write_text(yaml.dump({
+        (ilha_dir / "docker-compose.overlay.yml").write_text(yaml.dump({
             "services": {
                 "web": {
                     "environment": {
@@ -323,7 +323,7 @@ class TestConfigureWorkerEnvironment:
     def test_preserves_port_numbers(self, wc, tmp_path):
         ilha_dir = tmp_path / ".ilha"
         ilha_dir.mkdir()
-        (ilha_dir / "docker-compose.worktree.yml").write_text(yaml.dump({
+        (ilha_dir / "docker-compose.overlay.yml").write_text(yaml.dump({
             "services": {
                 "web": {
                     "environment": {

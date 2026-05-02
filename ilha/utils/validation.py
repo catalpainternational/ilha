@@ -6,12 +6,13 @@ This module provides validation functions for various inputs and system states.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
-from .logging import log_error, error_exit
+from .logging import error_exit, fail_prerequisite, log_error
 from ..config.settings import BRANCH_NAME_PATTERN, PROTECTED_BRANCHES
 
 # Bound `docker info` / `docker compose version` so wedged daemons cannot hang the CLI indefinitely.
@@ -52,70 +53,107 @@ def validate_git_repository(project_root: Optional[Path] = None) -> bool:
         return False
 
 
-def validate_docker_running(timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS) -> bool:
-    """Check if Docker is running (bounded; avoids hang on unresponsive daemon)."""
+def check_docker_daemon_responsive(
+    timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS,
+) -> Tuple[bool, Optional[str]]:
+    """Return (True, None) if the Docker daemon responds; else (False, reason)."""
+    if not shutil.which("docker"):
+        return False, "The `docker` command was not found on PATH."
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["docker", "info"],
             capture_output=True,
-            check=True,
+            text=True,
             timeout=timeout_seconds,
+            check=False,
         )
-        return True
     except subprocess.TimeoutExpired:
-        return False
+        return (
+            False,
+            f"`docker info` timed out after {timeout_seconds}s (daemon not responding or still starting).",
+        )
+    except OSError as exc:
+        return False, f"Could not run `docker info`: {exc}"
+    if result.returncode == 0:
+        return True, None
+    blob = (result.stderr or result.stdout or "").strip()
+    first = blob.splitlines()[0] if blob else "no output from docker"
+    if len(first) > 200:
+        first = first[:197] + "..."
+    return False, f"`docker info` failed (exit {result.returncode}): {first}"
+
+
+def validate_docker_running(timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS) -> bool:
+    """Check if Docker is running (bounded; avoids hang on unresponsive daemon)."""
+    ok, _ = check_docker_daemon_responsive(timeout_seconds)
+    return ok
+
+
+def check_docker_compose_responsive(
+    timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS,
+) -> Tuple[bool, Optional[str]]:
+    """Return (True, None) if compose CLI works; else (False, reason)."""
+    try:
+        r = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if r.returncode == 0:
+            return True, None
+        err = (r.stderr or r.stdout or "").strip()
+        compose_hint = err.splitlines()[0][:200] if err else "unknown error"
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            f"`docker compose version` timed out after {timeout_seconds}s.",
+        )
+    except OSError as exc:
+        compose_hint = str(exc)
     except (subprocess.CalledProcessError, FileNotFoundError, Exception):
-        return False
+        compose_hint = "docker compose failed"
+
+    try:
+        r2 = subprocess.run(
+            ["docker-compose", "version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if r2.returncode == 0:
+            return True, None
+    except subprocess.TimeoutExpired:
+        return (
+            False,
+            f"Neither `docker compose` nor `docker-compose` responded within {timeout_seconds}s.",
+        )
+    except OSError:
+        pass
+
+    return (
+        False,
+        "Neither `docker compose version` nor `docker-compose version` succeeded. "
+        f"(docker compose: {compose_hint})",
+    )
 
 
 def validate_docker_compose(timeout_seconds: int = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS) -> bool:
     """Check if Docker Compose is available (bounded)."""
-    try:
-        subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            check=True,
-            timeout=timeout_seconds,
-        )
-        return True
-    except subprocess.TimeoutExpired:
-        return False
-    except (subprocess.CalledProcessError, FileNotFoundError, Exception):
-        try:
-            subprocess.run(
-                ["docker-compose", "version"],
-                capture_output=True,
-                check=True,
-                timeout=timeout_seconds,
-            )
-            return True
-        except subprocess.TimeoutExpired:
-            return False
-        except (subprocess.CalledProcessError, FileNotFoundError, Exception):
-            return False
+    ok, _ = check_docker_compose_responsive(timeout_seconds)
+    return ok
 
 
 def validate_worktree_directory(worktree_path: Path, project_root: Optional[Path] = None) -> bool:
-    """Validate that we're in a valid worktree directory."""
-    # Check for compose worktree file in worktree's .ilha directory
-    compose_worktree_path = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-    return compose_worktree_path.exists()
+    """Validate that we're in a valid ilha worktree directory.
 
-
-def validate_compose_override_exists(branch_name: str, project_root: Optional[Path] = None) -> bool:
-    """Check if compose override file exists for a worktree."""
-    from ..core.git_manager import GitManager
-    from ..utils.path_utils import get_compose_override_path
-    
-    # Get worktree path
-    git_manager = GitManager(project_root=project_root)
-    worktree_path = git_manager.find_worktree_path(branch_name)
-    if not worktree_path:
-        return False
-    
-    # Check for compose override file
-    compose_override_path = get_compose_override_path(worktree_path)
-    return compose_override_path and compose_override_path.exists()
+    Presence of ``.ilha/docker-compose.overlay.yml`` is the canonical signal
+    that ``ilha setup`` has been run for this worktree.
+    """
+    overlay_path = worktree_path / ".ilha" / "docker-compose.overlay.yml"
+    return overlay_path.exists()
 
 
 def validate_branch_protection(branch_name: str) -> bool:
@@ -178,39 +216,63 @@ def validate_branch_merged(branch_name: str, project_root: Optional[Path] = None
 def check_prerequisites(project_root: Optional[Path] = None) -> None:
     """Check all prerequisites and exit if any fail."""
     if not validate_git_repository(project_root):
-        error_exit("Not in a git repository. Please run this command from the project root.")
-
-    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
-    if not validate_docker_running(timeout_seconds=timeout):
-        error_exit(
-            "Docker is not running or did not respond in time. "
-            "Start Docker Desktop / the daemon and try again. "
-            f"(Health probe timeout: {timeout}s)"
+        fail_prerequisite(
+            "This command must be run from a git repository (project root).",
+            hints=[
+                "Change directory to your project root or an ilha worktree, then retry.",
+                "Example: `cd path/to/repo` or `cd worktrees/<branch>`.",
+            ],
         )
 
-    if not validate_docker_compose(timeout_seconds=timeout):
-        error_exit(
-            "Docker Compose is not available or did not respond in time. "
-            "Install Docker Compose v2 (or docker-compose) and try again. "
-            f"(Health probe timeout: {timeout}s)"
+    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
+    ok, reason = check_docker_daemon_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker is required for this command, but the daemon is not usable right now.",
+            hints=[
+                reason,
+                "Start Docker Desktop (macOS/Windows) or the Docker service (Linux) and wait until it is fully running.",
+                f"If Docker is slow to start, wait and retry (health check timeout: {timeout}s).",
+                "Sanity check in a terminal: `docker info`",
+            ],
+        )
+
+    ok, reason = check_docker_compose_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker Compose is required for this command but is missing or failing.",
+            hints=[
+                reason,
+                "Install Docker Compose v2 (`docker compose`) or the legacy `docker-compose` CLI.",
+                f"Sanity check: `docker compose version` (timeout: {timeout}s)",
+            ],
         )
 
 
 def check_prerequisites_no_git() -> None:
     """Check Docker prerequisites only (skip git validation)."""
     timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
-    if not validate_docker_running(timeout_seconds=timeout):
-        error_exit(
-            "Docker is not running or did not respond in time. "
-            "Start Docker Desktop / the daemon and try again. "
-            f"(Health probe timeout: {timeout}s)"
+    ok, reason = check_docker_daemon_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker is required for this command, but the daemon is not usable right now.",
+            hints=[
+                reason,
+                "Start Docker Desktop (macOS/Windows) or the Docker service (Linux) and wait until it is fully running.",
+                f"If Docker is slow to start, wait and retry (health check timeout: {timeout}s).",
+                "Sanity check in a terminal: `docker info`",
+            ],
         )
 
-    if not validate_docker_compose(timeout_seconds=timeout):
-        error_exit(
-            "Docker Compose is not available or did not respond in time. "
-            "Install Docker Compose v2 (or docker-compose) and try again. "
-            f"(Health probe timeout: {timeout}s)"
+    ok, reason = check_docker_compose_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker Compose is required for this command but is missing or failing.",
+            hints=[
+                reason,
+                "Install Docker Compose v2 (`docker compose`) or the legacy `docker-compose` CLI.",
+                f"Sanity check: `docker compose version` (timeout: {timeout}s)",
+            ],
         )
 
 

@@ -5,12 +5,13 @@ Installs ONLY Docker + Docker Compose v2 on a fresh Ubuntu server.
 No Python, git, or ilha required on the target.
 
 Steps:
-1. Wait for apt/dpkg lock (unattended-upgrades on first boot)
-2. Configure firewall (UFW or iptables)
-3. Install Docker Engine and Compose v2
-4. Create ilha Docker network
-5. Create Caddy volumes
-6. Create swap file
+1. Mask apt-daily timers (so they can't fire mid-prep and race with our apt calls)
+2. Wait for apt/dpkg lock (any in-flight unattended-upgrades on first boot)
+3. Configure firewall (UFW or iptables)
+4. Install Docker Engine and Compose v2
+5. Create ilha Docker network
+6. Create Caddy volumes
+7. Create swap file
 """
 
 import sys
@@ -28,6 +29,10 @@ class ServerPrep:
         self.logger = DeployLogger()
         self.sys = RemoteSystemCommand(self.logger)
 
+    # systemd units that auto-run apt and race with our prep on first boot.
+    _APT_TIMER_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer")
+    _APT_SERVICE_UNITS = ("apt-daily.service", "apt-daily-upgrade.service")
+
     def run(self) -> bool:
         """Execute full preparation.
 
@@ -37,34 +42,66 @@ class ServerPrep:
         self.logger.info("=== ilha Slim Server Preparation ===")
         self.logger.info("Installing: Docker Engine + Compose v2 + firewall")
 
-        # Step 0: Wait for apt/dpkg lock
+        self._disable_apt_timers()
+        try:
+            return self._run_steps()
+        finally:
+            self._restore_apt_timers()
+
+    def _run_steps(self) -> bool:
+        # Wait for any currently-running unattended-upgrade to finish.
+        # The mask above prevents new ones from starting mid-prep.
         if not self.sys.apt_update():
             return False
         if not self.sys.dpkg_wait():
             return False
 
-        # Step 1: Firewall
         if not self._setup_firewall():
             return False
 
-        # Step 2: Docker
         if not self._install_docker():
             return False
 
-        # Step 3: Docker network
         if not self._create_docker_network():
             return False
 
-        # Step 4: Caddy volumes
         if not self._create_caddy_volumes():
             return False
 
-        # Step 5: Swap
         if not self._setup_swap():
             return False
 
         self.logger.success("=== Slim server preparation complete ===")
         return True
+
+    def _disable_apt_timers(self) -> None:
+        """Mask apt-daily timers and services so they can't fire mid-prep.
+
+        Masking (not just stopping) is required: systemd will otherwise re-fire
+        the timer the moment we release control. A currently-running invocation
+        is left alone — it'll be drained by apt_update/dpkg_wait below.
+        """
+        self.logger.info("--- Masking apt-daily timers ---")
+        units = self._APT_TIMER_UNITS + self._APT_SERVICE_UNITS
+        self.sys.run(["systemctl", "stop", *units], check=False)
+        self.sys.run(["systemctl", "mask", *units], check=False)
+
+    def _restore_apt_timers(self) -> None:
+        """Unmask and re-enable apt-daily timers.
+
+        Best-effort: a failure here shouldn't override the run's outcome, so we
+        log and move on. Worst case the operator runs `systemctl unmask` later.
+        """
+        units = self._APT_TIMER_UNITS + self._APT_SERVICE_UNITS
+        result = self.sys.run(["systemctl", "unmask", *units], check=False)
+        if result is None:
+            self.logger.warning(
+                "Could not unmask apt-daily units — run "
+                "`systemctl unmask apt-daily.timer apt-daily-upgrade.timer "
+                "apt-daily.service apt-daily-upgrade.service` manually."
+            )
+            return
+        self.sys.run(["systemctl", "start", *self._APT_TIMER_UNITS], check=False)
 
     def _setup_firewall(self) -> bool:
         """Configure firewall (UFW or iptables).

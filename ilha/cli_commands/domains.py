@@ -20,7 +20,7 @@ def register_commands(cli) -> None:
     @cli.group()
     @add_verbose_option
     def domains():
-        """Manage DNS domains and DNS A records."""
+        """Manage DNS domains, zones, and DNS A records."""
 
     @domains.command("create")
     @click.argument("subdomain")
@@ -72,6 +72,31 @@ def register_commands(cli) -> None:
                 JSONOutput.print_error(f"Error listing DNS A records: {exc}")
             else:
                 error_exit(f"Error listing DNS A records: {exc}")
+
+    @domains.command("zones")
+    @click.option("--dns-token", help="DNS API token (or use DIGITALOCEAN_API_TOKEN env var)")
+    @click.option("--as-json", "--json", "output_json", is_flag=True, default=False, help="Output results as JSON format")
+    @click.option("--as-csv", "output_csv", is_flag=True, default=False, help="Output results as CSV format")
+    @add_verbose_option
+    def domains_zones(dns_token: Optional[str], output_json: bool, output_csv: bool):
+        try:
+            check_prerequisites_no_git()
+            domain_commands = DomainCommands()
+            success = domain_commands.list_zones(
+                dns_token=dns_token,
+                json=output_json,
+                csv=output_csv,
+            )
+            if not success:
+                if output_json or output_csv:
+                    JSONOutput.print_error("Failed to list DNS zones")
+                else:
+                    error_exit("Failed to list DNS zones")
+        except Exception as exc:
+            if output_json or output_csv:
+                JSONOutput.print_error(f"Error listing DNS zones: {exc}")
+            else:
+                error_exit(f"Error listing DNS zones: {exc}")
 
     @domains.command("delete")
     @click.argument("full_domain")

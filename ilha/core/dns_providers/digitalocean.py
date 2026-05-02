@@ -188,14 +188,21 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
                 subdomains.append(record.get('name'))
         return subdomains
     
+    def list_domain_zones(self) -> List[Dict[str, Any]]:
+        """List DNS zones in the account (DigitalOcean ``GET /v2/domains``).
+
+        Returns:
+            List of domain objects from the API (each includes at least ``name`` and ``ttl``).
+        """
+        return self._collect_paginated("/domains", "domains")
+
     def list_all_domains(self) -> List[str]:
         """List all base domains in the account.
-        
+
         Returns:
             List of base domain names
         """
-        domains = self._collect_paginated('/domains', 'domains')
-        return [d.get('name') for d in domains if d.get('name')]
+        return [z.get("name") for z in self.list_domain_zones() if z.get("name")]
     
     def update_subdomain(self, subdomain: str, domain: str, ip: str) -> bool:
         """Update A record for subdomain to point to new IP.

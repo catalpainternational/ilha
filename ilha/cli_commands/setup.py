@@ -38,13 +38,4 @@ def register_commands(cli) -> None:
         if not success:
             raise click.ClickException("Failed to setup ilha for this project")
 
-    @cli.command("clean-legacy")
-    @add_verbose_option
-    @wrap_click_errors("Error cleaning legacy ilha elements")
-    def clean_legacy():
-        """Clean legacy ilha elements from docker-compose.yml."""
-        setup_manager = SetupManager()
-        success = setup_manager.clean_legacy_elements()
-        if not success:
-            raise click.ClickException("Failed to clean legacy ilha elements")
 

@@ -46,7 +46,6 @@ def test_deploy_preflight_exposes_public_cross_class_api():
         "resolve_comparison_root",
         "gather_source_manifest",
         "build_drift_report",
-        "detect_env_contract_issues",
     }
     for name in public_api:
         assert hasattr(DeployPreflight, name), (

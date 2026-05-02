@@ -11,17 +11,32 @@ from typing import Optional, Tuple
 from ..config.settings import get_project_root, get_worktree_paths, get_worktree_dir
 
 
-def get_compose_override_path(worktree_path: Optional[Path] = None) -> Optional[Path]:
-    """Get the path to the compose worktree file.
-    
-    Always returns worktrees/{branch}/.ilha/docker-compose.worktree.yml
+def get_compose_overlay_path(worktree_path: Optional[Path] = None) -> Path:
+    """Return the path where ilha writes its compose overlay.
+
+    Always returns a Path (existence is the caller's concern). Used for both
+    reading (existence-checked downstream) and writing.
     """
     if worktree_path is None:
         worktree_path = Path.cwd()
+    return worktree_path / ".ilha" / "docker-compose.overlay.yml"
 
-    # Always use worktree's .ilha directory
-    compose_path = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-    return compose_path if compose_path.exists() else None
+
+def compose_files_for_invocation(
+    worktree_path: Optional[Path] = None,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Return ``(base_compose, overlay_compose)`` for ``docker compose -f ... -f ...``.
+
+    The base is the user's own ``docker-compose.yml`` at the worktree root.
+    The overlay is ``.ilha/docker-compose.overlay.yml``. Either may be None
+    if missing — callers decide how to react. The standard local/deploy path
+    is to require both: base is the user's truth; overlay is ilha's deltas.
+    """
+    if worktree_path is None:
+        worktree_path = Path.cwd()
+    base = worktree_path / "docker-compose.yml"
+    overlay = worktree_path / ".ilha" / "docker-compose.overlay.yml"
+    return (base if base.exists() else None, overlay if overlay.exists() else None)
 
 
 def get_worktree_branch_name(worktree_path: Optional[Path] = None) -> Optional[str]:
@@ -124,16 +139,6 @@ def copy_env_file(source_path: Path, target_path: Path) -> bool:
             log_warning(f"Failed to copy .env file: {e}")
             return False
     return False
-
-
-def get_compose_file_path(worktree_path: Path, compose_type: str = "worktree") -> Path:
-    """Get the path to a compose file."""
-    if compose_type == "worktree":
-        return worktree_path / "ilha" / "config" / "docker-compose.worktree.yml"
-    elif compose_type == "global-caddy":
-        return worktree_path / "ilha" / "config" / "docker-compose.global-caddy.yml"
-    else:
-        raise ValueError(f"Unknown compose type: {compose_type}")
 
 
 def get_caddyfile_path(worktree_path: Path) -> Path:

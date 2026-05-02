@@ -89,6 +89,13 @@ def register_commands(cli) -> None:
                 return candidate_name
             counter += 1
 
+    def _find_existing_droplet_by_name(name: str, provider):
+        """Return the first droplet matching `name` exactly, or None."""
+        for d in provider.list_droplets():
+            if d.name == name:
+                return d
+        return None
+
     @droplet.command("list")
     @click.option("--api-token", help="DigitalOcean API token (or use DIGITALOCEAN_API_TOKEN env var)")
     @click.option("--as-json", "--json", "output_json", is_flag=True, default=False, help="Output results as JSON format")
@@ -311,6 +318,18 @@ def register_commands(cli) -> None:
     @click.option("--create-only", is_flag=True, default=False, help="Only create droplet, skip deploy")
     @click.option("--no-create", is_flag=True, default=False, help="Skip droplet creation, deploy to existing server (requires --scp-target or --domain/--ip)")
     @click.option("--no-prepare", is_flag=True, default=False, help="Skip server preparation")
+    @click.option(
+        "--reuse-existing",
+        is_flag=True,
+        default=False,
+        help="If a droplet with the resolved name already exists, deploy to it without prompting.",
+    )
+    @click.option(
+        "--force-new",
+        is_flag=True,
+        default=False,
+        help="Always create a new droplet even if one with the resolved name exists (suffixed with -2, -3, …).",
+    )
     @click.option("--vpc-uuid", help="VPC UUID for the droplet")
     @click.option("--central-droplet-name", help="Reuse VPC UUID from central droplet")
     @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
@@ -354,12 +373,6 @@ def register_commands(cli) -> None:
         help="Fail deploy when critical files differ between comparison root and worktree, even across different commits",
     )
     @click.option(
-        "--strict-env-contract/--no-strict-env-contract",
-        default=True,
-        show_default=True,
-        help="Block deploy when env values have known-bad shapes (e.g. SITE_DOMAIN with http:// prefix). Prevents the CSRF-breakage class; pass --no-strict-env-contract to bypass.",
-    )
-    @click.option(
         "--expected-ssh-fingerprint",
         help="SHA256:… fingerprint of the server's SSH host key. If set, a mismatch aborts the deploy (MITM defense). Without it, the first-seen key is trusted (TOFU) and logged so you can pin it on the next deploy.",
     )
@@ -384,6 +397,8 @@ def register_commands(cli) -> None:
         create_only: bool,
         no_create: bool,
         no_prepare: bool,
+        reuse_existing: bool,
+        force_new: bool,
         vpc_uuid: Optional[str],
         central_droplet_name: Optional[str],
         use_staging_certificates: bool,
@@ -396,7 +411,6 @@ def register_commands(cli) -> None:
         no_build: bool,
         force_password_reset: bool,
         strict_deploy_drift: bool,
-        strict_env_contract: bool,
         expected_ssh_fingerprint: Optional[str],
         smoke_timeout: int,
         json: bool,
@@ -437,6 +451,12 @@ def register_commands(cli) -> None:
                 else:
                     error_exit("--create-only and --no-create are mutually exclusive")
                 return
+            if reuse_existing and force_new:
+                if json:
+                    JSONOutput.print_error("--reuse-existing and --force-new are mutually exclusive")
+                else:
+                    error_exit("--reuse-existing and --force-new are mutually exclusive")
+                return
 
             # Auto-detect branch
             branch_name = auto_detect_branch_name(branch_name, json)
@@ -469,44 +489,84 @@ def register_commands(cli) -> None:
                 if token:
                     provider = DropletManager.create_provider("digitalocean", token)
 
-                if central_droplet_name and not vpc_uuid and provider:
-                    droplets_list = provider.list_droplets()
-                    for d in droplets_list:
-                        if d.name == central_droplet_name and d.vpc_uuid:
-                            resolved_vpc_uuid = d.vpc_uuid
-                            if not json:
-                                log_info(f"Using VPC UUID from '{central_droplet_name}': {resolved_vpc_uuid}")
-                            break
-
-                # Generate unique name
-                if provider:
-                    droplet_name = _generate_unique_droplet_name(droplet_name, provider)
-
-                droplet_commands = DropletCommands()
-                ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else None
-                tags_list = list(tags) if tags else None
-
-                created_droplet = droplet_commands.create_droplet(
-                    name=droplet_name,
-                    region=resolved_region,
-                    size=resolved_size,
-                    image=resolved_image,
-                    ssh_keys=ssh_keys_list,
-                    tags=tags_list,
-                    wait=True,
-                    api_token=effective_token,
-                    json=json,
-                    vpc_uuid=resolved_vpc_uuid,
-                    return_droplet=True,
-                )
-                if not created_droplet:
-                    _print_elapsed(start_time, json)
-                    if json:
-                        JSONOutput.print_error(f"Failed to create droplet: {droplet_name}")
+                # Existing-droplet detection: a previous deploy may have created
+                # the droplet but failed mid-prep. Without this check, we'd
+                # silently create <name>-2 and start billing for a second one.
+                existing = _find_existing_droplet_by_name(droplet_name, provider) if provider else None
+                if existing and not force_new:
+                    if reuse_existing:
+                        action = "reuse"
+                    elif json:
+                        _print_elapsed(start_time, json)
+                        JSONOutput.print_error(
+                            f"Droplet '{droplet_name}' already exists at {existing.ip_address or 'unknown'}. "
+                            "Pass --reuse-existing to deploy to it, or --force-new to create another."
+                        )
+                        return
                     else:
-                        error_exit(f"Failed to create droplet: {droplet_name}")
-                    return
-                droplet_info = created_droplet
+                        log_info(
+                            f"Droplet '{droplet_name}' already exists "
+                            f"(id={existing.id}, ip={existing.ip_address or 'unknown'}, status={existing.status})."
+                        )
+                        action = "reuse" if click.confirm(
+                            f"Deploy to existing droplet '{droplet_name}'?", default=True
+                        ) else "abort"
+
+                    if action == "abort":
+                        _print_elapsed(start_time, json)
+                        log_info("Aborted. Pass --force-new to create a fresh droplet, or destroy the existing one.")
+                        return
+
+                    # Reuse path: skip creation, fall through to deploy with this droplet's IP.
+                    if not existing.ip_address:
+                        _print_elapsed(start_time, json)
+                        if json:
+                            JSONOutput.print_error(f"Existing droplet '{droplet_name}' has no IP address")
+                        else:
+                            error_exit(f"Existing droplet '{droplet_name}' has no IP address")
+                        return
+                    droplet_info = existing
+                    if not json:
+                        log_info(f"Reusing droplet '{droplet_name}' at {existing.ip_address}")
+                else:
+                    if central_droplet_name and not vpc_uuid and provider:
+                        droplets_list = provider.list_droplets()
+                        for d in droplets_list:
+                            if d.name == central_droplet_name and d.vpc_uuid:
+                                resolved_vpc_uuid = d.vpc_uuid
+                                if not json:
+                                    log_info(f"Using VPC UUID from '{central_droplet_name}': {resolved_vpc_uuid}")
+                                break
+
+                    # Generate unique name (suffixes -2, -3 if --force-new lands on a collision)
+                    if provider:
+                        droplet_name = _generate_unique_droplet_name(droplet_name, provider)
+
+                    droplet_commands = DropletCommands()
+                    ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else None
+                    tags_list = list(tags) if tags else None
+
+                    created_droplet = droplet_commands.create_droplet(
+                        name=droplet_name,
+                        region=resolved_region,
+                        size=resolved_size,
+                        image=resolved_image,
+                        ssh_keys=ssh_keys_list,
+                        tags=tags_list,
+                        wait=True,
+                        api_token=effective_token,
+                        json=json,
+                        vpc_uuid=resolved_vpc_uuid,
+                        return_droplet=True,
+                    )
+                    if not created_droplet:
+                        _print_elapsed(start_time, json)
+                        if json:
+                            JSONOutput.print_error(f"Failed to create droplet: {droplet_name}")
+                        else:
+                            error_exit(f"Failed to create droplet: {droplet_name}")
+                        return
+                    droplet_info = created_droplet
 
                 if create_only:
                     _print_elapsed(start_time, json)
@@ -585,7 +645,6 @@ def register_commands(cli) -> None:
                     no_build=no_build,
                     force_password_reset=force_password_reset,
                     strict_deploy_drift=strict_deploy_drift,
-                    strict_env_contract=strict_env_contract,
                     smoke_timeout=smoke_timeout,
                     expected_ssh_fingerprint=expected_ssh_fingerprint,
                 )

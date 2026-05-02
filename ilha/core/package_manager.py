@@ -76,7 +76,7 @@ class PackageManager:
             if not success:
                 log_error(f"Failed to apply domain overrides to worktree at {worktree_path}")
                 log_error(f"This may cause containers to use localhost domain instead of {domain}")
-                log_error(f"Manual intervention required: edit {worktree_path}/.ilha/docker-compose.worktree.yml")
+                log_error(f"Manual intervention required: edit {worktree_path}/.ilha/docker-compose.overlay.yml")
                 log_error(f"and {worktree_path}/.ilha/env.ilha to set domain to {domain}")
                 return False
             
@@ -97,7 +97,7 @@ class PackageManager:
             if not success:
                 log_error(f"Failed to apply IP overrides to worktree at {worktree_path}")
                 log_error(f"This may cause containers to use localhost domain instead of {ip}")
-                log_error(f"Manual intervention required: edit {worktree_path}/.ilha/docker-compose.worktree.yml")
+                log_error(f"Manual intervention required: edit {worktree_path}/.ilha/docker-compose.overlay.yml")
                 log_error(f"and {worktree_path}/.ilha/env.ilha to set IP to {ip}")
                 return False
         
@@ -571,7 +571,7 @@ class PackageManager:
             if not self._initialize_git_for_standalone(target_directory):
                 log_warning("Failed to initialize git repository, ilha commands may not work")
             
-            # Fix env_file paths in docker-compose.worktree.yml for standalone deployment
+            # Fix env_file paths in docker-compose.overlay.yml for standalone deployment
             # The compose file may reference ${PROJECT_ROOT}/.env but on standalone deployments
             # the .env is in the worktree directory, so we use relative paths
             if not self._fix_env_file_paths_for_standalone(worktree_path):
@@ -828,7 +828,7 @@ class PackageManager:
             
             # If container_filter is provided, create filtered compose file
             if container_filter:
-                worktree_compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+                worktree_compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
                 if worktree_compose_file.exists():
                     filtered_compose = self._worker_config.filter_compose_services(
                         worktree_compose_file, container_filter, worktree_path, exclude_deps, private_ip
@@ -874,7 +874,7 @@ class PackageManager:
             ilha_dst = worktree_path / ".ilha"
             if ilha_src.exists():
                 # If preserving domain settings, check if existing compose file has domain/IP labels
-                existing_compose_file = ilha_dst / "docker-compose.worktree.yml"
+                existing_compose_file = ilha_dst / "docker-compose.overlay.yml"
                 preserve_compose = False
                 if preserve_domain_settings and existing_compose_file.exists():
                     try:
@@ -923,7 +923,7 @@ class PackageManager:
                 # Restore preserved compose file if we backed it up
                 if preserve_compose and backup_compose_path:
                     try:
-                        restored_compose_file = ilha_dst / "docker-compose.worktree.yml"
+                        restored_compose_file = ilha_dst / "docker-compose.overlay.yml"
                         shutil.copy2(backup_compose_path, restored_compose_file)
                         log_info("Restored preserved compose file with domain/IP settings")
                         os.unlink(backup_compose_path)
@@ -934,7 +934,7 @@ class PackageManager:
             
             # Check for filtered compose file and use it if available
             filtered_compose_file = ilha_dst / "docker-compose.worktree.filtered.yml"
-            worktree_compose_file = ilha_dst / "docker-compose.worktree.yml"
+            worktree_compose_file = ilha_dst / "docker-compose.overlay.yml"
             if filtered_compose_file.exists():
                 log_info("Found filtered compose file in package, using it as worktree compose file")
                 # Load filtered compose to get service count
@@ -1325,9 +1325,9 @@ class PackageManager:
             return False
 
     def _fix_env_file_paths_for_standalone(self, worktree_path: Path) -> bool:
-        """Fix env_file paths in docker-compose.worktree.yml for standalone deployment.
+        """Fix env_file paths in docker-compose.overlay.yml for standalone deployment.
         
-        The docker-compose.worktree.yml may have env_file paths like:
+        The docker-compose.overlay.yml may have env_file paths like:
             - ${PROJECT_ROOT}/.env
             - ${PROJECT_ROOT}/.ilha/env.ilha
         
@@ -1345,9 +1345,9 @@ class PackageManager:
         import yaml
         
         try:
-            compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+            compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
             if not compose_file.exists():
-                log_warning(f"docker-compose.worktree.yml not found at {compose_file}")
+                log_warning(f"docker-compose.overlay.yml not found at {compose_file}")
                 return False
             
             # Read the compose file
@@ -1355,7 +1355,7 @@ class PackageManager:
                 compose_data = yaml.safe_load(f)
             
             if not compose_data or 'services' not in compose_data:
-                log_warning("Invalid docker-compose.worktree.yml structure")
+                log_warning("Invalid docker-compose.overlay.yml structure")
                 return False
             
             modified = False
@@ -1392,7 +1392,7 @@ class PackageManager:
                 # Write the updated compose file
                 with open(compose_file, 'w') as f:
                     yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False)
-                log_info("Fixed env_file paths in docker-compose.worktree.yml for standalone deployment")
+                log_info("Fixed env_file paths in docker-compose.overlay.yml for standalone deployment")
             
             return True
             

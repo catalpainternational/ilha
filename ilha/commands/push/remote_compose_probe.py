@@ -17,6 +17,10 @@ RunRemote = Callable[[str, str, str, int], Tuple[int, str, str]]
 
 _SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
+# Compose flags shared with slim_deploy_manager: every remote `docker compose`
+# call passes both the user's compose (base) and ilha's overlay.
+_COMPOSE_FLAGS = "-f docker-compose.yml -f docker-compose.overlay.yml"
+
 
 def assert_safe_compose_service_name(name: str) -> str:
     if not name or not _SERVICE_NAME_RE.match(name):
@@ -38,12 +42,12 @@ def remote_compose_service_known(
     qroot = shlex.quote(remote_app_root)
     qsvc = shlex.quote(service_name)
 
-    ps_cmd = f"cd {qroot} && docker compose --env-file .env ps -q {qsvc} 2>/dev/null | head -1"
+    ps_cmd = f"cd {qroot} && docker compose --env-file .env {_COMPOSE_FLAGS} ps -q {qsvc} 2>/dev/null | head -1"
     code, stdout, _ = run_remote(username, server, ps_cmd, timeout)
     if code == 0 and stdout.strip():
         return True
 
-    cfg_cmd = f"cd {qroot} && docker compose --env-file .env config --services 2>/dev/null"
+    cfg_cmd = f"cd {qroot} && docker compose --env-file .env {_COMPOSE_FLAGS} config --services 2>/dev/null"
     code2, stdout2, _ = run_remote(username, server, cfg_cmd, timeout)
     if code2 != 0:
         return False
@@ -66,6 +70,6 @@ def remote_compose_service_logs_tail(
     n = max(10, min(int(lines), 300))
     qroot = shlex.quote(remote_app_root)
     qsvc = shlex.quote(service_name)
-    cmd = f"cd {qroot} && docker compose --env-file .env logs --tail {n} {qsvc} 2>&1"
+    cmd = f"cd {qroot} && docker compose --env-file .env {_COMPOSE_FLAGS} logs --tail {n} {qsvc} 2>&1"
     _code, out, err = run_remote(username, server, cmd, timeout)
     return (out + err).strip()

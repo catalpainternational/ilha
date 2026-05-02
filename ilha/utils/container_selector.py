@@ -81,21 +81,21 @@ def parse_container_selection(
         if not worktree_path:
             raise ValueError(f"Could not find worktree path for '{worktree_name}'")
         
-        # Check docker-compose.worktree.yml for the service
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-        
+        # The user's docker-compose.yml is authoritative for service names
+        # in the overlay model.
+        compose_file = worktree_path / "docker-compose.yml"
+
         if not compose_file.exists():
             raise ValueError(
-                f"No docker-compose.worktree.yml found for worktree '{worktree_name}'"
+                f"No docker-compose.yml found for worktree '{worktree_name}'"
             )
-        
-        # Load compose file and check if service exists
+
         try:
             with open(compose_file) as f:
                 compose_data = yaml.safe_load(f) or {}
         except Exception as e:
             raise ValueError(
-                f"Failed to parse docker-compose.worktree.yml for worktree '{worktree_name}': {e}"
+                f"Failed to parse docker-compose.yml for worktree '{worktree_name}': {e}"
             )
         
         services = compose_data.get('services', {})
@@ -154,17 +154,17 @@ def validate_container_selections(
         if not worktree_path:
             raise ValueError(f"Could not find worktree path for '{worktree_name}'")
         
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
-        
+        compose_file = worktree_path / "docker-compose.yml"
+
         if not compose_file.exists():
-            raise ValueError(f"No docker-compose.worktree.yml found for worktree '{worktree_name}'")
-        
+            raise ValueError(f"No docker-compose.yml found for worktree '{worktree_name}'")
+
         try:
             with open(compose_file) as f:
                 compose_data = yaml.safe_load(f) or {}
         except Exception as e:
             raise ValueError(
-                f"Failed to parse docker-compose.worktree.yml for worktree '{worktree_name}': {e}"
+                f"Failed to parse docker-compose.yml for worktree '{worktree_name}': {e}"
             )
         
         services = compose_data.get('services', {})

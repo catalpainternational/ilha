@@ -25,7 +25,6 @@ from ..core.docker_manager import DockerManager
 from ..core.git_manager import GitManager
 from ..core.environment_manager import EnvironmentManager
 from ..utils.path_utils import (
-    get_compose_override_path,
     get_worktree_branch_name,
     ensure_main_repo,
 )
@@ -447,12 +446,21 @@ class WorktreeOrchestrator:
                 "error": f"Could not find worktree directory for branch '{branch_name}'"
             }
         
-        # Get the correct path to the compose override file
-        compose_override_path = get_compose_override_path(worktree_path)
-        if not compose_override_path:
+        # Resolve base + overlay compose files
+        from ..utils.path_utils import compose_files_for_invocation
+        base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
+        if base_compose is None:
             return {
                 "success": False,
-                "error": "Could not find compose override file. Please ensure ilha directory exists."
+                "error": f"docker-compose.yml not found in worktree {worktree_path}",
+            }
+        if overlay_compose is None:
+            return {
+                "success": False,
+                "error": (
+                    f"ilha overlay missing at {worktree_path}/.ilha/docker-compose.overlay.yml. "
+                    "Re-run `ilha setup` to regenerate."
+                ),
             }
         
         # Get branch name and ensure worktree volumes exist
@@ -505,28 +513,21 @@ class WorktreeOrchestrator:
                     "error": "Environment files not found after creation"
                 }
 
-        # Use the compose file found by get_compose_override_path
-        compose_file = compose_override_path
-
-        if not compose_file.exists():
-            return {
-                "success": False,
-                "error": f"Compose worktree file not found: {compose_file}"
-            }
-
         # Get the full compose project name (project-branch format)
         project_name = sanitize_project_name(self._get_project_name())
         compose_project_name = f"{project_name}-{sanitize_project_name(resolved_branch_name)}"
-        
+
         success, stderr = self.docker_manager.run_compose_command(
-            compose_file, ["up", "-d"], env_file, compose_project_name, worktree_path, profile=profile
+            overlay_compose, ["up", "-d"], env_file, compose_project_name, worktree_path,
+            profile=profile, base_compose_file=base_compose,
         )
-        # Option 2: on pool overlap, remove project networks and retry once
+        # On pool overlap, remove project networks and retry once
         if not success and stderr and ("overlaps" in stderr or "invalid pool request" in stderr):
             log_info("Pool overlap detected, removing project networks and retrying...")
             self.docker_manager.remove_project_networks(compose_project_name)
             success, _ = self.docker_manager.run_compose_command(
-                compose_file, ["up", "-d"], env_file, compose_project_name, worktree_path, profile=profile
+                overlay_compose, ["up", "-d"], env_file, compose_project_name, worktree_path,
+                profile=profile, base_compose_file=base_compose,
             )
         
         if not success:
@@ -641,41 +642,38 @@ class WorktreeOrchestrator:
                 }
             }
         
-        # Get the correct path to the compose override file
-        compose_file = get_compose_override_path(worktree_path)
-        if not compose_file:
+        # Resolve base + overlay compose files
+        from ..utils.path_utils import compose_files_for_invocation
+        base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
+
+        env_file = (worktree_path / ".ilha" / "env.ilha").resolve()
+
+        if base_compose is None and overlay_compose is None:
             return {
                 "success": True,
                 "data": {
                     "branch": branch_name,
                     "status": "no_compose",
-                    "message": "Could not find compose override file, skipping container stop"
-                }
-            }
-        
-        env_file = (worktree_path / ".ilha" / "env.ilha").resolve()
-
-        if not compose_file.exists() or not env_file.exists():
-            return {
-                "success": True,
-                "data": {
-                    "branch": branch_name,
-                    "status": "no_files",
-                    "message": "Compose or environment file not found, skipping container stop"
+                    "message": "Could not find compose files, skipping container stop"
                 }
             }
 
         # Add --rmi local flag if remove_images is True
         extra_flags = ["--rmi", "local"] if remove_images else None
-        
+
         # Get the full compose project name (project-branch format)
         project_name = sanitize_project_name(self._get_project_name())
         compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-        
+
+        # Pick whichever files we have. For `down` it's safe even if the overlay
+        # is missing — compose will still find and stop containers by project name.
+        primary = overlay_compose or base_compose
+        base_for_invocation = base_compose if (base_compose is not None and overlay_compose is not None) else None
         success, _ = self.docker_manager.run_compose_command(
-            compose_file, ["down"], env_file, compose_project_name, worktree_path, extra_flags
+            primary, ["down"], env_file, compose_project_name, worktree_path, extra_flags,
+            base_compose_file=base_for_invocation,
         )
-        # Remove any leftover project networks to avoid pool-overlap on next up (Option 1)
+        # Remove any leftover project networks to avoid pool-overlap on next up
         self.docker_manager.remove_project_networks(compose_project_name)
         
         return {

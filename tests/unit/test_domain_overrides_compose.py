@@ -73,12 +73,16 @@ class TestDomainOverridesCompose:
 
     def _create_worktree_with_compose(self, worktree_path: Path, labels_format: str = "list") -> None:
         """Helper to create a worktree with compose file containing localhost labels.
-        
+
         Args:
             worktree_path: Path to worktree directory
             labels_format: "list" or "dict" - format of labels in compose file
         """
         worktree_path.mkdir(parents=True)
+        # Plant a manage.py marker so detect_project_footprint reports has_django=True;
+        # apply_domain_overrides only rewrites Django-specific env vars
+        # (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST) for Django projects.
+        (worktree_path / "manage.py").write_text("# django marker\n")
         ilha_dir = worktree_path / ".ilha"
         ilha_dir.mkdir(parents=True)
         
@@ -98,7 +102,7 @@ DEBUG=True
 """)
         
         # Create compose file with localhost Caddy labels
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         if labels_format == "list":
             compose_data = {
                 'services': {
@@ -167,7 +171,7 @@ DEBUG=True
         assert result is True, f"apply_domain_overrides returned False. Logs: {log_output}"
         
         # Verify compose file was updated
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
         assert compose_file.exists()
         
         with open(compose_file) as f:
@@ -188,7 +192,7 @@ DEBUG=True
         domain = "test.example.com"
         
         # Create compose file with domain labels
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             "services": {
                 "web": {
@@ -221,7 +225,7 @@ DEBUG=True
         domain = "test.example.com"
         
         # Create compose file WITHOUT domain labels (still has localhost)
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             "services": {
                 "web": {
@@ -245,7 +249,7 @@ DEBUG=True
         assert verification["env_variables"] is True, "Env variables should be verified"
         
         # Verify compose file was updated
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
         assert compose_file.exists()
         
         with open(compose_file) as f:
@@ -289,7 +293,7 @@ DEBUG=True
         assert result is True
         
         # Verify compose file was updated
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
         assert compose_file.exists()
         
         with open(compose_file) as f:
@@ -342,7 +346,7 @@ DEBUG=True
         ilha_dir.mkdir(parents=True)
         
         # Create invalid compose file
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_file.write_text("invalid: yaml: [unclosed")
         
         env_file = ilha_dir / "env.ilha"
@@ -367,7 +371,7 @@ DEBUG=True
         ilha_dir.mkdir(parents=True)
         
         # Create compose file without services
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {'version': '3.8', 'volumes': {}}
         with open(compose_file, 'w') as f:
             yaml.dump(compose_data, f)
@@ -393,7 +397,7 @@ DEBUG=True
         ilha_dir.mkdir(parents=True)
         
         # Create compose file without labels
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             'services': {
                 'web': {
@@ -424,7 +428,7 @@ DEBUG=True
         self._create_worktree_with_compose(worktree_path, labels_format="list")
         
         # Don't apply domain override - should keep localhost
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
         
         with open(compose_file) as f:
             compose_data = yaml.safe_load(f)
@@ -446,7 +450,7 @@ DEBUG=True
         ilha_dir.mkdir(parents=True)
         
         # Create compose file with multiple labels
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             'services': {
                 'web': {
@@ -492,6 +496,8 @@ DEBUG=True
         """Test that domain override updates ALLOWED_HOSTS in env.ilha."""
         worktree_path = temp_project / "worktrees" / "feature-test"
         worktree_path.mkdir(parents=True)
+        # ALLOWED_HOSTS is Django-specific; mark the worktree as a Django project.
+        (worktree_path / "manage.py").write_text("# django marker\n")
         ilha_dir = worktree_path / ".ilha"
         ilha_dir.mkdir(parents=True)
         
@@ -501,7 +507,7 @@ SITE_DOMAIN=test-feature.localhost
 ALLOWED_HOSTS=localhost,127.0.0.1,test-feature.localhost,*.localhost,web
 """)
         
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             'services': {
                 'web': {

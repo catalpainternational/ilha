@@ -18,12 +18,7 @@ AUTHOR = "ilha Contributors"
 # Default project configuration (used if .ilha/config.yml doesn't exist)
 # PROJECT_NAME is now dynamically determined from get_project_name()
 CADDY_NETWORK = "ilha_caddy_proxy"
-COMPOSE_OVERRIDE_DIR = "ilha"
 ILHA_DIR = ".ilha"
-
-# File paths
-COMPOSE_OVERRIDE = f"{COMPOSE_OVERRIDE_DIR}/config/docker-compose.ilha.yml"
-COMPOSE_WORKTREE = f"{COMPOSE_OVERRIDE_DIR}/config/docker-compose.worktree.yml"
 
 # Volume names
 POSTGRES_VOLUME_SUFFIX = "postgres_data"
@@ -372,7 +367,7 @@ def get_worktree_network_subnets(branch_name: str) -> Tuple[str, str]:
     """Return unique /24 subnets for a worktree (internal, web) to avoid pool overlap.
 
     Uses deterministic hash of compose project name so each worktree gets distinct
-    subnets. Use ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB in docker-compose.worktree.yml
+    subnets. Use ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB in docker-compose.overlay.yml
     networks section (e.g. subnet: ${ILHA_SUBNET_INTERNAL}).
     """
     project_name = sanitize_project_name(get_project_name())
@@ -384,29 +379,40 @@ def get_worktree_network_subnets(branch_name: str) -> Tuple[str, str]:
     return f"10.201.{internal_octet}.0/24", f"10.201.{web_octet}.0/24"
 
 
-def generate_env_compose_content(branch_name: str) -> str:
-    """Generate env.ilha content for a worktree."""
+def generate_env_compose_content(branch_name: str, *, has_django: bool = False) -> str:
+    """Generate env.ilha content for a worktree.
+
+    Always emits ilha-owned plumbing: COMPOSE_PROJECT_NAME, PROJECT_ROOT, SITE_DOMAIN
+    (bare host, used by Caddy labels), and per-worktree subnet vars. When
+    ``has_django`` is True, also emits Django-specific siblings (ALLOWED_HOSTS,
+    CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST) derived from SITE_DOMAIN.
+    """
     project_root = get_project_root()
     project_name = sanitize_project_name(get_project_name())  # Converts underscores to hyphens
     compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-    site_domain = f"http://{compose_project_name}.localhost"  # RFC-compliant hostname with protocol
-    allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
+    site_domain = f"{compose_project_name}.localhost"  # bare host
     internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
 
-    return f"""# ilha environment configuration for {branch_name}
+    content = f"""# ilha environment configuration for {branch_name}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
 SITE_DOMAIN={site_domain}
-ALLOWED_HOSTS={allowed_hosts}
-DEBUG=True
-USE_X_FORWARDED_HOST=True
-CSRF_TRUSTED_ORIGINS={site_domain}
-USE_SECURE_COOKIES=False
 
-# Per-worktree network subnets (avoid pool overlap; use in docker-compose.worktree.yml)
+# Per-worktree network subnets (avoid pool overlap; use in docker-compose overlay)
 ILHA_SUBNET_INTERNAL={internal_subnet}
 ILHA_SUBNET_WEB={web_subnet}
 """
+
+    if has_django:
+        allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
+        csrf_trusted_origins = f"http://{site_domain},https://{site_domain}"
+        content += f"""
+# Django-specific (emitted because Django was detected in this project)
+ALLOWED_HOSTS={allowed_hosts}
+CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
+USE_X_FORWARDED_HOST=True
+"""
+    return content
 
 # Volume naming
 def get_volume_name(branch_name: str, volume_type: str) -> str:

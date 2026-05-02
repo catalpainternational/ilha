@@ -5,7 +5,7 @@ This module provides commands for managing DNS domains including
 creating, listing, and deleting DNS A records.
 """
 
-from typing import Optional, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from ..core.dns_manager import DNSManager, parse_domain
 from ..core import dns_providers  # noqa: F401 - Import to trigger registration
 from ..utils.logging import log_info, log_success, log_warning, log_error, print_plain
@@ -236,14 +236,100 @@ class DomainCommands:
             else:
                 log_error(f"Error listing DNS A records: {e}")
             return False
-    
+
+    def list_zones(
+        self,
+        dns_token: Optional[str] = None,
+        json: bool = False,
+        csv: bool = False,
+    ) -> bool:
+        """List DNS zones registered in the DigitalOcean account (GET /v2/domains).
+
+        This lists zone apex names managed by DO DNS, not individual A records.
+        """
+        try:
+            token = DNSManager.resolve_dns_token(dns_token)
+            if not token:
+                if json:
+                    JSONOutput.print_error(DNS_TOKEN_NOT_FOUND)
+                else:
+                    log_error(DNS_TOKEN_NOT_FOUND)
+                return False
+
+            provider = DNSManager.create_provider("digitalocean", token)
+            if not provider:
+                if json:
+                    JSONOutput.print_error("Failed to create DNS provider")
+                else:
+                    log_error("Failed to create DNS provider")
+                return False
+
+            if not hasattr(provider, "list_domain_zones"):
+                if json:
+                    JSONOutput.print_error("Provider does not support listing DNS zones")
+                else:
+                    log_error("Provider does not support listing DNS zones")
+                return False
+
+            zones: List[Dict[str, Any]] = provider.list_domain_zones()
+            zones.sort(key=lambda z: (z.get("name") or ""))
+
+            if csv:
+                import csv
+                import sys
+
+                writer = csv.writer(sys.stdout)
+                writer.writerow(["Domain", "TTL"])
+                for z in zones:
+                    name = z.get("name") or ""
+                    ttl = z.get("ttl")
+                    writer.writerow([name, str(ttl) if ttl is not None else ""])
+                return True
+            if json:
+                result = {
+                    "success": True,
+                    "zones": zones,
+                    "count": len(zones),
+                }
+                JSONOutput.print_json(result)
+            else:
+                if not zones:
+                    print_plain("No DNS zones found in this DigitalOcean account")
+                    return True
+
+                console = Console()
+                table = Table(
+                    title=f"DigitalOcean DNS zones ({len(zones)})",
+                    show_header=True,
+                    header_style="bold",
+                    box=None,
+                    padding=(0, 1),
+                )
+                table.add_column("Domain", style="cyan", min_width=20)
+                table.add_column("TTL", style="blue", min_width=8)
+
+                for z in zones:
+                    ttl = z.get("ttl")
+                    table.add_row(z.get("name") or "—", str(ttl) if ttl is not None else "—")
+
+                console.print(table)
+
+            return True
+
+        except Exception as e:
+            if json:
+                JSONOutput.print_error(f"Error listing DNS zones: {e}")
+            else:
+                log_error(f"Error listing DNS zones: {e}")
+            return False
+
     def _get_domain_records(self, provider, domain: str) -> List[Tuple[str, str, str, Optional[int]]]:
         """Get all A records for a domain with details.
-        
+
         Args:
             provider: DNS provider instance
             domain: Base domain name
-            
+
         Returns:
             List of tuples: (subdomain, domain, ip, ttl)
         """

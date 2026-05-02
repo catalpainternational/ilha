@@ -6,6 +6,7 @@ import pytest
 
 from ilha.utils.validation import (
     DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS,
+    check_prerequisites_no_git,
     validate_docker_compose,
     validate_docker_running,
 )
@@ -53,3 +54,13 @@ def test_validate_docker_compose_false_on_timeout(monkeypatch):
 
 def test_default_docker_health_timeout_is_positive():
     assert DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS > 0
+
+
+def test_check_prerequisites_no_git_exits_gracefully_when_docker_unresponsive(monkeypatch):
+    monkeypatch.setattr(
+        "ilha.utils.validation.check_docker_daemon_responsive",
+        lambda **_k: (False, "Simulated: daemon not ready"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        check_prerequisites_no_git()
+    assert exc.value.code == 1

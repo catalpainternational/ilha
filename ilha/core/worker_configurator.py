@@ -330,7 +330,7 @@ class WorkerConfigurator:
             return False
 
         # Load compose file to detect environment variables
-        compose_file = worktree_path / ".ilha" / "docker-compose.worktree.yml"
+        compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
         if not compose_file.exists():
             log_warning(f"Compose file not found: {compose_file}")
             return False
@@ -398,7 +398,7 @@ class WorkerConfigurator:
                         f.write(f"{key}={value}\n")
                 log_success(f"Updated worker environment configuration in {env_file}")
 
-            # Also update docker-compose.worktree.yml to override hardcoded environment values
+            # Also update docker-compose.overlay.yml to override hardcoded environment values
             # This is necessary because docker-compose environment: section overrides env_file values
             updated_compose = False
             try:
@@ -430,11 +430,11 @@ class WorkerConfigurator:
                     # Write updated compose file
                     with open(compose_file, 'w') as f:
                         yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-                    log_success(f"Updated docker-compose.worktree.yml with worker configuration")
+                    log_success(f"Updated docker-compose.overlay.yml with worker configuration")
                 return True
 
             except Exception as e:
-                log_warning(f"Failed to update docker-compose.worktree.yml: {e}")
+                log_warning(f"Failed to update docker-compose.overlay.yml: {e}")
                 # Don't fail the whole operation, env.ilha update is still useful
 
             return updated  # Return True if env.ilha was updated, even if compose update failed

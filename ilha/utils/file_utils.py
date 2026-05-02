@@ -325,7 +325,7 @@ def ensure_entrypoint_executable(compose_path: Path, project_root: Path) -> None
     entrypoints work when the host directory is mounted over /app.
     
     Args:
-        compose_path: Path to docker-compose.worktree.yml (or similar).
+        compose_path: Path to docker-compose.overlay.yml (or similar).
         project_root: Resolved directory used as PROJECT_ROOT when running compose.
     """
     if not compose_path.exists():

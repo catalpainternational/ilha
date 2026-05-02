@@ -80,7 +80,7 @@ ALLOWED_HOSTS=localhost,127.0.0.1,test-project-test-branch.localhost,*.localhost
 DEBUG=True
 """)
 
-        compose_file = ilha_env_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_env_dir / "docker-compose.overlay.yml"
         compose_data = {
             'services': {
                 'web': {
@@ -234,9 +234,12 @@ DEBUG=True
         env_manager = EnvironmentManager(project_root=temp_project)
         worktree_path = temp_project / "worktrees" / "test-branch"
         worktree_path.mkdir(parents=True)
+        # Plant Django marker; apply_domain_overrides only rewrites Django-specific
+        # env vars when the project is detected as Django.
+        (worktree_path / "manage.py").write_text("# django marker\n")
         ilha_dir = worktree_path / ".ilha"
         ilha_dir.mkdir(parents=True)
-        
+
         # Simulate restored environment files (from package) with localhost
         env_file = ilha_dir / "env.ilha"
         env_file.write_text("""COMPOSE_PROJECT_NAME=test-project-test-branch
@@ -245,7 +248,7 @@ ALLOWED_HOSTS=localhost,127.0.0.1,test-project-test-branch.localhost,*.localhost
 DEBUG=True
 """)
         
-        compose_file = ilha_dir / "docker-compose.worktree.yml"
+        compose_file = ilha_dir / "docker-compose.overlay.yml"
         compose_data = {
             'services': {
                 'web': {
@@ -291,6 +294,7 @@ DEBUG=True
         # Scenario 1: Localhost (default)
         localhost_worktree = temp_project / "worktrees" / "localhost-branch"
         localhost_worktree.mkdir(parents=True)
+        (localhost_worktree / "manage.py").write_text("# django marker\n")
         localhost_ilha = localhost_worktree / ".ilha"
         localhost_ilha.mkdir(parents=True)
         
@@ -300,7 +304,7 @@ SITE_DOMAIN=test-project-localhost-branch.localhost
 ALLOWED_HOSTS=localhost,127.0.0.1,test-project-localhost-branch.localhost,*.localhost,web
 """)
         
-        localhost_compose = localhost_ilha / "docker-compose.worktree.yml"
+        localhost_compose = localhost_ilha / "docker-compose.overlay.yml"
         localhost_compose_data = {
             'services': {
                 'web': {
@@ -314,6 +318,7 @@ ALLOWED_HOSTS=localhost,127.0.0.1,test-project-localhost-branch.localhost,*.loca
         # Scenario 2: Domain override
         domain_worktree = temp_project / "worktrees" / "domain-branch"
         domain_worktree.mkdir(parents=True)
+        (domain_worktree / "manage.py").write_text("# django marker\n")
         domain_ilha = domain_worktree / ".ilha"
         domain_ilha.mkdir(parents=True)
         
@@ -324,7 +329,7 @@ SITE_DOMAIN=test-project-domain-branch.localhost
 ALLOWED_HOSTS=localhost,127.0.0.1,test-project-domain-branch.localhost,*.localhost,web
 """)
         
-        domain_compose = domain_ilha / "docker-compose.worktree.yml"
+        domain_compose = domain_ilha / "docker-compose.overlay.yml"
         domain_compose_data = {
             'services': {
                 'web': {

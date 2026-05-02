@@ -224,6 +224,22 @@ def error_exit(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
+def fail_prerequisite(
+    summary: str,
+    hints: Optional[List[str]] = None,
+    exit_code: int = 1,
+) -> None:
+    """Print a clear prerequisite failure and optional hint lines, then exit.
+
+    Prefer this over ``error_exit`` when users need concrete next steps.
+    """
+    log_error(summary)
+    if hints and not _quiet_mode:
+        for line in hints:
+            print_plain(f"  • {line}")
+    raise SystemExit(exit_code)
+
+
 def log_step(message: str) -> None:
     """Log a step message (always shown in non-quiet mode).
 

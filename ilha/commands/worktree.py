@@ -8,16 +8,15 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
-from ..config.settings import get_project_root, get_script_dir, COMPOSE_WORKTREE
+from ..config.settings import get_project_root, get_script_dir
 from ..core.worktree_orchestrator import WorktreeOrchestrator
 from ..core.docker_manager import DockerManager as CoreDockerManager
 from ..core.git_manager import GitManager as CoreGitManager
 from ..core.environment_manager import EnvironmentManager as CoreEnvironmentManager
 from ..utils.logging import log_info, log_success, log_warning, log_error, log_step
 from ..utils.path_utils import (
-    get_compose_override_path, 
     get_worktree_branch_name,
-    ensure_main_repo
+    ensure_main_repo,
 )
 from ..utils.validation import validate_branch_exists, validate_worktree_name_not_reserved
 from ..utils.validation import validate_worktree_directory

@@ -256,7 +256,7 @@ _ilha() {
                             _arguments \
                                 '1: :_ilha_services' \
                                 '--rm[Remove container after run]' \
-                                '--no-deps[Don\'t start linked services]' \
+                                "--no-deps[Don't start linked services]" \
                                 '--entrypoint[Override the entrypoint of the image]:command:' \
                             && ret=0
                         else
