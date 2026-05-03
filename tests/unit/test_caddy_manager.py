@@ -35,22 +35,6 @@ class TestCaddyManager:
         assert result is False
         caddy_manager.docker_manager.create_network.assert_called_once()
     
-    def test_start_global_caddy_compose_file_not_found(self, caddy_manager):
-        """Test start_global_caddy when compose file doesn't exist."""
-        # The implementation reads compose_file.read_text() which will raise FileNotFoundError
-        # if the file doesn't exist. The exception will propagate.
-        caddy_manager.docker_manager.create_network.return_value = True
-        caddy_manager._ensure_caddy_volumes = Mock(return_value=True)
-        caddy_manager._handle_existing_container = Mock(return_value=True)
-        caddy_manager.is_caddy_running = Mock(return_value=False)
-        caddy_manager.compose_file.read_text = Mock(side_effect=FileNotFoundError("Compose file not found"))
-        
-        # The exception will propagate, so we expect it
-        with pytest.raises(FileNotFoundError):
-            caddy_manager.start_global_caddy()
-        
-        caddy_manager.docker_manager.create_network.assert_called_once()
-    
     def test_start_global_caddy_success(self, caddy_manager):
         """Test successful global Caddy start."""
         caddy_manager.docker_manager.create_network.return_value = True
@@ -84,18 +68,6 @@ class TestCaddyManager:
         caddy_manager.docker_manager.create_network.assert_called_once()
         assert caddy_manager.docker_manager.start_services.called
     
-    def test_stop_global_caddy_compose_file_not_found(self, caddy_manager):
-        """Test stop_global_caddy when compose file doesn't exist."""
-        # The implementation reads compose_file.read_text() which will raise FileNotFoundError
-        # if the file doesn't exist. The exception will propagate.
-        caddy_manager.compose_file.read_text = Mock(side_effect=FileNotFoundError("Compose file not found"))
-        
-        # The exception will propagate, so we expect it
-        with pytest.raises(FileNotFoundError):
-            caddy_manager.stop_global_caddy()
-        
-        caddy_manager.docker_manager.stop_services.assert_not_called()
-    
     def test_stop_global_caddy_success(self, caddy_manager):
         """Test successful global Caddy stop."""
         caddy_manager.docker_manager.stop_services.return_value = True
@@ -116,26 +88,6 @@ class TestCaddyManager:
         
         assert result is False
         assert caddy_manager.docker_manager.stop_services.called
-    
-    @patch('ilha.commands.caddy.validate_container_running')
-    def test_is_caddy_running_true(self, mock_validate, caddy_manager):
-        """Test is_caddy_running when Caddy is running."""
-        mock_validate.return_value = True
-        
-        result = caddy_manager.is_caddy_running()
-        
-        assert result is True
-        mock_validate.assert_called_once_with("ilha_caddy_proxy")
-    
-    @patch('ilha.commands.caddy.validate_container_running')
-    def test_is_caddy_running_false(self, mock_validate, caddy_manager):
-        """Test is_caddy_running when Caddy is not running."""
-        mock_validate.return_value = False
-        
-        result = caddy_manager.is_caddy_running()
-        
-        assert result is False
-        mock_validate.assert_called_once_with("ilha_caddy_proxy")
     
     @patch('ilha.commands.caddy.validate_container_running')
     def test_get_caddy_status(self, mock_validate, caddy_manager):

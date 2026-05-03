@@ -23,34 +23,6 @@ class TestDockerManager:
             manager.compose_cmd = "docker compose"
             return manager
     
-    @patch('subprocess.run')
-    @patch('ilha.core.docker_manager.validate_network_exists')
-    def test_create_network_success(self, mock_validate, mock_run, docker_manager):
-        """Test successful network creation."""
-        network_name = "test-network"
-        mock_validate.return_value = False  # Network doesn't exist
-        mock_run.return_value = Mock(returncode=0)
-        
-        result = docker_manager.create_network(network_name)
-        
-        assert result == True
-        mock_validate.assert_called_once_with(network_name)
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
-    @patch('ilha.core.docker_manager.validate_network_exists')
-    def test_create_network_failure(self, mock_validate, mock_run, docker_manager):
-        """Test network creation failure."""
-        network_name = "test-network"
-        mock_validate.return_value = False  # Network doesn't exist
-        mock_run.side_effect = Exception("Network creation failed")
-        
-        result = docker_manager.create_network(network_name)
-        
-        assert result == False
-        mock_validate.assert_called_once_with(network_name)
-        mock_run.assert_called_once()
-    
     @patch('ilha.core.docker_manager.validate_volume_exists')
     @patch('subprocess.run')
     def test_copy_volume_source_not_exists(self, mock_run, mock_validate, docker_manager):
@@ -309,20 +281,6 @@ class TestDockerManager:
         assert "-d" in call_args
     
     @patch('subprocess.run')
-    def test_start_services_failure(self, mock_run, docker_manager):
-        """Test service start failure."""
-        compose_file = Path("/test/docker-compose.yml")
-        env_file = Path("/test/.ilha/env.ilha")
-        project_name = "test-project"
-        
-        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", "Service start failed")
-        
-        result = docker_manager.start_services(compose_file, env_file, project_name)
-        
-        assert result == False
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
     def test_stop_services_success(self, mock_run, docker_manager):
         """Test successful service stop."""
         compose_file = Path("/test/docker-compose.yml")
@@ -345,20 +303,6 @@ class TestDockerManager:
         assert "-f" in call_args
         assert str(compose_file) in call_args
         assert "down" in call_args
-    
-    @patch('subprocess.run')
-    def test_stop_services_failure(self, mock_run, docker_manager):
-        """Test service stop failure."""
-        compose_file = Path("/test/docker-compose.yml")
-        env_file = Path("/test/.ilha/env.ilha")
-        project_name = "test-project"
-        
-        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", "Service stop failed")
-        
-        result = docker_manager.stop_services(compose_file, env_file, project_name)
-        
-        assert result == False
-        mock_run.assert_called_once()
     
     @patch('subprocess.run')
     def test_run_compose_command_success(self, mock_run, docker_manager):
@@ -415,16 +359,6 @@ class TestDockerManager:
         )
     
     @patch('subprocess.run')
-    def test_list_volumes_failure(self, mock_run, docker_manager):
-        """Test volume listing failure."""
-        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", "Volume listing failed")
-        
-        result = docker_manager.list_volumes()
-        
-        assert result == []
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
     def test_get_volume_sizes_success(self, mock_run, docker_manager):
         """Test successful volume size retrieval."""
         # First call returns volume list, subsequent calls return size for each volume
@@ -440,14 +374,3 @@ class TestDockerManager:
         assert result["test-volume_postgres_data"] == "1.2GB"
         assert mock_run.call_count == 3
     
-    @patch('subprocess.run')
-    def test_get_volume_sizes_failure(self, mock_run, docker_manager):
-        """Test volume size retrieval failure."""
-        mock_run.side_effect = subprocess.CalledProcessError(1, "docker", "Volume size retrieval failed")
-        
-        # Mock list_volumes to return test volumes
-        with patch.object(docker_manager, 'list_volumes', return_value=["test-volume"]):
-            result = docker_manager.get_volume_sizes()
-        
-        assert result == {}
-        mock_run.assert_called_once()

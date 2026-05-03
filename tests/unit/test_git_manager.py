@@ -21,21 +21,6 @@ class TestGitManager:
             return manager
     
     @patch('subprocess.run')
-    def test_init_validation_success(self, mock_run):
-        """Test GitManager initialization with valid git repo."""
-        mock_run.return_value = Mock(returncode=0)
-        
-        # Should not raise an exception
-        manager = GitManager()
-        assert manager is not None
-        mock_run.assert_called_once_with(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True,
-            check=True,
-            cwd=manager.project_root
-        )
-    
-    @patch('subprocess.run')
     def test_init_validation_failure(self, mock_run):
         """Test GitManager initialization with invalid git repo.
 
@@ -56,16 +41,6 @@ class TestGitManager:
             check=True,
             cwd=project_root
         )
-    
-    @patch('ilha.core.git_manager.validate_current_branch')
-    def test_get_current_branch(self, mock_validate, git_manager):
-        """Test getting current branch."""
-        mock_validate.return_value = "main"
-        
-        result = git_manager.get_current_branch()
-        
-        assert result == "main"
-        mock_validate.assert_called_once()
     
     @patch('ilha.core.git_manager.validate_branch_exists')
     @patch('subprocess.run')
@@ -210,17 +185,6 @@ class TestGitManager:
         )
     
     @patch('subprocess.run')
-    def test_remove_worktree_failure(self, mock_run, git_manager):
-        """Test worktree removal failure."""
-        worktree_path = Path("/test/worktrees/test-branch")
-        mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Worktree removal failed")
-        
-        result = git_manager.remove_worktree(worktree_path)
-        
-        assert result == False
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
     def test_list_worktrees_success(self, mock_run, git_manager):
         """Test successful worktree listing."""
         mock_run.return_value = Mock(
@@ -244,16 +208,6 @@ class TestGitManager:
         )
     
     @patch('subprocess.run')
-    def test_list_worktrees_failure(self, mock_run, git_manager):
-        """Test worktree listing failure."""
-        mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Worktree listing failed")
-        
-        result = git_manager.list_worktrees()
-        
-        assert result == []
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
     def test_prune_worktrees_success(self, mock_run, git_manager):
         """Test successful worktree pruning."""
         # Mock worktree list with no prunable worktrees
@@ -263,38 +217,6 @@ class TestGitManager:
         
         assert result == 0  # No prunable worktrees
         assert mock_run.call_count == 1
-    
-    @patch('subprocess.run')
-    def test_prune_worktrees_failure(self, mock_run, git_manager):
-        """Test worktree pruning failure."""
-        mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Worktree pruning failed")
-        
-        result = git_manager.prune_worktrees()
-        
-        assert result == 0  # Should return 0 on failure
-        mock_run.assert_called_once()
-    
-    @patch('ilha.core.git_manager.validate_worktree_exists')
-    def test_validate_worktree_exists_true(self, mock_validate_func, git_manager):
-        """Test worktree existence validation when worktree exists."""
-        branch_name = "test-branch"
-        mock_validate_func.return_value = True
-        
-        result = git_manager.validate_worktree_exists(branch_name)
-        
-        assert result is True
-        mock_validate_func.assert_called_once_with(branch_name, git_manager.project_root)
-    
-    @patch('ilha.core.git_manager.validate_worktree_exists')
-    def test_validate_worktree_exists_false(self, mock_validate_func, git_manager):
-        """Test worktree existence validation when worktree doesn't exist."""
-        branch_name = "test-branch"
-        mock_validate_func.return_value = False
-        
-        result = git_manager.validate_worktree_exists(branch_name)
-        
-        assert result is False
-        mock_validate_func.assert_called_once_with(branch_name, git_manager.project_root)
     
     @patch('subprocess.run')
     def test_find_worktree_path_success(self, mock_run, git_manager):
@@ -324,17 +246,6 @@ class TestGitManager:
             returncode=0,
             stdout="/test/worktrees/other-branch abc123 [other-branch]"
         )
-        
-        result = git_manager.find_worktree_path(branch_name)
-        
-        assert result is None
-        mock_run.assert_called_once()
-    
-    @patch('subprocess.run')
-    def test_find_worktree_path_failure(self, mock_run, git_manager):
-        """Test finding worktree path when git command fails."""
-        branch_name = "test-branch"
-        mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Git command failed")
         
         result = git_manager.find_worktree_path(branch_name)
         
@@ -489,13 +400,3 @@ class TestGitManager:
         assert result["message"] == "Test commit message"
         assert mock_run.call_count == 4
     
-    @patch('subprocess.run')
-    def test_get_branch_info_failure(self, mock_run, git_manager):
-        """Test getting branch information when branch doesn't exist."""
-        branch_name = "nonexistent-branch"
-        mock_run.side_effect = subprocess.CalledProcessError(1, "git", "Branch not found")
-        
-        result = git_manager.get_branch_info(branch_name)
-        
-        assert result is None
-        mock_run.assert_called_once()

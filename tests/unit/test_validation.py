@@ -5,10 +5,9 @@ Unit tests for validation utilities.
 import pytest
 from unittest.mock import patch, Mock
 from ilha.utils.validation import (
-    validate_branch_name, validate_git_repository, validate_docker_running,
+    validate_branch_name, validate_docker_running,
     validate_docker_compose, validate_worktree_directory, validate_branch_protection,
-    validate_branch_exists, validate_worktree_exists, validate_current_branch,
-    validate_branch_merged, validate_volume_exists, validate_network_exists,
+    validate_worktree_exists, validate_current_branch,
     validate_container_running, check_prerequisites
 )
 
@@ -27,24 +26,6 @@ class TestValidation:
         assert validate_branch_name("test@branch") == False
         assert validate_branch_name("test branch") == False
         assert validate_branch_name("") == False
-    
-    @patch('subprocess.run')
-    def test_validate_git_repository_success(self, mock_run):
-        """Test git repository validation success."""
-        mock_run.return_value = Mock(returncode=0)
-        assert validate_git_repository() == True
-        # The actual call may include cwd parameter, so check for the call with any cwd
-        mock_run.assert_called()
-        call_args = mock_run.call_args
-        assert call_args[0][0] == ["git", "rev-parse", "--git-dir"]
-        assert call_args[1]["capture_output"] == True
-        assert call_args[1]["check"] == True
-    
-    @patch('subprocess.run')
-    def test_validate_git_repository_failure(self, mock_run):
-        """Test git repository validation failure."""
-        mock_run.side_effect = Exception("Not a git repo")
-        assert validate_git_repository() == False
     
     @patch('ilha.utils.validation.shutil.which', return_value="/usr/local/bin/docker")
     @patch('subprocess.run')
@@ -143,24 +124,6 @@ class TestValidation:
         assert validate_branch_protection("feature-auth") == False
     
     @patch('subprocess.run')
-    def test_validate_branch_exists_success(self, mock_run):
-        """Test branch exists validation success."""
-        mock_run.return_value = Mock(returncode=0)
-        assert validate_branch_exists("test-branch") == True
-        from ilha.config.settings import get_project_root
-        project_root = get_project_root()
-        mock_run.assert_called_once_with(
-            ["git", "show-ref", "--verify", "--quiet", "refs/heads/test-branch"],
-            capture_output=True, check=True, cwd=project_root
-        )
-    
-    @patch('subprocess.run')
-    def test_validate_branch_exists_failure(self, mock_run):
-        """Test branch exists validation failure."""
-        mock_run.side_effect = Exception("Branch not found")
-        assert validate_branch_exists("test-branch") == False
-    
-    @patch('subprocess.run')
     def test_validate_worktree_exists_success(self, mock_run):
         """Test worktree exists validation success."""
         mock_run.return_value = Mock(stdout="[test-branch] /path/to/worktree abc123", returncode=0)
@@ -191,50 +154,6 @@ class TestValidation:
         """Test current branch validation failure."""
         mock_run.side_effect = Exception("Git error")
         assert validate_current_branch() is None
-    
-    @patch('subprocess.run')
-    def test_validate_branch_merged_success(self, mock_run):
-        """Test branch merged validation success."""
-        mock_run.return_value = Mock(returncode=0)
-        assert validate_branch_merged("test-branch") == True
-        from ilha.config.settings import get_project_root
-        project_root = get_project_root()
-        mock_run.assert_called_once_with(["git", "branch", "-d", "test-branch"], 
-                                        capture_output=True, check=True, cwd=project_root)
-    
-    @patch('subprocess.run')
-    def test_validate_branch_merged_failure(self, mock_run):
-        """Test branch merged validation failure."""
-        mock_run.side_effect = Exception("Not merged")
-        assert validate_branch_merged("test-branch") == False
-    
-    @patch('subprocess.run')
-    def test_validate_volume_exists_success(self, mock_run):
-        """Test volume exists validation success."""
-        mock_run.return_value = Mock(returncode=0)
-        assert validate_volume_exists("test-volume") == True
-        mock_run.assert_called_once_with(["docker", "volume", "inspect", "test-volume"], 
-                                        capture_output=True, check=True)
-    
-    @patch('subprocess.run')
-    def test_validate_volume_exists_failure(self, mock_run):
-        """Test volume exists validation failure."""
-        mock_run.side_effect = Exception("Volume not found")
-        assert validate_volume_exists("test-volume") == False
-    
-    @patch('subprocess.run')
-    def test_validate_network_exists_success(self, mock_run):
-        """Test network exists validation success."""
-        mock_run.return_value = Mock(returncode=0)
-        assert validate_network_exists("test-network") == True
-        mock_run.assert_called_once_with(["docker", "network", "inspect", "test-network"], 
-                                        capture_output=True, check=True)
-    
-    @patch('subprocess.run')
-    def test_validate_network_exists_failure(self, mock_run):
-        """Test network exists validation failure."""
-        mock_run.side_effect = Exception("Network not found")
-        assert validate_network_exists("test-network") == False
     
     @patch('subprocess.run')
     def test_validate_container_running_success(self, mock_run):

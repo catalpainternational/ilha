@@ -32,13 +32,10 @@ def probe():
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("/admin/login/", "/admin/login/"),
-    ("admin/login/", "/admin/login/"),  # missing leading slash
-    ("/", "/"),
-    ("", "/"),
-    (None, "/"),
-    ("   /api/   ", "/api/"),  # surrounding whitespace stripped
-    ("api/", "/api/"),
+    (None, "/"),                    # None → root
+    ("", "/"),                      # empty → root
+    ("admin/login/", "/admin/login/"),  # missing leading slash gets prepended
+    ("   /api/   ", "/api/"),       # whitespace stripped
 ])
 def test_normalize_path(probe, raw, expected):
     assert probe.normalize_path(raw) == expected

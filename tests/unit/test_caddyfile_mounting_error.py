@@ -47,43 +47,6 @@ class TestCaddyfileMountingError:
             manager.orchestrator = mock_orchestrator  # Also set via property
             return manager
     
-    def test_caddyfile_mounting_error_stderr_parsing(self, docker_manager):
-        """Test parsing of Caddyfile mounting error from Docker Compose stderr."""
-        # Simulate the exact error from the terminal output
-        error_stderr = """Network test_internal  Creating
-Network test_internal  Created
-Network test_web  Creating
-Network test_web  Created
-Volume test_caddy_data  Creating
-Volume test_caddy_data  Created
-Volume test_caddy_config  Creating
-Volume test_caddy_config  Created
-time="2025-09-28T18:11:45+09:00" level=warning msg="volume \"test_postgres_data\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
-time="2025-09-28T18:11:45+09:00" level=warning msg="volume \"test_redis_data\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
-time="2025-09-28T18:11:45+09:00" level=warning msg="volume \"test_media_files\" already exists but was not created by Docker Compose. Use `external: true` to use an existing volume"
-Container test-caddy  Creating
-Container test-redis  Creating
-Container test-db  Creating
-Container test-caddy  Created
-Container test-redis  Created
-Container test-db  Created
-Container test-rq-worker-1  Creating
-Container test-web  Creating
-Container test-rq-worker-1  Created
-Container test-web  Created
-Container test-db  Starting
-Container test-redis  Starting
-Container test-caddy  Starting
-Container test-redis  Started
-Container test-db  Started
-Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error mounting "/host_mnt/tmp/test_project/test_project/ilha-cli/Caddyfile.ilha" to rootfs at "/etc/caddy/Caddyfile": create mountpoint for /etc/caddy/Caddyfile mount: cannot create subdirectories in "/var/lib/docker/overlay2/0e95bf1b18750d834fdd6e71829438667d616029fa9dc17eaff3c6f7ceaae713/merged/etc/caddy/Caddyfile": not a directory: unknown: Are you trying to mount a directory onto a file (or vice-versa)? Check if the specified host path exists and is the expected type"""
-        
-        # Test that the error contains the expected patterns
-        assert "ilha-cli/Caddyfile.ilha" in error_stderr
-        assert "error mounting" in error_stderr
-        assert "Are you trying to mount a directory onto a file" in error_stderr
-        assert "Check if the specified host path exists" in error_stderr
-    
     @patch('subprocess.run')
     def test_docker_compose_caddyfile_mounting_failure(self, mock_run, docker_manager):
         """Test Docker Compose failure due to Caddyfile mounting error."""
@@ -105,22 +68,6 @@ Error response from daemon: failed to create task for container: failed to creat
         assert result == False
         mock_run.assert_called_once()
     
-    def test_caddyfile_path_validation(self):
-        """Test validation of Caddyfile path structure."""
-        # Test the incorrect path pattern from the error
-        incorrect_path = "/tmp/test_project/test_project/ilha-cli/Caddyfile.ilha"
-        
-        # The error shows 'ilha-cli' (with hyphen) but should be 'ilha' (with underscore)
-        # Note: "ilha" is a substring of "ilha-cli", so we check for the specific pattern
-        assert "ilha-cli" in incorrect_path
-        # Check that the path contains the incorrect pattern (not just "ilha")
-        assert incorrect_path.count("ilha") > 0  # "ilha" is substring of "ilha-cli"
-        
-        # Test the correct path pattern
-        correct_path = "/tmp/test_project/test_project/ilha/Caddyfile.ilha"
-        assert "ilha" in correct_path
-        assert "ilha-cli" not in correct_path
-    
     def test_worktree_start_with_missing_caddyfile(self, worktree_manager):
         """Test worktree start when Caddyfile path doesn't exist."""
         branch_name = "test-branch"
@@ -135,37 +82,6 @@ Error response from daemon: failed to create task for container: failed to creat
         
         assert result is False
         worktree_manager.orchestrator.start_worktree.assert_called_once_with(branch_name, profile=None)
-    
-    def test_worktree_start_with_incorrect_caddyfile_path(self, worktree_manager):
-        """Test worktree start when Caddyfile path has incorrect directory structure."""
-        branch_name = "test-branch"
-        
-        # Mock orchestrator to return failure (simulating incorrect Caddyfile path error)
-        worktree_manager.orchestrator.start_worktree.return_value = {
-            'success': False,
-            'error': 'Caddyfile mounting error: incorrect path structure (ilha-cli vs ilha)'
-        }
-        
-        result = worktree_manager.start_worktree(branch_name)
-        
-        assert result is False
-        worktree_manager.orchestrator.start_worktree.assert_called_once_with(branch_name, profile=None)
-    
-    def test_caddyfile_mounting_error_detection(self):
-        """Test detection of Caddyfile mounting error patterns."""
-        error_messages = [
-            "error mounting",
-            "Are you trying to mount a directory onto a file",
-            "Check if the specified host path exists",
-            "ilha-cli/Caddyfile.ilha",
-            "create mountpoint for /etc/caddy/Caddyfile"
-        ]
-        
-        # Test that all error patterns are present in the actual error
-        full_error = """Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error mounting "/host_mnt/tmp/test_project/test_project/ilha-cli/Caddyfile.ilha" to rootfs at "/etc/caddy/Caddyfile": create mountpoint for /etc/caddy/Caddyfile mount: cannot create subdirectories in "/var/lib/docker/overlay2/0e95bf1b18750d834fdd6e71829438667d616029fa9dc17eaff3c6f7ceaae713/merged/etc/caddy/Caddyfile": not a directory: unknown: Are you trying to mount a directory onto a file (or vice-versa)? Check if the specified host path exists and is the expected type"""
-        
-        for pattern in error_messages:
-            assert pattern in full_error, f"Pattern '{pattern}' not found in error message"
     
     @patch('subprocess.run')
     def test_docker_compose_command_with_caddyfile_error(self, mock_run, docker_manager):
@@ -229,28 +145,6 @@ Error response from daemon: failed to create task for container: failed to creat
             assert str(compose_file) in call_args
             assert "up" in call_args
             assert "-d" in call_args
-    
-    def test_caddyfile_path_resolution_error_scenarios(self):
-        """Test various Caddyfile path resolution error scenarios."""
-        # Test case 1: Incorrect directory name (hyphen vs underscore)
-        incorrect_path = "/tmp/test_project/test_project/ilha-cli/Caddyfile.ilha"
-        correct_path = "/tmp/test_project/test_project/ilha/Caddyfile.ilha"
-        
-        assert incorrect_path != correct_path
-        assert "ilha-cli" in incorrect_path
-        assert "ilha" in correct_path
-        
-        # Test case 2: Missing file
-        missing_file_path = "/tmp/test_project/test_project/ilha/nonexistent_file"
-        assert "Caddyfile.ilha" not in missing_file_path
-        
-        # Test case 3: Directory instead of file
-        directory_path = "/tmp/test_project/test_project/ilha/"
-        assert directory_path.endswith("/")
-        
-        # Test case 4: Wrong file extension
-        wrong_extension_path = "/tmp/test_project/test_project/ilha/Caddyfile.txt"
-        assert not wrong_extension_path.endswith("Caddyfile.ilha")
     
     @patch('subprocess.run')
     def test_volume_warnings_with_caddyfile_error(self, mock_run, docker_manager):

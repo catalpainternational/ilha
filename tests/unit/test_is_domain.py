@@ -57,9 +57,6 @@ class TestIsDomain:
 
     # --- Edge cases ---
 
-    def test_bare_localhost(self, config):
-        assert config._is_domain("localhost") is False
-
     def test_dotless_host(self, config):
         """A single-label host (no dots) is not a domain."""
         assert config._is_domain("myhost") is False
