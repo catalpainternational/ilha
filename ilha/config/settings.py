@@ -206,6 +206,62 @@ def get_worktree_dir() -> str:
     config = get_project_config()
     return config.get("worktree_dir", "worktrees")
 
+
+def resolve_project_name(project_root: Path) -> str:
+    """Resolve a project's identity from its `.ilha/config.yml`, then directory name.
+
+    Single source of truth for "what is this project's name?" — used by setup,
+    env generation, and worktree orchestration so all sites agree.
+
+    Returns an unsanitized string; callers that need Docker-safe names should
+    pipe through ``sanitize_project_name``.
+    """
+    config_path = Path(project_root) / ILHA_DIR / "config.yml"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                config = yaml.safe_load(f) or {}
+            name = config.get("project_name")
+            if name:
+                return str(name)
+        except Exception:
+            pass
+    return Path(project_root).name
+
+
+def resolve_default_branch(project_root: Path) -> str:
+    """Resolve the default branch for a project root.
+
+    Order: ``origin/HEAD`` symbolic ref → current local branch → ``"master"``.
+    Used to pick a sensible default for env.ilha generation at the project root,
+    where there is no checked-out worktree to read a branch from.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        ref = result.stdout.strip()
+        if ref.startswith("refs/remotes/origin/"):
+            return ref[len("refs/remotes/origin/"):]
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "branch", "--show-current"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+        branch = result.stdout.strip()
+        if branch:
+            return branch
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return "master"
+
 # Docker Compose command detection
 def get_compose_command() -> str:
     """Get the appropriate docker compose command."""

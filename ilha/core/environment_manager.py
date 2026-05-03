@@ -244,37 +244,21 @@ class EnvironmentManager:
             domain: Optional domain override (subdomain.domain.tld)
         """
         from ..config.settings import (
-            ILHA_DIR,
             sanitize_project_name,
+            resolve_project_name,
             get_allowed_hosts_for_worktree,
             build_allowed_hosts_with_container,
             DEFAULT_ENV_VARS,
         )
-        import yaml
-        
+
         env_file = worktree_path / ".env"
-        
+
         # Don't overwrite existing .env file
         if env_file.exists():
             return True
-        
-        # Get project name from config in self.project_root (not current directory)
-        project_name = None
-        config_path = self.project_root / ILHA_DIR / "config.yml"
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config = yaml.safe_load(f) or {}
-                    project_name = config.get("project_name")
-            except Exception:
-                pass
-        
-        # Fallback to project root directory name if config doesn't have project_name
-        if not project_name:
-            project_name = self.project_root.name
-        
+
         # Create default environment content with project prefix
-        project_name = sanitize_project_name(project_name)
+        project_name = sanitize_project_name(resolve_project_name(self.project_root))
         compose_project_name = f"{project_name}-{branch_name}"
         
         # Use domain override if provided, otherwise use localhost
@@ -342,26 +326,10 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
         ``has_django`` is True. If ``has_django`` is None, detect against
         ``self.project_root``.
         """
-        from ..config.settings import ILHA_DIR, sanitize_project_name, get_allowed_hosts_for_worktree
+        from ..config.settings import sanitize_project_name, resolve_project_name, get_allowed_hosts_for_worktree
         from ..utils.project_footprint import detect_project_footprint
-        import yaml
 
-        # Get project name from config in self.project_root
-        project_name = None
-        config_path = self.project_root / ILHA_DIR / "config.yml"
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config = yaml.safe_load(f) or {}
-                    project_name = config.get("project_name")
-            except Exception:
-                pass
-
-        # Fallback to project root directory name if config doesn't have project_name
-        if not project_name:
-            project_name = self.project_root.name
-
-        project_name = sanitize_project_name(project_name)
+        project_name = sanitize_project_name(resolve_project_name(self.project_root))
         compose_project_name = f"{project_name}-{branch_name}"
         site_domain = f"{compose_project_name}.localhost"  # bare host
 

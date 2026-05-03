@@ -97,7 +97,7 @@ class SetupManager:
         
         return config
     
-    def _generate_env_ilha_content(self, branch_name: str = "master") -> str:
+    def _generate_env_ilha_content(self, branch_name: Optional[str] = None) -> str:
         """Generate env.ilha content for project root.
 
         Reuses generate_env_compose_content() from settings.py for consistency.
@@ -105,8 +105,10 @@ class SetupManager:
         siblings (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST)
         are emitted iff the project actually uses Django.
         """
-        from ..config.settings import generate_env_compose_content
+        from ..config.settings import generate_env_compose_content, resolve_default_branch
         from ..utils.project_footprint import detect_project_footprint
+        if branch_name is None:
+            branch_name = resolve_default_branch(self.project_root)
         has_django = detect_project_footprint(self.project_root).has_django
         return generate_env_compose_content(branch_name, has_django=has_django)
 
@@ -124,7 +126,16 @@ class SetupManager:
         log_step("Setting up ilha for this project")
         if domain:
             log_info(f"Using domain override: {domain}")
-        
+
+        # Fractal dispatch: when invoked inside an existing worktree, configure
+        # against the parent project rather than treating cwd as a new project
+        # root. Preserves the fractal contract (worktree inherits parent
+        # identity; env.ilha reflects the actual git branch).
+        from ..utils.path_utils import detect_execution_context
+        _, _, is_worktree = detect_execution_context()
+        if is_worktree:
+            return self._setup_worktree(force=force, non_interactive=non_interactive)
+
         # 0. Check if .ilha already exists and prompt for overwrite
         force_overwrite = force
         if self.ilha_dir.exists():
@@ -210,6 +221,112 @@ class SetupManager:
         log_success("ilha setup completed successfully!")
         log_info(f"Configuration: {self.ilha_dir}/config.yml")
         log_info("Next: ilha start")
+        return True
+
+    def _setup_worktree(self, *, force: bool, non_interactive: bool) -> bool:
+        """Configure the current worktree as a fractal child of its parent.
+
+        Inherits identity (config.yml, compose overlay, Caddyfile, README) from
+        the parent's ``.ilha/`` via the same primitives ``ilha up`` uses, then
+        regenerates ``env.ilha`` for the worktree's actual git branch. This
+        keeps every fractal-write path in agreement with the parent and avoids
+        the silent ``cwd().name`` and hardcoded-``master`` defaults that bite
+        when ``ilha setup`` is re-run inside a worktree.
+        """
+        import shutil
+        from ..utils.path_utils import get_parent_project_root, get_worktree_branch_name
+        from ..core.worktree_orchestrator import WorktreeOrchestrator
+        from ..core.environment_manager import EnvironmentManager
+
+        worktree_path = self.project_root  # cwd, since SetupManager defaults to it
+
+        parent_root = get_parent_project_root()
+        if not parent_root:
+            log_error(
+                f"No parent ilha project found above {worktree_path}. "
+                f"Run `ilha setup` at the parent project root first."
+            )
+            return False
+
+        parent_config = parent_root / ILHA_DIR / "config.yml"
+        if not parent_config.exists():
+            log_error(
+                f"Parent at {parent_root} has no .ilha/config.yml. "
+                f"Run `ilha setup` there first, then re-run from this worktree."
+            )
+            return False
+
+        branch_name = get_worktree_branch_name(worktree_path)
+        if not branch_name:
+            log_error(f"Could not determine git branch for worktree at {worktree_path}")
+            return False
+
+        log_info(f"Configuring worktree '{branch_name}' as fractal child of {parent_root}")
+
+        target_ilha = worktree_path / ILHA_DIR
+        existing_env_ilha = target_ilha / "env.ilha"
+
+        # Snapshot the worktree's own env.ilha (if any) before any rmtree, so
+        # branch-specific user overrides (DROPLET_DOMAIN, PUSH_*, branch-local
+        # secrets) survive a --force re-copy from parent.
+        from ..utils.env_loader import load_env_file
+        worktree_env_snapshot: Dict[str, str] = (
+            load_env_file(existing_env_ilha) if existing_env_ilha.exists() else {}
+        )
+
+        if target_ilha.exists():
+            if force:
+                log_info("--force: removing existing worktree .ilha before re-copying from parent")
+                shutil.rmtree(target_ilha)
+            elif non_interactive:
+                log_info(f"{target_ilha} exists; keeping it (refreshing env.ilha only)")
+            else:
+                if prompt_yes_no(
+                    f"Overwrite {target_ilha} with a fresh copy from {parent_root}?",
+                    default=False,
+                ):
+                    shutil.rmtree(target_ilha)
+                else:
+                    log_info("Keeping existing .ilha; refreshing env.ilha only")
+
+        orchestrator = WorktreeOrchestrator(project_root=parent_root)
+        if not target_ilha.exists():
+            if not orchestrator._copy_ilha_to_worktree(worktree_path):
+                log_error("Failed to copy parent .ilha into worktree")
+                return False
+            log_success(f"Copied parent .ilha to {target_ilha}")
+
+        # Refresh env.ilha for the actual branch.
+        # Merge order (later wins):
+        #   1. parent's env.ilha    — shared baseline (API keys, global secrets)
+        #   2. worktree's snapshot  — branch-specific user overrides
+        #   3. ilha-managed keys    — COMPOSE_PROJECT_NAME, SITE_DOMAIN, ALLOWED_HOSTS, ...
+        env_manager = EnvironmentManager(project_root=parent_root)
+        new_content = env_manager._generate_env_compose_content(branch_name)
+
+        merged_env: Dict[str, str] = {}
+        if existing_env_ilha.exists():
+            # After _copy_ilha_to_worktree, this file is the parent's env.ilha.
+            merged_env.update(load_env_file(existing_env_ilha))
+        merged_env.update(worktree_env_snapshot)
+        ilha_managed = self._parse_env_content_to_dict(new_content)
+        merged_env.update(ilha_managed)
+
+        header_comment = next(
+            (line.strip() for line in new_content.split("\n") if line.strip().startswith("#")),
+            None,
+        )
+        try:
+            self._write_env_dict_to_file(merged_env, existing_env_ilha, header_comment=header_comment)
+            log_success(f"Refreshed {existing_env_ilha} ({len(merged_env)} vars)")
+        except Exception as e:
+            log_error(f"Failed to write worktree env.ilha: {e}")
+            return False
+
+        log_success("Worktree setup complete")
+        log_info(f"Branch: {branch_name}")
+        log_info(f"Parent: {parent_root}")
+        log_info(f"Configuration: {target_ilha}/config.yml")
         return True
 
     def _django_post_setup_checks(self, monkey_patch: bool, non_interactive: bool) -> None:
@@ -574,7 +691,8 @@ if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
             
             # Auto-detect project name if not provided
             if not project_name:
-                project_name = self.project_root.name
+                from ..config.settings import resolve_project_name
+                project_name = resolve_project_name(self.project_root)
             
             # Generate config dict (single source of truth)
             config = self._generate_config_dict(
@@ -785,8 +903,10 @@ if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
                 log_info("env.ilha already exists, skipping creation")
                 return True
             
-            # Generate ilha-specific env content (reuses settings.py logic)
-            env_content = self._generate_env_ilha_content("master")
+            # Generate ilha-specific env content (reuses settings.py logic).
+            # branch_name=None lets _generate_env_ilha_content resolve the
+            # actual default branch from git instead of hardcoding "master".
+            env_content = self._generate_env_ilha_content()
             
             # Extract header comment from ilha-specific content (first comment line)
             header_comment = None

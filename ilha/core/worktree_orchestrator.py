@@ -65,41 +65,23 @@ class WorktreeOrchestrator:
         self.env_manager = EnvironmentManager(project_root=self.project_root)
     
     def _get_project_name(self) -> str:
-        """Get project name from config using instance project_root.
-        
-        Ensures we use the correct project_root context from the orchestrator instance.
-        """
-        # If we have a project_root with config, use it directly
-        from ..config.settings import ILHA_DIR
-        config_path = self.project_root / ILHA_DIR / "config.yml"
-        if config_path.exists():
-            try:
-                import yaml
-                with open(config_path) as f:
-                    config = yaml.safe_load(f) or {}
-                    project_name = config.get("project_name")
-                    if project_name:
-                        return project_name
-            except Exception:
-                pass
-        
-        # Fallback to project root directory name (sanitized)
-        from ..config.settings import sanitize_project_name
-        return sanitize_project_name(self.project_root.name)
-    
+        """Get project name from config using instance project_root."""
+        from ..config.settings import resolve_project_name
+        return resolve_project_name(self.project_root)
+
     def _find_true_project_root(self) -> Optional[Path]:
-        """Find the true project root, respecting fractal worktree configs."""
+        """Find the true project root, respecting fractal worktree configs.
+
+        Delegates to ``get_project_root`` which already implements the
+        local-first-then-upward search; differs only in that this method
+        resolves against ``self.project_root`` rather than ``cwd``.
+        """
         current = self.project_root
-        
-        # If current project_root has config.yml, it's the root (fractal or main)
         if (current / ".ilha" / "config.yml").exists():
             return current
-        
-        # Search upward for parent config
         for parent in current.parents:
             if (parent / ".ilha" / "config.yml").exists():
                 return parent
-        
         return self.project_root
 
     def _handle_worktree_creation_error(self, branch_name: str, error_type: str) -> Dict[str, Any]:
