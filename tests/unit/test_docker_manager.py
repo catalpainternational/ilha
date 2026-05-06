@@ -373,4 +373,68 @@ class TestDockerManager:
         assert "test-volume_postgres_data" in result
         assert result["test-volume_postgres_data"] == "1.2GB"
         assert mock_run.call_count == 3
-    
+
+
+class TestRunComposePassthrough:
+    """run_compose_passthrough must propagate the inner exit code verbatim
+    and only raise ilhaCommandError for genuine ilha/docker-compose failures
+    (missing worktree, missing files, docker compose binary missing)."""
+
+    @pytest.fixture
+    def docker_manager(self):
+        with patch('ilha.core.docker_manager.validate_docker_running'), \
+             patch('ilha.core.docker_manager.get_compose_command'):
+            manager = DockerManager()
+            manager.compose_cmd = "docker compose"
+            return manager
+
+    @pytest.fixture
+    def stub_passthrough_resolution(self, tmp_path):
+        """Stub all preflight resolution so tests can focus on subprocess behavior."""
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        base_compose = worktree_path / "docker-compose.yml"
+        base_compose.write_text("services: {}\n")
+        overlay = worktree_path / ".ilha" / "docker-compose.overlay.yml"
+        overlay.parent.mkdir()
+        overlay.write_text("services: {}\n")
+        env_file = worktree_path / ".env"
+        env_file.write_text("FOO=bar\n")
+
+        with patch('ilha.core.git_manager.GitManager') as MockGM, \
+             patch('ilha.utils.path_utils.compose_files_for_invocation') as mock_files, \
+             patch('ilha.utils.path_utils.get_env_compose_file_path') as mock_env, \
+             patch.object(DockerManager, '_build_compose_base_command', return_value=["docker", "compose"]), \
+             patch.object(DockerManager, '_resolve_working_directory', return_value=worktree_path), \
+             patch.object(DockerManager, '_prepare_compose_environment', return_value={}):
+            gm = MockGM.return_value
+            gm.validate_worktree_exists.return_value = True
+            gm.find_worktree_path.return_value = worktree_path
+            mock_files.return_value = (base_compose, overlay)
+            mock_env.return_value = env_file
+            yield {"gm": gm, "worktree_path": worktree_path}
+
+    @patch('subprocess.run')
+    def test_returns_zero_on_success(self, mock_run, docker_manager, stub_passthrough_resolution):
+        mock_run.return_value = Mock(returncode=0)
+        assert docker_manager.run_compose_passthrough("ainaro", ["exec", "web", "true"]) == 0
+
+    @patch('subprocess.run')
+    def test_returns_inner_exit_code_verbatim(self, mock_run, docker_manager, stub_passthrough_resolution):
+        """A non-zero inner exit must NOT raise — it is the user's command's exit code."""
+        mock_run.return_value = Mock(returncode=2)
+        assert docker_manager.run_compose_passthrough("ainaro", ["exec", "web", "false"]) == 2
+
+    def test_raises_when_worktree_missing(self, docker_manager):
+        from ilha.exceptions import ilhaCommandError
+        with patch('ilha.core.git_manager.GitManager') as MockGM:
+            MockGM.return_value.validate_worktree_exists.return_value = False
+            with pytest.raises(ilhaCommandError, match="Worktree for branch 'nope' does not exist"):
+                docker_manager.run_compose_passthrough("nope", ["ps"])
+
+    @patch('subprocess.run', side_effect=FileNotFoundError("docker not found"))
+    def test_raises_when_docker_binary_missing(self, mock_run, docker_manager, stub_passthrough_resolution):
+        from ilha.exceptions import ilhaCommandError
+        with pytest.raises(ilhaCommandError, match="docker compose invocation failed"):
+            docker_manager.run_compose_passthrough("ainaro", ["ps"])
+

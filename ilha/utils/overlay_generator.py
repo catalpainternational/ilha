@@ -22,6 +22,7 @@ from .caddy_config import (
     _has_caddy_labels,
     _is_static_web_service,
 )
+from .compose_yaml import compose_reset
 from .deploy_hosts import normalize_deploy_host
 
 
@@ -87,6 +88,16 @@ def _resolve_proxy_domain(domain: Optional[str], ip: Optional[str]) -> str:
     return "${SITE_DOMAIN:-${COMPOSE_PROJECT_NAME}.localhost}"
 
 
+def _is_external_volume(volume_config: Any) -> bool:
+    """Return whether a top-level compose volume is managed outside ilha."""
+    if not isinstance(volume_config, dict):
+        return False
+    external = volume_config.get("external")
+    if isinstance(external, dict):
+        return bool(external.get("name") or external.get("external"))
+    return bool(external)
+
+
 def generate_overlay(
     user_compose: Dict[str, Any],
     *,
@@ -126,10 +137,10 @@ def generate_overlay(
         if _is_routable(service_name, sc):
             any_routable = True
             port = _detect_service_port(sc, service_name=service_name)
-            # ports: [] replaces base's host port mappings (compose-spec: lists
-            # without identity replace). expose makes the container port
-            # reachable on the ilha network for Caddy.
-            ovr["ports"] = []
+            # Compose appends list values during multi-file merges. Use its
+            # explicit reset tag so base host-port mappings do not leak into
+            # worktree environments.
+            ovr["ports"] = compose_reset()
             ovr["expose"] = [str(port)]
             ovr["labels"] = {
                 "caddy.proxy": proxy_domain,
@@ -143,6 +154,16 @@ def generate_overlay(
         services_out[service_name] = ovr
 
     overlay: Dict[str, Any] = {"services": services_out}
+
+    volumes_in = user_compose.get("volumes") or {}
+    if isinstance(volumes_in, dict):
+        volumes_out = {
+            volume_name: {"name": f"${{COMPOSE_PROJECT_NAME}}_{volume_name}"}
+            for volume_name, volume_config in volumes_in.items()
+            if not _is_external_volume(volume_config)
+        }
+        if volumes_out:
+            overlay["volumes"] = volumes_out
 
     if any_routable:
         # Top-level networks declaration only required when at least one

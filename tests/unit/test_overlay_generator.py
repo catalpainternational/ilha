@@ -1,5 +1,7 @@
 """Tests for the compose overlay generator."""
 
+import yaml
+
 from ilha.utils.overlay_generator import (
     detect_conflicting_services,
     generate_overlay,
@@ -41,6 +43,35 @@ def test_django_postgres_canonical():
 
     # Top-level external network only emitted when at least one routable service
     assert overlay["networks"]["ilha_caddy_proxy"] == {"external": True}
+    assert overlay["volumes"]["postgres_data"]["name"] == "${COMPOSE_PROJECT_NAME}_postgres_data"
+
+
+def test_routable_ports_dump_as_compose_reset_tag():
+    """Routable services reset inherited host ports in Docker Compose merges."""
+    user = {"services": {"web": {"image": "django-app", "ports": ["8000:8000"]}}}
+
+    dumped = yaml.dump(_gen(user), default_flow_style=False, sort_keys=False)
+
+    assert "ports: !reset []" in dumped
+    assert yaml.safe_load(dumped)["services"]["web"]["ports"] == []
+
+
+def test_named_volumes_are_scoped_to_worktree_project():
+    """Top-level named volumes are renamed to the worktree compose project."""
+    user = {
+        "services": {"web": {"image": "django-app"}},
+        "volumes": {
+            "postgres_data": {"name": "business_intelligence_postgres_data"},
+            "redis_data": None,
+            "shared_cache": {"external": True},
+        },
+    }
+
+    overlay = _gen(user)
+
+    assert overlay["volumes"]["postgres_data"]["name"] == "${COMPOSE_PROJECT_NAME}_postgres_data"
+    assert overlay["volumes"]["redis_data"]["name"] == "${COMPOSE_PROJECT_NAME}_redis_data"
+    assert "shared_cache" not in overlay["volumes"]
 
 
 def test_static_only_caddy_project():

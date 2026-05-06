@@ -24,7 +24,7 @@ from ..config.settings import (
     sanitize_project_name,
     POSTGRES_VOLUME_SUFFIX,
 )
-from ..exceptions import PrerequisiteError
+from ..exceptions import PrerequisiteError, ilhaCommandError
 from ..utils.logging import log_info, log_success, log_warning, log_error, show_progress
 from ..utils.file_utils import ensure_entrypoint_executable
 from ..utils.validation import (
@@ -1325,15 +1325,26 @@ class DockerManager:
         
         return volumes
     
-    def run_compose_passthrough(self, branch_name: str, compose_args: List[str]) -> bool:
+    def run_compose_passthrough(self, branch_name: str, compose_args: List[str]) -> int:
         """Run docker compose command with automatic base+overlay resolution.
+
+        Acts as a transparent passthrough: the inner command's exit code is
+        returned verbatim, including non-zero values that mean the user's
+        program (e.g. ``manage.py ...``) ran and exited with that code.
 
         Args:
             branch_name: Name of the worktree/branch
             compose_args: Docker compose arguments to pass through
 
         Returns:
-            True if command succeeded, False otherwise
+            The inner process exit code (0 on success, non-zero if the inner
+            command failed).
+
+        Raises:
+            ilhaCommandError: If the worktree, compose files, or env file are
+                missing, or if docker compose itself cannot be invoked. These
+                are real ilha/docker failures distinct from a non-zero inner
+                exit code.
         """
         from ..core.git_manager import GitManager
         from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
@@ -1342,32 +1353,27 @@ class DockerManager:
         # Validate worktree exists
         git_manager = GitManager()
         if not git_manager.validate_worktree_exists(branch_name):
-            log_error(f"Worktree for branch '{branch_name}' does not exist")
-            return False
+            raise ilhaCommandError(f"Worktree for branch '{branch_name}' does not exist")
 
         # Get worktree path
         worktree_path = git_manager.find_worktree_path(branch_name)
         if not worktree_path:
-            log_error(f"Could not find worktree directory for branch '{branch_name}'")
-            return False
+            raise ilhaCommandError(f"Could not find worktree directory for branch '{branch_name}'")
 
         # Get base + overlay compose files
         base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
         if base_compose is None:
-            log_error(f"docker-compose.yml not found in worktree: {worktree_path}")
-            return False
+            raise ilhaCommandError(f"docker-compose.yml not found in worktree: {worktree_path}")
         if overlay_compose is None:
-            log_error(
+            raise ilhaCommandError(
                 f"ilha overlay not found at {worktree_path}/.ilha/docker-compose.overlay.yml. "
                 f"Re-run `ilha setup` to regenerate."
             )
-            return False
 
         # Get environment file
         env_file = get_env_compose_file_path(worktree_path)
         if not env_file.exists():
-            log_error(f"Environment file not found: {env_file}")
-            return False
+            raise ilhaCommandError(f"Environment file not found: {env_file}")
         
         # Find project root from worktree path (search upward for .ilha/config.yml)
         # This ensures we get the correct project name even when command is run from wrong directory
@@ -1431,10 +1437,9 @@ class DockerManager:
         try:
             # Run command and stream output to user
             result = subprocess.run(cmd, cwd=working_dir, env=env)
-            return result.returncode == 0
-        except Exception as e:
-            log_error(f"Failed to run docker compose command: {e}")
-            return False
+        except OSError as e:
+            raise ilhaCommandError(f"docker compose invocation failed: {e}")
+        return result.returncode
 
     async def start_worktree_containers(self, branch_name: str, worktree_path: Path,
                                        project_root: Path) -> Dict[str, Any]:
