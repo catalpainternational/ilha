@@ -6,7 +6,8 @@ combined with the user's own ``docker-compose.yml`` via
 ``docker compose -f docker-compose.yml -f .ilha/docker-compose.overlay.yml``,
 adds the small set of deltas ilha owns: per-worktree container names, the
 ilha Caddy proxy network, Caddy labels for routable services, host-port
-isolation, and env-file wiring.
+isolation (including db/redis dev publishes), per-worktree volume names,
+and env-file wiring.
 
 Read-only on the user's compose. The user's file is never mutated and is
 not even copied — compose deep-merges base + overlay at runtime.
@@ -98,6 +99,27 @@ def _is_external_volume(volume_config: Any) -> bool:
     return bool(external)
 
 
+def _has_published_ports(service_config: Dict[str, Any]) -> bool:
+    """Return whether the base compose publishes this service to the host."""
+    ports = service_config.get("ports")
+    return isinstance(ports, list) and len(ports) > 0
+
+
+def _scoped_volume_config(volume_name: str, volume_config: Any) -> Dict[str, Any]:
+    """Build a per-worktree volume override.
+
+    Base compose files often pin global volume names (and project labels) for
+    local dev. Reset inherited labels so worktrees do not attach to another
+    project's volumes.
+    """
+    cfg: Dict[str, Any] = {"name": f"${{COMPOSE_PROJECT_NAME}}_{volume_name}"}
+    if isinstance(volume_config, dict) and (
+        volume_config.get("name") is not None or volume_config.get("labels")
+    ):
+        cfg["labels"] = compose_reset()
+    return cfg
+
+
 def generate_overlay(
     user_compose: Dict[str, Any],
     *,
@@ -150,6 +172,10 @@ def generate_overlay(
             }
             # Mapping form so compose deep-merges with whatever the user has.
             ovr["networks"] = {"default": None, "ilha_caddy_proxy": None}
+        elif _has_published_ports(sc):
+            # e.g. postgres published on 5432:5432 for local dev — worktrees
+            # must not bind the same host port as sibling environments.
+            ovr["ports"] = compose_reset()
 
         services_out[service_name] = ovr
 
@@ -158,7 +184,7 @@ def generate_overlay(
     volumes_in = user_compose.get("volumes") or {}
     if isinstance(volumes_in, dict):
         volumes_out = {
-            volume_name: {"name": f"${{COMPOSE_PROJECT_NAME}}_{volume_name}"}
+            volume_name: _scoped_volume_config(volume_name, volume_config)
             for volume_name, volume_config in volumes_in.items()
             if not _is_external_volume(volume_config)
         }

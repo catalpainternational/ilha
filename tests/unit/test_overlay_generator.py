@@ -17,7 +17,7 @@ def test_django_postgres_canonical():
     user = {
         "services": {
             "web": {"image": "django-app", "ports": ["8000:8000"]},
-            "db": {"image": "postgres:16"},
+            "db": {"image": "postgres:16", "ports": ["5432:5432"]},
         },
         "volumes": {"postgres_data": None},
     }
@@ -35,9 +35,9 @@ def test_django_postgres_canonical():
         "${PROJECT_ROOT}/.ilha/env.ilha",
     ]
 
-    # db: container_name + env_file only; no ports/labels/networks override
+    # db: host ports from base compose are reset so worktrees stay isolated
     assert services["db"]["container_name"] == "${COMPOSE_PROJECT_NAME}-db"
-    assert "ports" not in services["db"]
+    assert services["db"]["ports"] == []
     assert "labels" not in services["db"]
     assert "networks" not in services["db"]
 
@@ -54,6 +54,41 @@ def test_routable_ports_dump_as_compose_reset_tag():
 
     assert "ports: !reset []" in dumped
     assert yaml.safe_load(dumped)["services"]["web"]["ports"] == []
+
+
+def test_non_routable_ports_dump_as_compose_reset_tag():
+    """Non-routable services with base host ports also get !reset in the overlay."""
+    user = {
+        "services": {
+            "db": {"image": "postgres:16", "ports": ["5432:5432"]},
+        }
+    }
+
+    dumped = yaml.dump(_gen(user), default_flow_style=False, sort_keys=False)
+
+    assert "ports: !reset []" in dumped
+    assert yaml.safe_load(dumped)["services"]["db"]["ports"] == []
+
+
+def test_global_volume_names_are_scoped_and_labels_reset():
+    """Explicit global volume names/labels in base compose must not leak across worktrees."""
+    user = {
+        "services": {"web": {"image": "django-app"}},
+        "volumes": {
+            "postgres_data": {
+                "name": "business_intelligence_postgres_data",
+                "labels": {"com.docker.compose.project": "business_intelligence"},
+            },
+            "redis_data": None,
+        },
+    }
+
+    overlay = _gen(user)
+
+    assert overlay["volumes"]["postgres_data"]["name"] == "${COMPOSE_PROJECT_NAME}_postgres_data"
+    assert overlay["volumes"]["postgres_data"]["labels"] == []
+    assert overlay["volumes"]["redis_data"]["name"] == "${COMPOSE_PROJECT_NAME}_redis_data"
+    assert "labels" not in overlay["volumes"]["redis_data"]
 
 
 def test_named_volumes_are_scoped_to_worktree_project():
