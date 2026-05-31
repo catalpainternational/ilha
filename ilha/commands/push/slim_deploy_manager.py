@@ -960,6 +960,7 @@ echo OK
         restore_volumes: bool = False,
         no_build: bool = False,
         force_password_reset: bool = False,
+        secrets_profile: Optional[str] = None,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
@@ -1100,6 +1101,7 @@ echo OK
                     debug=debug,
                     use_staging_certificates=use_staging_certificates,
                     deployignore=deployignore,
+                    secrets_profile=secrets_profile,
                 )
 
                 try:
@@ -1413,6 +1415,7 @@ echo OK
         db_only: bool = False,
         force_password_reset: bool = False,
         smoke_timeout: int = 60,
+        secrets_profile: Optional[str] = None,
     ) -> bool:
         """Update an existing slim-deployed server.
 
@@ -1522,6 +1525,7 @@ echo OK
                 ip=ip,
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1590,6 +1594,7 @@ echo OK
                 ip=ip,
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1684,6 +1689,7 @@ echo OK
         debug: bool = False,
         use_staging_certificates: bool = False,
         deployignore: Optional[str] = None,
+        secrets_profile: Optional[str] = None,
     ) -> Optional[Path]:
         """Build a flat deploy directory ready to rsync.
 
@@ -1770,6 +1776,7 @@ echo OK
                 deploy_dir, worktree_path, branch_name,
                 domain=domain, ip=ip, debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
 
             # ── caddy/ ──────────────────────────────────────────────
@@ -2070,6 +2077,7 @@ echo OK
         ip: Optional[str] = None,
         debug: bool = False,
         use_staging_certificates: bool = False,
+        secrets_profile: Optional[str] = None,
     ) -> None:
         """Build a single .env file by merging project .env + worktree env.ilha,
         then applying domain/IP overrides.
@@ -2099,6 +2107,13 @@ echo OK
         env_ilha = get_env_compose_file_path(worktree_path)
         if env_ilha.exists():
             merged.update(load_env_file(env_ilha))
+
+        # Layer 2.25: optional SOPS profile (overrides plaintext secret values)
+        if secrets_profile:
+            from ...commands.secrets import SecretsManager
+
+            merged.update(SecretsManager(self.project_root).decrypt_profile(secrets_profile))
+            log_info(f"Merged SOPS secret profile: {secrets_profile}")
 
         # Layer 2.5: compose ``db`` service environment defaults.
         # If a project declares ``POSTGRES_USER: ${POSTGRES_USER:-pivot}`` in
@@ -2205,25 +2220,22 @@ echo OK
                 )
 
         # ── Write top-level .env (used by ``docker compose --env-file`` and sourced by scripts) ──
-        # Quote values so shell `source .env` does not treat space-separated parts as commands
-        def _env_line(key: str, value: str) -> str:
-            safe = str(value).replace("\\", "\\\\").replace('"', '\\"')
-            return f'{key}="{safe}"'
+        from ...utils.env_loader import format_env_text
 
+        env_content = format_env_text(merged, quote_values=True)
         env_path = deploy_dir / ".env"
-        lines = [_env_line(k, v) for k, v in merged.items()]
-        env_path.write_text("\n".join(lines) + "\n")
+        env_path.write_text(env_content)
         log_info(f"Merged .env written ({len(merged)} vars)")
 
         # ── Also write .env inside code/ (referenced by compose env_file) ──
         code_env = deploy_dir / "code" / ".env"
-        code_env.write_text("\n".join(lines) + "\n")
+        code_env.write_text(env_content)
 
         # ── Update the env.ilha inside code/.ilha/ (loaded *second* by compose,
         #    so it must not revert production overrides to localhost defaults) ──
         code_env_ilha = deploy_dir / "code" / ".ilha" / "env.ilha"
         if code_env_ilha.exists():
-            code_env_ilha.write_text("\n".join(lines) + "\n")
+            code_env_ilha.write_text(env_content)
             log_info("Updated code/.ilha/env.ilha with production overrides")
 
     # ──────────────────────────────────────────────────────────────────

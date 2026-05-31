@@ -498,7 +498,8 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
     def create_droplet(self, name: str, region: str, size: str, image: str,
                       ssh_keys: Optional[List[str]] = None,
                       tags: Optional[List[str]] = None,
-                      vpc_uuid: Optional[str] = None) -> Optional[DropletInfo]:
+                      vpc_uuid: Optional[str] = None,
+                      user_data: Optional[str] = None) -> Optional[DropletInfo]:
         """Create a new droplet.
         
         Args:
@@ -509,6 +510,7 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             ssh_keys: List of SSH key names (e.g., ['anders', 'peter']) - will be resolved to IDs
             tags: List of tags for the droplet
             vpc_uuid: Optional VPC UUID. If not provided, will use default VPC for the region.
+            user_data: Optional cloud-init user data script
             
         Returns:
             DropletInfo if successful, None otherwise
@@ -550,6 +552,9 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         
         if tags:
             payload['tags'] = tags
+
+        if user_data:
+            payload['user_data'] = user_data
         
         log_info("Sending droplet creation request to DigitalOcean API...")
         response = self._make_request('POST', '/droplets', json=payload)

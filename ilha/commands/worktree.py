@@ -109,18 +109,30 @@ class WorktreeManager:
             log_error(result['error'])
             return False, result
     
-    def start_worktree(self, branch_name: str, profile: Optional[str] = None) -> bool:
+    def start_worktree(
+        self,
+        branch_name: str,
+        profile: Optional[str] = None,
+        secrets_profile: Optional[str] = None,
+    ) -> bool:
         """Start worktree environment - CLI interface.
         
         Args:
             branch_name: Name of the branch/worktree to start
             profile: Optional Docker Compose profile to use
+            secrets_profile: Optional SOPS secret profile name
         """
         self._ensure_orchestrator()
         extra = f" (profile: {profile})" if profile else ""
+        if secrets_profile:
+            extra += f" (secrets: {secrets_profile})"
         log_step(f"Starting worktree {branch_name}{extra}")
 
-        result = self.orchestrator.start_worktree(branch_name, profile=profile)
+        result = self.orchestrator.start_worktree(
+            branch_name,
+            profile=profile,
+            secrets_profile=secrets_profile,
+        )
         
         if result['success']:
             data = result['data']

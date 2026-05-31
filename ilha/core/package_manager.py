@@ -157,6 +157,8 @@ class PackageManager:
                     "success": False,
                     "error": f"Could not find worktree directory for branch '{branch_name}'"
                 }
+
+            self._warn_plaintext_secrets_in_package(worktree_path)
             
             # 2. Create output directory
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -727,6 +729,29 @@ class PackageManager:
                     })
         
         return sorted(packages, key=lambda x: x["name"])
+
+    def _warn_plaintext_secrets_in_package(self, worktree_path: Path) -> None:
+        """Warn when exporting plaintext env files while SOPS profiles exist."""
+        from ilha.commands.secrets import SecretsManager
+        from ilha.utils.path_utils import get_env_compose_file_path
+
+        secrets_mgr = SecretsManager(self.project_root)
+        if not secrets_mgr.has_configured_profiles():
+            return
+
+        paths = [
+            worktree_path / ".env",
+            get_env_compose_file_path(worktree_path),
+            self.project_root / ".env",
+            self.project_root / ".ilha" / "env.ilha",
+        ]
+        sensitive = secrets_mgr.warn_plaintext_env_in_paths(paths)
+        if sensitive:
+            log_warning(
+                "Package export includes plaintext env files with sensitive keys "
+                f"({', '.join(sensitive)}). Prefer SOPS profiles in .ilha/config.yml "
+                "and avoid committing plaintext secrets."
+            )
     
     def _create_project_archive(self, branch_name: str, worktree_path: Path, output_path: Path) -> bool:
         """Create tar archive of project including .ilha directories.

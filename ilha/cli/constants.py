@@ -19,6 +19,9 @@ RESERVED_COMMANDS = {
     "server-import",
     "help",
     "completion",
+    "image",
+    "secrets",
+    "worker",
     "packages",
     "droplet",
     "domains",
@@ -52,5 +55,4 @@ ALIAS_FLAGS = {
     "-D": "delete",
     "-r": "remove",
 }
-
 

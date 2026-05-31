@@ -35,6 +35,16 @@ def add_verbose_option(func: Callable[..., Any]) -> Callable[..., Any]:
     )(func)
 
 
+def add_secrets_option(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator to add ``--secrets <profile>`` for SOPS-backed env layers."""
+    return click.option(
+        "--secrets",
+        "secrets_profile",
+        default=None,
+        help="SOPS secret profile name from .ilha/config.yml (decrypted at runtime)",
+    )(func)
+
+
 def add_json_option(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator to add a JSON output flag to a command."""
     return click.option(

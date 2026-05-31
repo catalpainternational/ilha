@@ -55,9 +55,10 @@ def test_worktree_first_up_invokes_branch(monkeypatch, runner):
         def __init__(self):
             self.env_manager = SimpleNamespace(get_access_url=lambda branch: f"http://{branch}.test")
 
-        def start_worktree(self, branch_name, profile=None):
+        def start_worktree(self, branch_name, profile=None, secrets_profile=None):
             self.started_branch = branch_name
             self.started_profile = profile
+            self.started_secrets_profile = secrets_profile
             return True
 
     manager = FakeWorktreeManager()
@@ -116,9 +117,10 @@ def test_bare_up_resolves_from_worktree_context(monkeypatch, runner):
         def __init__(self):
             self.env_manager = SimpleNamespace(get_access_url=lambda branch: f"http://{branch}.test")
 
-        def start_worktree(self, branch_name, profile=None):
+        def start_worktree(self, branch_name, profile=None, secrets_profile=None):
             self.started_branch = branch_name
             self.started_profile = profile
+            self.started_secrets_profile = secrets_profile
             return True
 
     manager = FakeWorktreeManager()
@@ -142,9 +144,10 @@ def test_bare_up_resolves_from_current_git_branch(monkeypatch, runner):
         def __init__(self):
             self.env_manager = SimpleNamespace(get_access_url=lambda branch: f"http://{branch}.test")
 
-        def start_worktree(self, branch_name, profile=None):
+        def start_worktree(self, branch_name, profile=None, secrets_profile=None):
             self.started_branch = branch_name
             self.started_profile = profile
+            self.started_secrets_profile = secrets_profile
             return True
 
     class FakeGitManager:
@@ -206,9 +209,10 @@ def test_bare_up_includes_d_flag(monkeypatch, runner):
         def __init__(self):
             self.env_manager = SimpleNamespace(get_access_url=lambda branch: f"http://{branch}.test")
 
-        def start_worktree(self, branch_name, profile=None):
+        def start_worktree(self, branch_name, profile=None, secrets_profile=None):
             self.started_branch = branch_name
             self.started_profile = profile
+            self.started_secrets_profile = secrets_profile
             return True
 
     manager = FakeWorktreeManager()

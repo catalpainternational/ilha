@@ -406,12 +406,18 @@ class WorktreeOrchestrator:
                 "error": f"Exception during worktree creation: {str(e)}"
             }
     
-    def start_worktree(self, branch_name: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    def start_worktree(
+        self,
+        branch_name: str,
+        profile: Optional[str] = None,
+        secrets_profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Start worktree environment with complete orchestration.
         
         Args:
             branch_name: Name of the branch/worktree to start
             profile: Optional Docker Compose profile to use
+            secrets_profile: Optional SOPS secret profile name
         """
         # Validate worktree exists
         if not self.git_manager.validate_worktree_exists(branch_name):
@@ -499,18 +505,40 @@ class WorktreeOrchestrator:
         project_name = sanitize_project_name(self._get_project_name())
         compose_project_name = f"{project_name}-{sanitize_project_name(resolved_branch_name)}"
 
-        success, stderr = self.docker_manager.run_compose_command(
-            overlay_compose, ["up", "-d"], env_file, compose_project_name, worktree_path,
-            profile=profile, base_compose_file=base_compose,
-        )
-        # On pool overlap, remove project networks and retry once
-        if not success and stderr and ("overlaps" in stderr or "invalid pool request" in stderr):
-            log_info("Pool overlap detected, removing project networks and retrying...")
-            self.docker_manager.remove_project_networks(compose_project_name)
-            success, _ = self.docker_manager.run_compose_command(
-                overlay_compose, ["up", "-d"], env_file, compose_project_name, worktree_path,
-                profile=profile, base_compose_file=base_compose,
+        def _start_with_secrets(secrets_env_file=None):
+            return self.docker_manager.run_compose_command(
+                overlay_compose,
+                ["up", "-d"],
+                env_file,
+                compose_project_name,
+                worktree_path,
+                profile=profile,
+                base_compose_file=base_compose,
+                secrets_env_file=secrets_env_file,
             )
+
+        if secrets_profile:
+            from ..commands.secrets import SecretsManager
+
+            secrets_mgr = SecretsManager()
+            with secrets_mgr.materialize_temp_env(
+                secrets_mgr.decrypt_profile(secrets_profile)
+            ) as secrets_env_file:
+                success, stderr = _start_with_secrets(secrets_env_file)
+                if not success and stderr and (
+                    "overlaps" in stderr or "invalid pool request" in stderr
+                ):
+                    log_info("Pool overlap detected, removing project networks and retrying...")
+                    self.docker_manager.remove_project_networks(compose_project_name)
+                    success, _ = _start_with_secrets(secrets_env_file)
+        else:
+            success, stderr = _start_with_secrets()
+            if not success and stderr and (
+                "overlaps" in stderr or "invalid pool request" in stderr
+            ):
+                log_info("Pool overlap detected, removing project networks and retrying...")
+                self.docker_manager.remove_project_networks(compose_project_name)
+                success, _ = _start_with_secrets()
         
         if not success:
             return {
