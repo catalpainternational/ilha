@@ -1,114 +1,142 @@
 """
 Environment file loader utility for ilha.
 
-This module provides utilities for loading environment variables from .env files.
+Parses plaintext dotenv files and provides merge/format helpers used by
+deploy, worker bundles, and SOPS-backed secret profiles.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, List, Mapping, Optional, Union
+
 from .logging import log_warning
 
+EnvLayer = Union[Path, Mapping[str, str], None]
 
-def load_env_file(env_path: Path) -> Dict[str, str]:
-    """Load and parse .env file.
-    
-    Parses a .env file with the following rules:
-    - Lines starting with # are comments (ignored)
-    - Empty lines are ignored
-    - Lines with format KEY=VALUE are parsed
-    - Whitespace around keys and values is stripped
-    - Lines without = are ignored
-    
-    Args:
-        env_path: Path to .env file
-        
-    Returns:
-        Dictionary of key-value pairs from .env file, or empty dict if file
-        doesn't exist or parsing fails
-    """
-    env_vars = {}
-    
-    if not env_path.exists():
-        return env_vars
-    
-    try:
-        with open(env_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                # Strip whitespace
-                line = line.strip()
-                
-                # Skip empty lines
-                if not line:
-                    continue
-                
-                # Skip comment lines
-                if line.startswith('#'):
-                    continue
-                
-                # Parse KEY=VALUE format
-                if '=' in line:
-                    # Split on first = to handle values that might contain =
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    
-                    # Remove surrounding quotes from value if present
-                    # Handle both single and double quotes
-                    if len(value) >= 2:
-                        if (value.startswith('"') and value.endswith('"')) or \
-                           (value.startswith("'") and value.endswith("'")):
-                            value = value[1:-1]
-                    
-                    # Skip if key is empty
-                    if key:
-                        env_vars[key] = value
-                # Lines without = are silently ignored (not an error)
-    
-    except (IOError, OSError) as e:
-        log_warning(f"Failed to read .env file at {env_path}: {e}")
-        return {}
-    except Exception as e:
-        log_warning(f"Error parsing .env file at {env_path}: {e}")
-        return {}
-    
+SENSITIVE_ENV_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_PRIVATE_KEY")
+DEFAULT_SENSITIVE_EXACT_KEYS = frozenset(
+    {
+        "DIGITALOCEAN_API_TOKEN",
+        "DOCR_READ_TOKEN",
+        "DJANGO_SECRET_KEY",
+        "EMAIL_HOST_PASSWORD",
+        "SECRET_KEY",
+    }
+)
+
+
+def is_sensitive_env_key(key: str, *, extra_exclude: Optional[Iterable[str]] = None) -> bool:
+    """Return True if an env key looks like a secret."""
+    upper = key.upper()
+    if upper in DEFAULT_SENSITIVE_EXACT_KEYS:
+        return True
+    if extra_exclude:
+        excluded = {item.upper() for item in extra_exclude}
+        if upper in excluded:
+            return True
+    return any(upper.endswith(suffix) for suffix in SENSITIVE_ENV_SUFFIXES)
+
+
+def sensitive_env_keys(env: Mapping[str, str], *, extra_exclude: Optional[Iterable[str]] = None) -> List[str]:
+    """Return env keys that look sensitive."""
+    return sorted(key for key in env if is_sensitive_env_key(key, extra_exclude=extra_exclude))
+
+
+def parse_env_text(text: str) -> Dict[str, str]:
+    """Parse dotenv text into a key/value dict."""
+    return parse_env_lines(text.splitlines())
+
+
+def parse_env_lines(lines: Iterable[str]) -> Dict[str, str]:
+    """Parse dotenv lines into a key/value dict."""
+    env_vars: Dict[str, str] = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2:
+            if (value.startswith('"') and value.endswith('"')) or (
+                value.startswith("'") and value.endswith("'")
+            ):
+                value = value[1:-1]
+        if key:
+            env_vars[key] = value
     return env_vars
 
 
-def load_env_from_project_root() -> Dict[str, str]:
-    """Load .env file from project root directory.
-    
-    Convenience function that finds the project root and loads the .env file
-    from there.
-    
+def format_env_text(
+    env: Mapping[str, str],
+    *,
+    quote_values: bool = False,
+) -> str:
+    """Serialize env vars to dotenv text."""
+    lines: List[str] = []
+    for key in sorted(env.keys()):
+        value = str(env[key])
+        if quote_values:
+            safe = value.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{key}="{safe}"')
+        else:
+            lines.append(f"{key}={value}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def merge_env_layers(*layers: EnvLayer) -> Dict[str, str]:
+    """Merge env layers left-to-right; later layers override earlier ones."""
+    merged: Dict[str, str] = {}
+    for layer in layers:
+        if layer is None:
+            continue
+        if isinstance(layer, Path):
+            merged.update(load_env_file(layer))
+        else:
+            merged.update(dict(layer))
+    return merged
+
+
+def load_env_file(env_path: Path) -> Dict[str, str]:
+    """Load and parse a plaintext .env file.
+
+    Args:
+        env_path: Path to .env file
+
     Returns:
-        Dictionary of key-value pairs from project root .env file, or empty
-        dict if file doesn't exist or project root can't be determined
+        Dictionary of key-value pairs, or empty dict if missing/unreadable.
     """
+    if not env_path.exists():
+        return {}
+
+    try:
+        return parse_env_text(env_path.read_text(encoding="utf-8"))
+    except (OSError, IOError) as exc:
+        log_warning(f"Failed to read .env file at {env_path}: {exc}")
+        return {}
+    except Exception as exc:
+        log_warning(f"Error parsing .env file at {env_path}: {exc}")
+        return {}
+
+
+def load_env_from_project_root() -> Dict[str, str]:
+    """Load .env from project root."""
     try:
         from ..config.settings import get_project_root
+
         project_root = get_project_root()
-        env_path = project_root / ".env"
-        return load_env_file(env_path)
-    except Exception as e:
-        log_warning(f"Failed to load .env file from project root: {e}")
+        return load_env_file(project_root / ".env")
+    except Exception as exc:
+        log_warning(f"Failed to load .env file from project root: {exc}")
         return {}
 
 
 def load_env_from_home() -> Dict[str, str]:
-    """Load .env file from user's home directory.
-    
-    Checks ~/.ilha/env.ilha for global ilha configuration.
-    This allows users to set global settings that apply across all projects.
-    
-    Returns:
-        Dictionary of key-value pairs from global env file, or empty
-        dict if file doesn't exist
-    """
+    """Load ~/.ilha/env.ilha for global ilha configuration."""
     try:
-        home_dir = Path.home()
-        env_path = home_dir / ".ilha" / "env.ilha"
+        env_path = Path.home() / ".ilha" / "env.ilha"
         return load_env_file(env_path)
-    except Exception as e:
-        log_warning(f"Failed to load .env file from home directory: {e}")
+    except Exception as exc:
+        log_warning(f"Failed to load .env file from home directory: {exc}")
         return {}
-
