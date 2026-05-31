@@ -1,0 +1,505 @@
+"""Ephemeral worker droplet CLI commands."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional
+
+import click
+
+from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option, command_wrapper
+from ilha.commands.droplets import DropletCommands, auto_detect_branch_name
+from ilha.commands.worker import DEFAULT_WORKER_TAG, WorkerManager
+from ilha.core.droplet_manager import DropletManager
+from ilha.exceptions import ilhaCommandError
+from ilha.utils.json_output import JSONOutput
+from ilha.utils.logging import log_info, log_success, print_plain
+
+
+def _resolve_central_private_ip(
+    *,
+    central_ip: Optional[str],
+    central_droplet_name: Optional[str],
+    api_token: Optional[str],
+) -> str:
+    if central_ip:
+        return central_ip.strip()
+    if not central_droplet_name:
+        raise ilhaCommandError("Either --central-ip or --central-droplet-name is required")
+
+    token = DropletManager.resolve_droplet_token(api_token)
+    provider = DropletManager.create_provider("digitalocean", token) if token else None
+    if not provider:
+        raise ilhaCommandError("DigitalOcean API token required to resolve central droplet")
+
+    droplets = provider.list_droplets()
+    matches = [d for d in droplets if d.name == central_droplet_name]
+    if not matches:
+        raise ilhaCommandError(f"Central droplet not found: {central_droplet_name}")
+    if len(matches) > 1:
+        raise ilhaCommandError(f"Multiple droplets named {central_droplet_name!r}; use --central-ip")
+    central = matches[0]
+    if not central.private_ip_address:
+        raise ilhaCommandError(
+            f"Central droplet {central_droplet_name!r} has no private IP; ensure VPC networking is enabled"
+        )
+    return central.private_ip_address
+
+
+def _resolve_vpc_uuid(
+    *,
+    vpc_uuid: Optional[str],
+    central_droplet_name: Optional[str],
+    api_token: Optional[str],
+) -> Optional[str]:
+    if vpc_uuid:
+        return vpc_uuid
+    if not central_droplet_name:
+        return None
+
+    token = DropletManager.resolve_droplet_token(api_token)
+    provider = DropletManager.create_provider("digitalocean", token) if token else None
+    if not provider:
+        return None
+
+    for droplet in provider.list_droplets():
+        if droplet.name == central_droplet_name and droplet.vpc_uuid:
+            return droplet.vpc_uuid
+    return None
+
+
+def register_commands(cli) -> None:
+    @cli.group()
+    @add_verbose_option
+    def worker():
+        """Manage ephemeral RQ worker droplets (bundle, deploy, list, destroy)."""
+
+    @worker.command("bundle")
+    @click.argument("branch_name", required=False)
+    @click.option("--central-ip", help="Central server private IP for Redis/DB")
+    @click.option("--central-droplet-name", help="Resolve central private IP from droplet name")
+    @click.option("--worker-service", help="Compose worker service name (default: rq-worker-1)")
+    @click.option("--output-dir", type=click.Path(path_type=Path), help="Directory to write bundle files")
+    @click.option("--cloud-init", is_flag=True, default=False, help="Print rendered cloud-init user data")
+    @click.option("--api-token", help="DigitalOcean API token (for resolving central droplet)")
+    @add_secrets_option
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper()
+    def worker_bundle(
+        branch_name: Optional[str],
+        central_ip: Optional[str],
+        central_droplet_name: Optional[str],
+        worker_service: Optional[str],
+        output_dir: Optional[click.Path],
+        cloud_init: bool,
+        secrets_profile: Optional[str],
+        json: bool,
+        api_token: Optional[str] = None,
+    ):
+        """Generate a minimal worker compose bundle for ephemeral droplets.
+
+        \b
+        Examples:
+          ilha worker bundle staging --central-droplet-name central
+          ilha worker bundle staging --central-ip 10.0.0.5 --cloud-init
+        """
+        branch = auto_detect_branch_name(branch_name, json)
+        if not branch:
+            raise ilhaCommandError("Branch name is required")
+
+        mgr = WorkerManager()
+        pool_cfg = mgr.load_pool_config()
+        resolved_ip = _resolve_central_private_ip(
+            central_ip=central_ip,
+            central_droplet_name=central_droplet_name or pool_cfg.central_droplet_name,
+            api_token=api_token,
+        )
+        bundle = mgr.build_bundle(
+            branch,
+            resolved_ip,
+            worker_service=worker_service,
+            output_dir=output_dir,
+            secrets_profile=secrets_profile,
+        )
+        payload = {
+            "branch": branch,
+            "worker_service": bundle.worker_service,
+            "image_ref": bundle.image_ref,
+            "central_private_ip": bundle.central_private_ip,
+            "output_dir": str(bundle.output_dir),
+            "compose_path": str(bundle.compose_path),
+            "env_path": str(bundle.env_path),
+        }
+        if cloud_init:
+            payload["user_data"] = mgr.render_cloud_init(bundle, secrets_profile=secrets_profile)
+
+        if json:
+            return JSONOutput.success("Worker bundle generated", payload)
+        log_success(f"Worker bundle: {bundle.output_dir}")
+        print_plain(f"  Image: {bundle.image_ref}")
+        print_plain(f"  Central IP: {bundle.central_private_ip}")
+        if cloud_init:
+            print_plain("")
+            print_plain(payload["user_data"])
+
+    def _deploy_worker_droplets(
+        *,
+        branch_name: Optional[str],
+        count: int,
+        central_ip: Optional[str],
+        central_droplet_name: Optional[str],
+        worker_service: Optional[str],
+        region: Optional[str],
+        size: Optional[str],
+        image: Optional[str],
+        ssh_keys: Optional[str],
+        tags: tuple,
+        vpc_uuid: Optional[str],
+        api_token: Optional[str],
+        wait: bool,
+        secrets_profile: Optional[str],
+        json: bool,
+    ):
+        if count < 1:
+            raise ilhaCommandError("--count must be at least 1")
+
+        branch = auto_detect_branch_name(branch_name, json)
+        if not branch:
+            raise ilhaCommandError("Branch name is required")
+
+        mgr = WorkerManager()
+        pool_cfg = mgr.load_pool_config()
+        central_name = central_droplet_name or pool_cfg.central_droplet_name
+        resolved_ip = _resolve_central_private_ip(
+            central_ip=central_ip,
+            central_droplet_name=central_name,
+            api_token=api_token,
+        )
+        resolved_vpc = _resolve_vpc_uuid(
+            vpc_uuid=vpc_uuid,
+            central_droplet_name=central_name,
+            api_token=api_token,
+        )
+
+        bundle = mgr.build_bundle(
+            branch,
+            resolved_ip,
+            worker_service=worker_service,
+            secrets_profile=secrets_profile,
+        )
+        user_data = mgr.render_cloud_init(bundle, secrets_profile=secrets_profile)
+        droplet_cmds = DropletCommands()
+
+        existing = droplet_cmds.list_droplets_by_tag(DEFAULT_WORKER_TAG, api_token=api_token, branch=branch)
+        start_index = len(existing) + 1
+
+        ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else list(pool_cfg.ssh_keys)
+        droplet_tags = mgr.worker_tags(branch, list(tags))
+
+        created = []
+        for offset in range(count):
+            name = mgr.generate_worker_name(branch, start_index + offset)
+            droplet = droplet_cmds.create_droplet(
+                name=name,
+                region=region or pool_cfg.region,
+                size=size or pool_cfg.size,
+                image=image or pool_cfg.image,
+                ssh_keys=ssh_keys_list or None,
+                tags=droplet_tags,
+                wait=wait,
+                api_token=api_token,
+                vpc_uuid=resolved_vpc,
+                user_data=user_data,
+                json=json,
+                return_droplet=True,
+            )
+            if not droplet:
+                raise ilhaCommandError(f"Failed to create worker droplet: {name}")
+            created.append(
+                {
+                    "id": droplet.id,
+                    "name": droplet.name,
+                    "ip_address": droplet.ip_address,
+                    "private_ip_address": droplet.private_ip_address,
+                    "status": droplet.status,
+                }
+            )
+            if not json:
+                log_info(f"Created worker droplet {droplet.name} (id={droplet.id})")
+
+        payload = {"branch": branch, "count": len(created), "droplets": created}
+        if json:
+            return JSONOutput.success("Worker droplets created", payload)
+        log_success(f"Created {len(created)} worker droplet(s)")
+
+    @worker.command("deploy")
+    @click.argument("branch_name", required=False)
+    @click.option("--count", type=int, default=1, show_default=True, help="Number of worker droplets to create")
+    @click.option("--central-ip", help="Central server private IP for Redis/DB")
+    @click.option("--central-droplet-name", help="Resolve central private IP and VPC from droplet name")
+    @click.option("--worker-service", help="Compose worker service name (default: rq-worker-1)")
+    @click.option("--region", help="Droplet region override")
+    @click.option("--size", help="Droplet size override")
+    @click.option("--image", help="Droplet OS image override")
+    @click.option("--ssh-keys", help="Comma-separated SSH key names")
+    @click.option("--tags", multiple=True, help="Additional droplet tags")
+    @click.option("--vpc-uuid", help="VPC UUID override")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @click.option("--wait", is_flag=True, default=False, help="Wait for droplets to become active")
+    @add_secrets_option
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def worker_deploy(
+        branch_name: Optional[str],
+        count: int,
+        central_ip: Optional[str],
+        central_droplet_name: Optional[str],
+        worker_service: Optional[str],
+        region: Optional[str],
+        size: Optional[str],
+        image: Optional[str],
+        ssh_keys: Optional[str],
+        tags: tuple,
+        vpc_uuid: Optional[str],
+        api_token: Optional[str],
+        wait: bool,
+        secrets_profile: Optional[str],
+        json: bool,
+    ):
+        """Deploy ephemeral worker droplets via cloud-init.
+
+        \b
+        Examples:
+          ilha worker deploy staging --count 2 --central-droplet-name central
+          ilha worker deploy staging --central-ip 10.0.0.5 --wait --json
+        """
+        return _deploy_worker_droplets(
+            branch_name=branch_name,
+            count=count,
+            central_ip=central_ip,
+            central_droplet_name=central_droplet_name,
+            worker_service=worker_service,
+            region=region,
+            size=size,
+            image=image,
+            ssh_keys=ssh_keys,
+            tags=tags,
+            vpc_uuid=vpc_uuid,
+            api_token=api_token,
+            wait=wait,
+            secrets_profile=secrets_profile,
+            json=json,
+        )
+
+    @worker.command("spawn", hidden=True)
+    @click.argument("branch_name", required=False)
+    @click.option("--count", type=int, default=1, show_default=True, help="Number of worker droplets to create")
+    @click.option("--central-ip", help="Central server private IP for Redis/DB")
+    @click.option("--central-droplet-name", help="Resolve central private IP and VPC from droplet name")
+    @click.option("--worker-service", help="Compose worker service name (default: rq-worker-1)")
+    @click.option("--region", help="Droplet region override")
+    @click.option("--size", help="Droplet size override")
+    @click.option("--image", help="Droplet OS image override")
+    @click.option("--ssh-keys", help="Comma-separated SSH key names")
+    @click.option("--tags", multiple=True, help="Additional droplet tags")
+    @click.option("--vpc-uuid", help="VPC UUID override")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @click.option("--wait", is_flag=True, default=False, help="Wait for droplets to become active")
+    @add_secrets_option
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def worker_spawn(
+        branch_name: Optional[str],
+        count: int,
+        central_ip: Optional[str],
+        central_droplet_name: Optional[str],
+        worker_service: Optional[str],
+        region: Optional[str],
+        size: Optional[str],
+        image: Optional[str],
+        ssh_keys: Optional[str],
+        tags: tuple,
+        vpc_uuid: Optional[str],
+        api_token: Optional[str],
+        wait: bool,
+        secrets_profile: Optional[str],
+        json: bool,
+    ):
+        """Deprecated alias for ``worker deploy``."""
+        return _deploy_worker_droplets(
+            branch_name=branch_name,
+            count=count,
+            central_ip=central_ip,
+            central_droplet_name=central_droplet_name,
+            worker_service=worker_service,
+            region=region,
+            size=size,
+            image=image,
+            ssh_keys=ssh_keys,
+            tags=tags,
+            vpc_uuid=vpc_uuid,
+            api_token=api_token,
+            wait=wait,
+            secrets_profile=secrets_profile,
+            json=json,
+        )
+
+    @worker.command("list")
+    @click.option("--branch", help="Filter by branch tag")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def worker_list(branch: Optional[str], api_token: Optional[str], json: bool):
+        """List ephemeral worker droplets.
+
+        \b
+        Examples:
+          ilha worker list
+          ilha worker list --branch staging --json
+        """
+        droplets = DropletCommands().list_droplets_by_tag(
+            DEFAULT_WORKER_TAG,
+            api_token=api_token,
+            branch=branch,
+        )
+        rows = [
+            {
+                "id": d.id,
+                "name": d.name,
+                "status": d.status,
+                "ip_address": d.ip_address,
+                "private_ip_address": d.private_ip_address,
+                "region": d.region,
+                "size": d.size,
+                "tags": d.tags,
+            }
+            for d in droplets
+        ]
+        if json:
+            return JSONOutput.success("Worker droplets listed", {"droplets": rows, "count": len(rows)})
+
+        if not rows:
+            print_plain("No worker droplets found.")
+            return
+        for row in rows:
+            print_plain(
+                f"{row['name']} (id={row['id']}, status={row['status']}, ip={row['ip_address'] or 'pending'})"
+            )
+
+    def _destroy_worker_droplets(
+        *,
+        ids: Optional[str],
+        destroy_all: bool,
+        branch: Optional[str],
+        force: bool,
+        api_token: Optional[str],
+        json: bool,
+    ):
+        droplet_cmds = DropletCommands()
+        target_ids: List[int] = []
+
+        if ids:
+            resolved, errors = droplet_cmds._resolve_droplet_identifiers(ids, api_token, json)
+            if errors and not resolved:
+                raise ilhaCommandError(errors[0]["error"])
+            target_ids = resolved
+        elif destroy_all:
+            droplets = droplet_cmds.list_droplets_by_tag(DEFAULT_WORKER_TAG, api_token=api_token, branch=branch)
+            target_ids = [d.id for d in droplets]
+        else:
+            raise ilhaCommandError("Specify --ids or --all")
+
+        if not target_ids:
+            if json:
+                return JSONOutput.success("No worker droplets to destroy", {"destroyed": []})
+            print_plain("No worker droplets to destroy.")
+            return
+
+        destroyed = []
+        failed = []
+        for droplet_id in target_ids:
+            ok = droplet_cmds.destroy_droplet(
+                droplet_id=droplet_id,
+                force=force,
+                api_token=api_token,
+                json=False,
+                only_droplet=True,
+            )
+            if ok:
+                destroyed.append(droplet_id)
+            else:
+                failed.append(droplet_id)
+
+        if json:
+            return JSONOutput.success(
+                "Worker droplets destroyed" if not failed else "Some worker droplets failed to destroy",
+                {"destroyed": destroyed, "failed": failed},
+            )
+        if destroyed:
+            log_success(f"Destroyed {len(destroyed)} worker droplet(s)")
+        if failed:
+            raise ilhaCommandError(f"Failed to destroy droplet(s): {', '.join(map(str, failed))}")
+
+    @worker.command("destroy")
+    @click.option("--ids", help="Comma-separated droplet IDs or names to destroy")
+    @click.option("--all", "destroy_all", is_flag=True, default=False, help="Destroy all worker-tagged droplets")
+    @click.option("--branch", help="When using --all, filter by branch tag")
+    @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompts")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def worker_destroy(
+        ids: Optional[str],
+        destroy_all: bool,
+        branch: Optional[str],
+        force: bool,
+        api_token: Optional[str],
+        json: bool,
+    ):
+        """Destroy ephemeral worker droplets.
+
+        \b
+        Examples:
+          ilha worker destroy --all --branch staging --force
+          ilha worker destroy --ids worker-staging-1,12345678
+        """
+        return _destroy_worker_droplets(
+            ids=ids,
+            destroy_all=destroy_all,
+            branch=branch,
+            force=force,
+            api_token=api_token,
+            json=json,
+        )
+
+    @worker.command("reap", hidden=True)
+    @click.option("--ids", help="Comma-separated droplet IDs or names to destroy")
+    @click.option("--all", "destroy_all", is_flag=True, default=False, help="Destroy all worker-tagged droplets")
+    @click.option("--branch", help="When using --all, filter by branch tag")
+    @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompts")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def worker_reap(
+        ids: Optional[str],
+        destroy_all: bool,
+        branch: Optional[str],
+        force: bool,
+        api_token: Optional[str],
+        json: bool,
+    ):
+        """Deprecated alias for ``worker destroy``."""
+        return _destroy_worker_droplets(
+            ids=ids,
+            destroy_all=destroy_all,
+            branch=branch,
+            force=force,
+            api_token=api_token,
+            json=json,
+        )

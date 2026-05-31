@@ -167,6 +167,77 @@ environment:
   #   - rq-worker-1
 
 # ============================================================================
+# Image Registry Configuration (Optional)
+# ============================================================================
+
+# Image publishing configuration
+# Used by 'ilha image build', 'ilha image push', 'ilha image publish',
+# 'ilha image list', and 'ilha image destroy'
+# CLI flags override these defaults. Use --save on image commands to persist
+# registry/repository/platform preferences here.
+# image:
+  # Registry provider. Currently only 'digitalocean' is supported.
+  # provider: digitalocean
+
+  # DigitalOcean Container Registry name (not the full hostname)
+  # Example image: registry.digitalocean.com/catalpa/bower/web:staging-abc1234
+  # registry: catalpa
+
+  # Repository prefix. Defaults to project_name.
+  # repository: bower
+
+  # Build platform. Default: linux/amd64
+  # platform: linux/amd64
+
+  # Tag template. Available fields: {branch}, {service}, {sha}, {sha7}
+  # tag_template: "{branch}-{sha7}"
+
+  # Optional per-service repository overrides. Workers that share a build
+  # context with web are built once and tagged for each requested image.
+  # services:
+  #   web:
+  #     repository: bower/web
+  #   rq-worker-1:
+  #     repository: bower/web
+
+# ============================================================================
+# Secrets (SOPS) Configuration (Optional)
+# ============================================================================
+
+# Encrypted secret profiles for deploy/runtime. Commit only *.sops.env files,
+# not plaintext .env or env.ilha with production secrets.
+# secrets:
+  # provider: sops
+  # default_profile: staging
+  # profiles:
+  #   staging:
+  #     file: .ilha/env.staging.sops.env
+  #   production:
+  #     file: .ilha/env.production.sops.env
+
+# ============================================================================
+# Worker Pool Configuration (Optional)
+# ============================================================================
+
+# Ephemeral worker droplet pool for RQ autoscaling on DigitalOcean.
+# Used by `ilha worker deploy`, `ilha worker list`, `ilha worker destroy`,
+# `ilha worker bundle`, and Django autoscale_workers.
+# worker_pool:
+  # Compose worker service to run on ephemeral droplets
+  # worker_service: rq-worker-1
+  # central_droplet_name: staging-central
+  # size: s-2vcpu-4gb
+  # region: nyc1
+  # image: ubuntu-22-04-x64
+  # ssh_keys: [anders]
+  # max_workers: 10
+  # idle_destroy_after_seconds: 300
+  # registry_token_env: DOCR_READ_TOKEN
+  # tags: [worker, ilha-managed]
+  # env_allowlist: []  # Optional explicit env keys to include in worker bundles/cloud-init
+  # env_exclude: [DIGITALOCEAN_API_TOKEN, DOCR_READ_TOKEN, EMAIL_HOST_PASSWORD, DJANGO_SECRET_KEY]
+
+# ============================================================================
 # DNS Configuration (Optional)
 # ============================================================================
 
@@ -209,4 +280,3 @@ environment:
   # When enabled, automatically allows VPC network (10.0.0.0/8) access to Redis/DB ports
   # Default: false (opt-in, requires UFW to be installed on server)
   # auto_configure_firewall: false
-
