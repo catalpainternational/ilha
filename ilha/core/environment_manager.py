@@ -8,7 +8,7 @@ configuration management for worktree environments.
 import os
 import socket
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from ..config.settings import (
     generate_env_compose_content,
@@ -248,6 +248,7 @@ class EnvironmentManager:
             resolve_project_name,
             get_allowed_hosts_for_worktree,
             build_allowed_hosts_with_container,
+            generate_secret_key,
             DEFAULT_ENV_VARS,
         )
 
@@ -256,6 +257,10 @@ class EnvironmentManager:
         # Don't overwrite existing .env file
         if env_file.exists():
             return True
+
+        # Give every new environment its own strong SECRET_KEY so no deploy ever
+        # ships the shared, publicly-known insecure default.
+        secret_key = generate_secret_key()
 
         # Create default environment content with project prefix
         project_name = sanitize_project_name(resolve_project_name(self.project_root))
@@ -290,7 +295,7 @@ POSTGRES_DB=
 
 # Django configuration
 DEBUG=True
-DJANGO_SECRET_KEY=django-insecure-secret-key
+DJANGO_SECRET_KEY={secret_key}
 ALLOWED_HOSTS={allowed_hosts}
 SITE_DOMAIN={site_domain}
 """
@@ -475,9 +480,14 @@ USE_X_FORWARDED_HOST=True
             Updated content string
         """
         import re
-        pattern = rf'^{var_name}=.*$'
+        # re.escape the key in the search pattern; use a replacement *function*
+        # so the value is treated literally. A plain replacement string would let
+        # backslashes / group refs (\1, \g<...>) in the value corrupt the file or
+        # raise (e.g. a Windows path or an odd CSRF/host value).
+        pattern = rf'^{re.escape(var_name)}=.*$'
+        replacement = f'{var_name}={value}'
         if re.search(pattern, content, flags=re.MULTILINE):
-            content = re.sub(pattern, f'{var_name}={value}', content, flags=re.MULTILINE)
+            content = re.sub(pattern, lambda _m: replacement, content, flags=re.MULTILINE)
         else:
             content += f"\n{var_name}={value}\n"
         return content
@@ -723,7 +733,7 @@ USE_X_FORWARDED_HOST=True
         
         return success
     
-    def get_worktree_config(self, branch_name: str) -> Dict[str, any]:
+    def get_worktree_config(self, branch_name: str) -> Dict[str, Any]:
         """Get complete worktree configuration."""
         return {
             "branch_name": branch_name,

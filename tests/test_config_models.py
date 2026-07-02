@@ -19,8 +19,11 @@ class TestDropletStoredConfig:
         config = DropletStoredConfig()
         assert config.branch is None
         assert config.ip is None
-        assert config.remote_user == "root"
-        assert config.ssh_port == 22
+        # Unset remote_user/ssh_port default to None so they inherit the global
+        # default_remote_user / default_ssh_port at merge time (the effective
+        # "root"/22 fallback lives in MergedDeployConfig).
+        assert config.remote_user is None
+        assert config.ssh_port is None
 
     def test_create_full(self):
         """Test creating droplet config with all fields."""
@@ -78,7 +81,8 @@ class TestGlobalIlhaConfig:
 
     def test_create_minimal(self):
         """Test creating minimal global config."""
-        config = GlobalIlhaConfig()
+        # A token (default or per-droplet) is required by validate_api_token_available.
+        config = GlobalIlhaConfig(default_api_token="token")
         assert config.version == "1.0"
         assert config.default_region == "nyc3"
         assert len(config.droplets) == 0
@@ -117,14 +121,14 @@ class TestGlobalIlhaConfig:
 
     def test_health_check_timeout_validation(self):
         """Test health check timeout bounds."""
-        config = GlobalIlhaConfig(health_check_timeout=300)
+        config = GlobalIlhaConfig(default_api_token="token", health_check_timeout=300)
         assert config.health_check_timeout == 300
 
         with pytest.raises(ValueError):
-            GlobalIlhaConfig(health_check_timeout=10)  # Too low
+            GlobalIlhaConfig(default_api_token="token", health_check_timeout=10)  # Too low
 
         with pytest.raises(ValueError):
-            GlobalIlhaConfig(health_check_timeout=10000)  # Too high
+            GlobalIlhaConfig(default_api_token="token", health_check_timeout=10000)  # Too high
 
 
 class TestEnvironmentConfig:
@@ -236,7 +240,8 @@ class TestConfigPydanticFeatures:
         data = config.model_dump()
         assert data["branch"] == "main"
         assert data["ip"] == "10.0.0.1"
-        assert data["remote_user"] == "root"
+        # Unset remote_user is None (inherits global default_remote_user at merge).
+        assert data["remote_user"] is None
 
     def test_model_dump_exclude_none(self):
         """Test model serialization excluding None values."""

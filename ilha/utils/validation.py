@@ -201,20 +201,61 @@ def validate_current_branch(project_root: Optional[Path] = None) -> Optional[str
 
 
 def validate_branch_merged(branch_name: str, project_root: Optional[Path] = None) -> bool:
-    """Check if a branch has been merged."""
+    """Check whether *branch_name* has been merged into HEAD.
+
+    Non-destructive: uses ``git merge-base --is-ancestor`` (exit 0 when the
+    branch tip is an ancestor of HEAD, i.e. fully merged). This is only a
+    predicate — it must never mutate the repository. (It previously ran
+    ``git branch -d``, which *deletes* a merged branch as a side effect, so
+    merely reading branch info could destroy a branch.)
+    """
     try:
         if project_root is None:
             from ..config.settings import get_project_root
             project_root = get_project_root()
-        subprocess.run(["git", "branch", "-d", branch_name],
-                      capture_output=True, check=True, cwd=project_root)
-        return True
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", branch_name, "HEAD"],
+            capture_output=True, cwd=project_root
+        )
+        return result.returncode == 0
     except Exception:
         return False
 
 
+def _check_docker_prerequisites() -> None:
+    """Fail with guidance if the Docker daemon or Compose CLI is not usable.
+
+    Single source of truth for the Docker/Compose prerequisite checks shared by
+    ``check_prerequisites`` and ``check_prerequisites_no_git`` (previously ~40
+    copy-pasted lines in each).
+    """
+    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
+    ok, reason = check_docker_daemon_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker is required for this command, but the daemon is not usable right now.",
+            hints=[
+                reason,
+                "Start Docker Desktop (macOS/Windows) or the Docker service (Linux) and wait until it is fully running.",
+                f"If Docker is slow to start, wait and retry (health check timeout: {timeout}s).",
+                "Sanity check in a terminal: `docker info`",
+            ],
+        )
+
+    ok, reason = check_docker_compose_responsive(timeout_seconds=timeout)
+    if not ok:
+        fail_prerequisite(
+            "Docker Compose is required for this command but is missing or failing.",
+            hints=[
+                reason,
+                "Install Docker Compose v2 (`docker compose`) or the legacy `docker-compose` CLI.",
+                f"Sanity check: `docker compose version` (timeout: {timeout}s)",
+            ],
+        )
+
+
 def check_prerequisites(project_root: Optional[Path] = None) -> None:
-    """Check all prerequisites and exit if any fail."""
+    """Check all prerequisites (git repo + Docker/Compose) and exit if any fail."""
     if not validate_git_repository(project_root):
         fail_prerequisite(
             "This command must be run from a git repository (project root).",
@@ -223,57 +264,12 @@ def check_prerequisites(project_root: Optional[Path] = None) -> None:
                 "Example: `cd path/to/repo` or `cd worktrees/<branch>`.",
             ],
         )
-
-    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
-    ok, reason = check_docker_daemon_responsive(timeout_seconds=timeout)
-    if not ok:
-        fail_prerequisite(
-            "Docker is required for this command, but the daemon is not usable right now.",
-            hints=[
-                reason,
-                "Start Docker Desktop (macOS/Windows) or the Docker service (Linux) and wait until it is fully running.",
-                f"If Docker is slow to start, wait and retry (health check timeout: {timeout}s).",
-                "Sanity check in a terminal: `docker info`",
-            ],
-        )
-
-    ok, reason = check_docker_compose_responsive(timeout_seconds=timeout)
-    if not ok:
-        fail_prerequisite(
-            "Docker Compose is required for this command but is missing or failing.",
-            hints=[
-                reason,
-                "Install Docker Compose v2 (`docker compose`) or the legacy `docker-compose` CLI.",
-                f"Sanity check: `docker compose version` (timeout: {timeout}s)",
-            ],
-        )
+    _check_docker_prerequisites()
 
 
 def check_prerequisites_no_git() -> None:
     """Check Docker prerequisites only (skip git validation)."""
-    timeout = DEFAULT_DOCKER_HEALTH_TIMEOUT_SECONDS
-    ok, reason = check_docker_daemon_responsive(timeout_seconds=timeout)
-    if not ok:
-        fail_prerequisite(
-            "Docker is required for this command, but the daemon is not usable right now.",
-            hints=[
-                reason,
-                "Start Docker Desktop (macOS/Windows) or the Docker service (Linux) and wait until it is fully running.",
-                f"If Docker is slow to start, wait and retry (health check timeout: {timeout}s).",
-                "Sanity check in a terminal: `docker info`",
-            ],
-        )
-
-    ok, reason = check_docker_compose_responsive(timeout_seconds=timeout)
-    if not ok:
-        fail_prerequisite(
-            "Docker Compose is required for this command but is missing or failing.",
-            hints=[
-                reason,
-                "Install Docker Compose v2 (`docker compose`) or the legacy `docker-compose` CLI.",
-                f"Sanity check: `docker compose version` (timeout: {timeout}s)",
-            ],
-        )
+    _check_docker_prerequisites()
 
 
 def validate_volume_exists(volume_name: str) -> bool:
@@ -299,8 +295,11 @@ def validate_network_exists(network_name: str) -> bool:
 def validate_container_running(container_name: str) -> bool:
     """Check if a Docker container is running."""
     try:
-        result = subprocess.run(["docker", "ps", "--filter", f"name={container_name}", 
-                               "--format", "{{.Status}}"], 
+        # Anchor the name filter (^/name$) so 'web' does not match 'web2' /
+        # 'myproj-web-old' — matching validate_container_exists. A bare
+        # substring filter reported unrelated containers as running.
+        result = subprocess.run(["docker", "ps", "--filter", f"name=^/{container_name}$",
+                               "--format", "{{.Status}}"],
                               capture_output=True, text=True, check=True)
         return "Up" in result.stdout
     except (subprocess.CalledProcessError, Exception):

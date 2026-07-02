@@ -7,7 +7,7 @@ Two consumer shapes need the same set of strategies (curl → wget → python �
   independent ``docker exec`` via ``subprocess.run`` and falls through to the
   next on non-zero exit.
 * ``SlimDeployManager._build_smoke_probe_command`` and
-  ``DeployDoctor._build_smoke_probe_command`` build a single ``sh -c``
+  ``SlimDeployManager._build_smoke_probe_command`` build a single ``sh -c``
   chain (``if curl-exists; then curl; elif wget-exists; then wget; ...``)
   and execute it via ``docker compose exec``.
 

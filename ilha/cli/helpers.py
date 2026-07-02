@@ -117,11 +117,16 @@ def command_wrapper(
                         details=exc.details,
                         json_output=True,
                     )
+                    # print_error does not exit; without this the process returns
+                    # 0 on failure, so `ilha <cmd> --json` looks successful to
+                    # CI/automation checking $?.
+                    raise SystemExit(exc.exit_code or 1)
                 else:
                     error_exit(exc.message, exit_code=exc.exit_code)
             except Exception as exc:
                 if json_enabled:
                     JSONOutput.print_error(str(exc), error_code="command_error", json_output=True)
+                    raise SystemExit(1)
                 else:
                     raise
 

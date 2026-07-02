@@ -32,3 +32,12 @@ class PrerequisiteError(ilhaError):
     """Raised when environment or prerequisite checks fail."""
 
 
+class VolumeBackupError(ilhaError):
+    """Raised when a volume backup was attempted and failed.
+
+    Distinct from "there was nothing to back up" (which is not an error): a
+    deploy that requested ``--restore-volumes`` must abort on this rather than
+    silently bringing the app up on an empty/fresh volume.
+    """
+
+

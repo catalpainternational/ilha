@@ -6,7 +6,6 @@ when the server runs out of space.
 """
 
 import random
-import subprocess
 import time
 from typing import Any, Dict, Tuple
 
@@ -36,14 +35,7 @@ class RemoteDiskManager:
         command: str,
         timeout: int = 30,
     ) -> Tuple[int, str, str]:
-        ssh_cmd = self.ssh.build_ssh_command(username, server, command)
-        try:
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-            return result.returncode, result.stdout or "", result.stderr or ""
-        except subprocess.TimeoutExpired:
-            return 1, "", f"Remote command timed out after {timeout}s"
-        except Exception as exc:
-            return 1, "", str(exc)
+        return self.ssh.run_remote_text(username, server, command, timeout=timeout)
 
     # ── Public API ───────────────────────────────────────────────────
 

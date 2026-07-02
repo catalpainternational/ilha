@@ -20,7 +20,7 @@ from ..config.settings import (
     get_source_volume_names_for_project_root,
     DEFAULT_ENV_VARS,
     get_project_root,
-    get_project_name,
+    resolve_project_name,
     sanitize_project_name,
     POSTGRES_VOLUME_SUFFIX,
 )
@@ -64,6 +64,22 @@ class DockerManager:
                 message="Docker is not running. Please start Docker and try again.",
                 error_code="docker_not_running"
             )
+
+    def _compose_project_name(self, branch_name: str) -> str:
+        """Return the compose project name for *branch_name*, anchored to
+        ``self.project_root``.
+
+        Single source of truth for the ``{project}-{branch}`` compose project
+        name inside DockerManager. Uses ``resolve_project_name(self.project_root)``
+        — NOT ``get_project_name()``, which reads the *current working directory*
+        and returns the wrong name whenever a command runs from somewhere other
+        than the project root (server import from ``/root``, backups triggered
+        elsewhere), causing container/volume lookups to target the wrong project.
+        Matches EnvironmentManager so the value agrees with the deployed
+        ``COMPOSE_PROJECT_NAME``.
+        """
+        project_name = sanitize_project_name(resolve_project_name(self.project_root))
+        return f"{project_name}-{sanitize_project_name(branch_name)}"
     
     def create_network(self, network_name: str = CADDY_NETWORK) -> bool:
         """Create external network if it doesn't exist."""
@@ -165,8 +181,9 @@ class DockerManager:
         Returns:
             Container name in format: {project_name}-{branch_name}-db, or None if not found
         """
-        from ..config.settings import get_project_name, sanitize_project_name
-        project_name = sanitize_project_name(get_project_name())
+        # Anchor to self.project_root (see _compose_project_name); get_project_name()
+        # would read cwd and mis-resolve when invoked from outside the project.
+        project_name = sanitize_project_name(resolve_project_name(self.project_root))
         container_name = f"{project_name}-{branch_name}-db"
         
         # Verify container exists
@@ -435,8 +452,12 @@ class DockerManager:
         temp_backup_dir.mkdir(exist_ok=True)
         
         try:
-            # Backup each volume in parallel (uncompressed tar per volume,
-            # single gzip pass on the combined archive to avoid triple compression)
+            # Backup each volume in parallel as a gzipped per-volume tar
+            # (``{volume}.tar.gz``). restore_volumes() discovers backups by
+            # globbing ``*.tar.gz`` and extracts them with ``tar xzf``, so the
+            # per-volume format MUST be gzipped — an uncompressed ``{volume}.tar``
+            # is silently unmatched on restore (full data loss). This also keeps
+            # the format identical to package_manager._backup_selected_volumes.
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             def _backup_one_volume(volume_type, volume_name):
@@ -449,9 +470,9 @@ class DockerManager:
                         "docker", "run", "--rm",
                         "-v", f"{volume_name}:/data",
                         "-v", f"{temp_backup_dir.absolute()}:/backup",
-                        "alpine", "tar", "cf", f"/backup/{volume_name}.tar", "-C", "/data", "."
+                        "alpine", "tar", "czf", f"/backup/{volume_name}.tar.gz", "-C", "/data", "."
                     ], check=True, capture_output=True, text=True)
-                    log_success(f"Volume backup created: {volume_name}.tar")
+                    log_success(f"Volume backup created: {volume_name}.tar.gz")
                     return True
                 except subprocess.CalledProcessError as e:
                     log_error(f"Failed to backup volume {volume_name}: {e}")
@@ -495,10 +516,10 @@ class DockerManager:
                         log_error(f"Failed to restart containers: {restart_error}")
                 return None
 
-            # Sanity check: every expected .tar file exists before we combine.
+            # Sanity check: every expected per-volume archive exists before we combine.
             missing = [
                 vname for vname in volume_names.values()
-                if not (temp_backup_dir / f"{vname}.tar").exists()
+                if not (temp_backup_dir / f"{vname}.tar.gz").exists()
             ]
             if missing:
                 log_error(f"Aborting backup: expected per-volume tar files missing: {missing}")
@@ -640,12 +661,19 @@ class DockerManager:
                     # Apply worktree prefix pattern: {project_name}-{branch_name}_{volume_name}
                     prefixed_volume_name = f"{compose_project_name}_{volume_name}"
                     volumes.append(prefixed_volume_name)
-                elif volume_name.startswith('/') or ':' not in volume_spec if isinstance(volume_spec, str) else False:
-                    # Anonymous volume or bind mount, skip
-                    continue
                 else:
-                    # Might be an external volume or already prefixed
-                    # Check if it matches our pattern
+                    # Not a named volume. Skip anonymous volumes and bind mounts —
+                    # only meaningful for the string short-form spec ('/host:/ctr'
+                    # or a bare anonymous path). (The previous one-liner mixed a
+                    # ternary with `or` and was effectively unreadable.)
+                    is_bind_or_anonymous = (
+                        isinstance(volume_spec, str)
+                        and (volume_name.startswith('/') or ':' not in volume_spec)
+                    )
+                    if is_bind_or_anonymous:
+                        continue
+                    # Might be an external volume or already prefixed — keep it if
+                    # it matches our worktree pattern.
                     if f"{branch_name}_" in volume_name or compose_project_name in volume_name:
                         volumes.append(volume_name)
         
@@ -838,19 +866,25 @@ class DockerManager:
             }
             backup_map_tar = {}
             log_info(f"Creating backup file mapping...")
-            for backup_file in available_tar_backups:
-                # Remove extension (.tar.gz)
-                backup_name = backup_file.stem  # Remove .tar.gz
-                
-                log_info(f"Processing backup file: {backup_file.name}")
+            # NOTE: iterate with a distinct name — do not rebind the ``backup_file``
+            # parameter (the package path), which later logic may still need.
+            for candidate_backup in available_tar_backups:
+                # Strip the full ``.tar.gz`` compound suffix. (Path.stem only
+                # removes the last suffix, leaving a trailing ``.tar`` that broke
+                # the endswith(volume-type-suffix) match below.)
+                backup_name = candidate_backup.name
+                if backup_name.endswith(".tar.gz"):
+                    backup_name = backup_name[: -len(".tar.gz")]
+
+                log_info(f"Processing backup file: {candidate_backup.name}")
                 for volume_type, volume_name in volume_names.items():
                     # Check if this backup matches the expected volume type by suffix
                     expected_suffix = f"_{volume_type_suffixes.get(volume_type, volume_type)}"
                     if backup_name.endswith(expected_suffix):
                         # File-level backup
                         if volume_type not in backup_map_tar:
-                            backup_map_tar[volume_type] = backup_file
-                            log_info(f"Mapped file backup {backup_file.name} to volume type {volume_type}")
+                            backup_map_tar[volume_type] = candidate_backup
+                            log_info(f"Mapped file backup {candidate_backup.name} to volume type {volume_type}")
                         break
             
             if backup_map_tar:
@@ -1348,7 +1382,7 @@ class DockerManager:
         """
         from ..core.git_manager import GitManager
         from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
-        from ..config.settings import get_project_name, sanitize_project_name
+        from ..config.settings import sanitize_project_name
 
         # Validate worktree exists
         git_manager = GitManager()
@@ -1441,12 +1475,11 @@ class DockerManager:
             raise ilhaCommandError(f"docker compose invocation failed: {e}")
         return result.returncode
 
-    async def start_worktree_containers(self, branch_name: str, worktree_path: Path,
+    def start_worktree_containers(self, branch_name: str, worktree_path: Path,
                                        project_root: Path) -> Dict[str, Any]:
         """Start containers for a worktree asynchronously."""
         try:
             from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
-            from ..config.settings import get_project_name, sanitize_project_name
 
             base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
             env_file = get_env_compose_file_path(worktree_path)
@@ -1456,8 +1489,7 @@ class DockerManager:
             if overlay_compose is None:
                 return {"success": False, "error": f"ilha overlay missing for worktree '{branch_name}' — re-run `ilha setup`"}
 
-            project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+            compose_project_name = self._compose_project_name(branch_name)
 
             success, _ = self.run_compose_command(
                 overlay_compose,
@@ -1475,12 +1507,11 @@ class DockerManager:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def stop_worktree_containers(self, branch_name: str) -> Dict[str, Any]:
-        """Stop containers for a worktree asynchronously."""
+    def stop_worktree_containers(self, branch_name: str) -> Dict[str, Any]:
+        """Stop containers for a worktree."""
         try:
             from ..core.git_manager import GitManager
             from ..utils.path_utils import compose_files_for_invocation, get_env_compose_file_path
-            from ..config.settings import get_project_name, sanitize_project_name
 
             git_manager = GitManager(validate=False)
             worktree_path = git_manager.find_worktree_path(branch_name)
@@ -1491,8 +1522,7 @@ class DockerManager:
             base_compose, overlay_compose = compose_files_for_invocation(worktree_path)
             env_file = get_env_compose_file_path(worktree_path)
 
-            project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+            compose_project_name = self._compose_project_name(branch_name)
 
             if overlay_compose is None or base_compose is None:
                 # Without overlay we can still try to stop using whatever compose
@@ -1534,10 +1564,8 @@ class DockerManager:
             True if any containers are running, False otherwise
         """
         try:
-            from ..config.settings import get_project_name, sanitize_project_name
             
-            project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+            compose_project_name = self._compose_project_name(branch_name)
             
             # Get running containers for this project
             result = subprocess.run([
@@ -1557,13 +1585,11 @@ class DockerManager:
             log_warning(f"Failed to check if worktree is running: {e}")
             return False
     
-    async def get_worktree_containers(self, branch_name: str) -> List[Dict[str, Any]]:
-        """Get container status for a worktree asynchronously."""
+    def get_worktree_containers(self, branch_name: str) -> List[Dict[str, Any]]:
+        """Get container status for a worktree (synchronous — only blocking I/O)."""
         try:
-            from ..config.settings import get_project_name, sanitize_project_name
             
-            project_name = sanitize_project_name(get_project_name())
-            compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+            compose_project_name = self._compose_project_name(branch_name)
             
             # Get containers for this project
             result = subprocess.run([
@@ -1594,8 +1620,8 @@ class DockerManager:
             log_warning(f"Failed to get containers: {e}")
             return []
 
-    async def get_worktree_volumes(self, branch_name: str) -> List[Dict[str, Any]]:
-        """Get volumes for a worktree asynchronously."""
+    def get_worktree_volumes(self, branch_name: str) -> List[Dict[str, Any]]:
+        """Get volumes for a worktree (synchronous — only blocking I/O)."""
         try:
             from ..config.settings import get_volume_names
             from ..utils.validation import validate_volume_exists
@@ -1631,18 +1657,11 @@ class DockerManager:
     def get_worktree_containers_sync(self, branch_name: str) -> List[Dict[str, Any]]:
         """Get container status for a worktree synchronously.
         
-        This is a synchronous wrapper around the async get_worktree_containers() method.
-        Used by WorktreeOrchestrator.get_worktree_info() which is synchronous.
-        
-        Args:
-            branch_name: Branch name for the worktree
-            
-        Returns:
-            List of container dictionaries with name, status, state, ports, and image
+        Back-compat alias for get_worktree_containers(), which is now synchronous.
+        Used by WorktreeOrchestrator.get_worktree_info().
         """
-        import asyncio
         try:
-            return asyncio.run(self.get_worktree_containers(branch_name))
+            return self.get_worktree_containers(branch_name)
         except Exception as e:
             log_warning(f"Failed to get containers synchronously: {e}")
             return []
@@ -1650,18 +1669,11 @@ class DockerManager:
     def get_worktree_volumes_sync(self, branch_name: str) -> List[Dict[str, Any]]:
         """Get volumes for a worktree synchronously.
         
-        This is a synchronous wrapper around the async get_worktree_volumes() method.
-        Used by WorktreeOrchestrator.get_worktree_info() which is synchronous.
-        
-        Args:
-            branch_name: Branch name for the worktree
-            
-        Returns:
-            List of volume dictionaries with name, type, branch, and exists status
+        Back-compat alias for get_worktree_volumes(), which is now synchronous.
+        Used by WorktreeOrchestrator.get_worktree_info().
         """
-        import asyncio
         try:
-            return asyncio.run(self.get_worktree_volumes(branch_name))
+            return self.get_worktree_volumes(branch_name)
         except Exception as e:
             log_warning(f"Failed to get volumes synchronously: {e}")
             return []

@@ -229,6 +229,44 @@ class SSHConnectionManager:
             check=False
         )
     
+    def run_remote_text(
+        self,
+        username: str,
+        server: str,
+        command: str,
+        timeout: int = 30,
+    ) -> Tuple[int, str, str]:
+        """Run *command* over SSH and return ``(returncode, stdout, stderr)``.
+
+        Single source of truth for the ``_run_remote_text`` helper that used to
+        be copy-pasted verbatim into SlimDeployManager and
+        RemoteDiskManager. Never raises: timeouts and unexpected errors are
+        mapped to a non-zero return code with the message on stderr.
+        """
+        ssh_cmd = self.build_ssh_command(username, server, command)
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+            return result.returncode, result.stdout or "", result.stderr or ""
+        except subprocess.TimeoutExpired:
+            return 1, "", f"Remote command timed out after {timeout}s"
+        except Exception as exc:  # noqa: BLE001 — surfaced to caller as (rc, "", err)
+            return 1, "", str(exc)
+
+    @staticmethod
+    def run_local_text(command: List[str], timeout: int = 30) -> Tuple[int, str, str]:
+        """Run a local argv *command* and return ``(returncode, stdout, stderr)``.
+
+        Companion to :meth:`run_remote_text` for the local half of deploy
+        diagnostics. Never raises.
+        """
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            return result.returncode, result.stdout or "", result.stderr or ""
+        except subprocess.TimeoutExpired:
+            return 1, "", f"Local command timed out after {timeout}s"
+        except Exception as exc:  # noqa: BLE001 — surfaced to caller as (rc, "", err)
+            return 1, "", str(exc)
+
     def build_scp_command(self, source: str, target: str,
                          use_control_master: bool = True) -> List[str]:
         """Build SCP command with connection reuse.

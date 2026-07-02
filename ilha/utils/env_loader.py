@@ -5,8 +5,45 @@ This module provides utilities for loading environment variables from .env files
 """
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Mapping, Optional
 from .logging import log_warning
+
+
+def _strip_inline_quotes(value: str) -> str:
+    """Remove a single pair of matching surrounding quotes, if present."""
+    if len(value) >= 2 and (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("'") and value.endswith("'"))
+    ):
+        return value[1:-1]
+    return value
+
+
+def parse_env_content(content: str) -> Dict[str, str]:
+    """Parse ``KEY=VALUE`` lines from *content* into a dict.
+
+    Single source of truth for .env parsing. Rules: ``#`` comment lines and
+    blank lines are ignored; the split is on the first ``=``; surrounding
+    whitespace is stripped; one pair of matching surrounding quotes is removed.
+    Lines without ``=`` or with an empty key are ignored.
+
+    Many modules used to hand-roll this (some stripping quotes, some not),
+    which meant the same .env line could parse differently depending on the
+    code path. Route all KEY=VALUE parsing through here.
+    """
+    env_vars: Dict[str, str] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        if not key:
+            continue
+        env_vars[key] = _strip_inline_quotes(value.strip())
+    return env_vars
 
 
 def load_env_file(env_path: Path) -> Dict[str, str]:
@@ -26,52 +63,69 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         Dictionary of key-value pairs from .env file, or empty dict if file
         doesn't exist or parsing fails
     """
-    env_vars = {}
-    
     if not env_path.exists():
-        return env_vars
-    
+        return {}
+
     try:
-        with open(env_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                # Strip whitespace
-                line = line.strip()
-                
-                # Skip empty lines
-                if not line:
-                    continue
-                
-                # Skip comment lines
-                if line.startswith('#'):
-                    continue
-                
-                # Parse KEY=VALUE format
-                if '=' in line:
-                    # Split on first = to handle values that might contain =
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    
-                    # Remove surrounding quotes from value if present
-                    # Handle both single and double quotes
-                    if len(value) >= 2:
-                        if (value.startswith('"') and value.endswith('"')) or \
-                           (value.startswith("'") and value.endswith("'")):
-                            value = value[1:-1]
-                    
-                    # Skip if key is empty
-                    if key:
-                        env_vars[key] = value
-                # Lines without = are silently ignored (not an error)
-    
+        content = env_path.read_text(encoding='utf-8')
     except (IOError, OSError) as e:
         log_warning(f"Failed to read .env file at {env_path}: {e}")
         return {}
+
+    try:
+        return parse_env_content(content)
     except Exception as e:
         log_warning(f"Error parsing .env file at {env_path}: {e}")
         return {}
-    
-    return env_vars
+
+
+def upsert_env_vars(
+    env_path: Path,
+    updates: Mapping[str, str],
+    *,
+    remove: Optional[Iterable[str]] = None,
+) -> None:
+    """Set/replace *updates* (and delete *remove*) in an env file in place.
+
+    Preserves comments, blank lines, ordering and any non ``KEY=VALUE`` lines —
+    only the affected keys are rewritten. Existing keys are updated where they
+    already appear; brand-new keys are appended. Creates the file (and parent
+    dirs) if it does not exist.
+
+    Single source of truth for the "read → strip old keys → append → write"
+    dance that was re-implemented across EnvironmentManager (save_push_config,
+    save_droplet_config, set_staging_certificate_flag, update_project_root, …) —
+    several of which destroyed comments by rewriting from a parsed dict. Route
+    env-file mutation through here.
+    """
+    remove_set = {str(k) for k in (remove or ())}
+    updates = {str(k): str(v) for k, v in updates.items()}
+
+    existing_lines = []
+    if env_path.exists():
+        existing_lines = env_path.read_text(encoding='utf-8').splitlines()
+
+    written_keys = set()
+    out_lines = []
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0].strip()
+            if key in remove_set:
+                continue  # drop this key entirely
+            if key in updates:
+                out_lines.append(f"{key}={updates[key]}")
+                written_keys.add(key)
+                continue
+        out_lines.append(line)
+
+    # Append any keys that weren't already present.
+    for key, value in updates.items():
+        if key not in written_keys:
+            out_lines.append(f"{key}={value}")
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text("\n".join(out_lines) + "\n", encoding='utf-8')
 
 
 def load_env_from_project_root() -> Dict[str, str]:

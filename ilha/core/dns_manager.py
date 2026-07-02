@@ -96,15 +96,24 @@ def is_domain(host: str) -> bool:
     Returns:
         True if host is a domain, False if IP or localhost
     """
-    if host.startswith('localhost') or host.startswith('127.0.0.1'):
+    if not host:
         return False
-    
-    # IP pattern: \d+\.\d+\.\d+\.\d+
-    if re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
+
+    # Compare against the bare host without any :port suffix. Use EXACT/anchored
+    # checks — a prefix match wrongly classified legitimate registrable domains
+    # like 'localhost.example.com' or '127.0.0.1.nip.io' as non-domains.
+    bare = host.split(':', 1)[0]
+
+    # The literal local machine is not a routable domain.
+    if bare == 'localhost':
         return False
-    
+
+    # A bare IPv4 literal is not a domain (but e.g. '127.0.0.1.nip.io' is).
+    if re.match(r'^\d+\.\d+\.\d+\.\d+$', bare):
+        return False
+
     # Domain: contains dots and valid domain characters
-    return '.' in host and not host.startswith('.')
+    return '.' in bare and not bare.startswith('.')
 
 
 class DNSProvider(ABC):

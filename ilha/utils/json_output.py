@@ -28,6 +28,20 @@ class JSONOutput:
         return result
     
     @staticmethod
+    def notice(message: str, level: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Format an info/warning notice — carries a ``level`` so machine consumers
+        can tell it apart from a success result (which it previously masqueraded as)."""
+        result = {
+            "success": True,
+            "level": level,
+            "message": message,
+            "timestamp": __import__("datetime").datetime.now().isoformat()
+        }
+        if data:
+            result["data"] = data
+        return result
+
+    @staticmethod
     def error(message: str, error_code: Optional[str] = None, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Format an error result."""
         result = {
@@ -105,15 +119,15 @@ class JSONOutput:
     def print_info(message: str, data: Optional[Dict[str, Any]] = None, json_output: bool = False) -> None:
         """Print info message, optionally as JSON."""
         if json_output:
-            JSONOutput.print_json(JSONOutput.success(message, data))
+            JSONOutput.print_json(JSONOutput.notice(message, "info", data))
         else:
             log_info(message)
-    
+
     @staticmethod
     def print_warning(message: str, data: Optional[Dict[str, Any]] = None, json_output: bool = False) -> None:
         """Print warning message, optionally as JSON."""
         if json_output:
-            JSONOutput.print_json(JSONOutput.success(message, data))
+            JSONOutput.print_json(JSONOutput.notice(message, "warning", data))
         else:
             log_warning(message)
 
@@ -141,7 +155,9 @@ def handle_json_output(func):
             return result
         except Exception as e:
             if json_output:
-                JSONOutput.print_error(str(e), "command_error")
+                # Must pass json_output=True or print_error logs a plain text
+                # line instead of the JSON error envelope — defeating --json.
+                JSONOutput.print_error(str(e), "command_error", json_output=True)
             else:
                 raise
     return wrapper

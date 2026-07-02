@@ -9,7 +9,7 @@ with Python code that reuses existing ilha modules.
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from ..core.package_manager import PackageManager
 from ..core.docker_manager import DockerManager
@@ -188,7 +188,7 @@ class ServerImportOrchestrator:
             log_error(f"Failed to cleanup worktree: {e}")
             return False
     
-    def _verify_volumes(self, branch_name: str, project_root: Path) -> Dict[str, any]:
+    def _verify_volumes(self, branch_name: str, project_root: Path) -> Dict[str, Any]:
         """Verify volumes were restored correctly.
         
         Args:
@@ -375,7 +375,7 @@ class ServerImportOrchestrator:
         if not build:
             return True
         
-        log_info("Rebuilding Docker images for branch: {branch_name}")
+        log_info(f"Rebuilding Docker images for branch: {branch_name}")
         
         # Clear BuildKit cache
         log_info("Clearing Docker BuildKit cache...")
@@ -460,7 +460,7 @@ class ServerImportOrchestrator:
             log_error(f"Failed to start services: {result.stderr}")
             return False
     
-    def _verify_containers(self, branch_name: str) -> Dict[str, any]:
+    def _verify_containers(self, branch_name: str) -> Dict[str, Any]:
         """Verify containers are running.
         
         Args:
@@ -505,7 +505,7 @@ class ServerImportOrchestrator:
     
     def import_and_start(self, package_path: str, branch_name: str,
                         domain: Optional[str] = None, ip: Optional[str] = None,
-                        build: bool = False, debug: bool = False, start: bool = True) -> Dict[str, any]:
+                        build: bool = False, debug: bool = False, start: bool = True) -> Dict[str, Any]:
         """Import package and optionally start services.
         
         Args:

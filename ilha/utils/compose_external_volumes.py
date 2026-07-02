@@ -36,6 +36,31 @@ def expand_compose_vars(template: str, env: MutableMapping[str, str]) -> str:
     return result
 
 
+def load_compose(compose_path: Path, env: MutableMapping[str, str]) -> Dict[str, Any]:
+    """Read *compose_path*, expand ``${VAR}`` refs from *env*, and parse the YAML.
+
+    Single source of truth for the read → per-line ``expand_compose_vars`` →
+    ``yaml.safe_load`` sequence that was copy-pasted across
+    ``list_external_volume_host_names``, ``_load_compose_service`` and
+    ``compose_web_image_reference``. Returns ``{}`` on a missing/unreadable file
+    or a YAML/import error, so callers can treat the result as an ordinary dict.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    try:
+        raw_text = compose_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    expanded = "\n".join(expand_compose_vars(line, env) for line in raw_text.splitlines())
+    try:
+        data = yaml.safe_load(expanded)
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 @dataclass(frozen=True)
 class NamedVolume:
     """A named volume declared in a project's compose ``volumes:`` block.
@@ -174,16 +199,7 @@ def list_external_volume_host_names(
 
     Expands ``${COMPOSE_PROJECT_NAME}`` (and similar) using *env* before reading YAML.
     """
-    try:
-        import yaml
-    except ImportError:
-        return []
-
-    raw_text = compose_path.read_text(encoding="utf-8")
-    expanded_lines: List[str] = []
-    for line in raw_text.splitlines():
-        expanded_lines.append(expand_compose_vars(line, env))
-    data: Dict[str, Any] = yaml.safe_load("\n".join(expanded_lines)) or {}
+    data = load_compose(compose_path, env)
     volumes = data.get("volumes") or {}
     out: List[str] = []
     for key, spec in volumes.items():
@@ -206,16 +222,7 @@ def _load_compose_service(
     compose_path: Path, env: Dict[str, str], service: str
 ) -> Dict[str, Any]:
     """Return the (possibly empty) service mapping for *service* in *compose_path*."""
-    try:
-        import yaml
-    except ImportError:
-        return {}
-    try:
-        raw_text = compose_path.read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    expanded = "\n".join(expand_compose_vars(line, env) for line in raw_text.splitlines())
-    data: Dict[str, Any] = yaml.safe_load(expanded) or {}
+    data = load_compose(compose_path, env)
     services = data.get("services") or {}
     svc = services.get(service)
     return svc if isinstance(svc, dict) else {}
@@ -232,18 +239,7 @@ def compose_web_image_reference(
     to ``{COMPOSE_PROJECT_NAME}_{service}`` with tag ``latest`` on the Docker host.
     Returns ``""`` when the service is missing from the compose file.
     """
-    try:
-        import yaml  # noqa: F401 — surfaced via _load_compose_service
-    except ImportError:
-        return ""
-
-    try:
-        raw_text = compose_path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    import yaml as _yaml
-    expanded = "\n".join(expand_compose_vars(line, env) for line in raw_text.splitlines())
-    data: Dict[str, Any] = _yaml.safe_load(expanded) or {}
+    data = load_compose(compose_path, env)
     services = data.get("services") or {}
     if web_service not in services:
         return ""

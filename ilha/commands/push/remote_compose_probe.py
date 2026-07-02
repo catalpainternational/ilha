@@ -1,5 +1,5 @@
 """
-Remote Compose discovery for slim deploy and doctor.
+Remote Compose discovery for slim deploy.
 
 ``docker compose config --services`` alone is fragile: it can exit non-zero
 (interpolation errors, warnings treated as errors on some versions, profiles)
@@ -13,13 +13,15 @@ import re
 import shlex
 from typing import Callable, Tuple
 
+from ...utils.compose_yaml import compose_flags_str
+
 RunRemote = Callable[[str, str, str, int], Tuple[int, str, str]]
 
 _SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
 # Compose flags shared with slim_deploy_manager: every remote `docker compose`
 # call passes both the user's compose (base) and ilha's overlay.
-_COMPOSE_FLAGS = "-f docker-compose.yml -f docker-compose.overlay.yml"
+_COMPOSE_FLAGS = compose_flags_str()
 
 
 def assert_safe_compose_service_name(name: str) -> str:

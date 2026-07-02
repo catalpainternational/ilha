@@ -161,7 +161,7 @@ class TestValidation:
         mock_run.return_value = Mock(stdout="Up 2 hours", returncode=0)
         assert validate_container_running("test-container") == True
         mock_run.assert_called_once_with(
-            ["docker", "ps", "--filter", "name=test-container", "--format", "{{.Status}}"],
+            ["docker", "ps", "--filter", "name=^/test-container$", "--format", "{{.Status}}"],
             capture_output=True, text=True, check=True
         )
     

@@ -48,14 +48,19 @@ class TransferManager:
                 package_size_mb = package_path.stat().st_size / 1024 / 1024
                 log_info(f"Transferring {package_size_mb:.2f} MB package (this may take a while)...")
                 
-                # rsync with compression, progress, and partial transfer support
+                # rsync with compression, progress, and partial transfer support.
+                # Route the ssh transport through the connection manager so rsync
+                # reuses the ControlPath master connection and honours the same
+                # host-key policy as every other SSH call (rather than hand-rolling
+                # a separate accept-new ssh string).
+                rsync_ssh = self.ssh.get_rsync_ssh_command(scp_target.username, scp_target.server)
                 cmd = [
                     "rsync",
                     "-avz",  # archive, verbose, compress
                     "--progress",  # show progress
                     "--partial",  # keep partial transfers
                     "--inplace",  # update in-place for faster completion
-                    "-e", "ssh -o StrictHostKeyChecking=accept-new",  # Auto-accept new host keys
+                    "-e", rsync_ssh,
                     str(package_path),
                     remote_file_path
                 ]
@@ -162,7 +167,7 @@ class TransferManager:
                 cmd = self.ssh.build_ssh_command(
                     target.username,
                     target.server,
-                    f"mkdir -p {remote_dir}",
+                    f"mkdir -p {shlex.quote(remote_dir)}",
                     use_control_master=True
                 )
                 
@@ -272,10 +277,14 @@ class TransferManager:
             # Add SSH host key before connection
             add_ssh_host_key(target.server)
             
+            # build_ssh_command already wraps the command in `bash -lc <quoted>`;
+            # a second nested bash -lc with an unquoted path was a shell-injection
+            # vector. Quote the path and let the single outer shell handle it.
+            quoted_path = shlex.quote(remote_file_path)
             cmd = self.ssh.build_ssh_command(
                 target.username,
                 target.server,
-                f"bash -lc 'test -f {remote_file_path} && echo EXISTS || echo NOT_FOUND'",
+                f"test -f {quoted_path} && echo EXISTS || echo NOT_FOUND",
                 use_control_master=True
             )
             

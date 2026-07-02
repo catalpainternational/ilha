@@ -54,39 +54,6 @@ def test_droplet_put_json_includes_safeguard_report(monkeypatch, runner):
     assert payload["data"]["smoke_checks"]["success"] is True
 
 
-def test_droplet_doctor_json_reports_checks(monkeypatch, runner):
-    class FakeDeployManager:
-        def doctor(self, **kwargs):
-            return {
-                "branch": kwargs["branch_name"],
-                "target": kwargs["scp_target"],
-                "smoke_path": "/api/health/",
-                "checks": [
-                    {"title": "docker_compose_ps", "success": True, "stdout": "ok", "stderr": ""},
-                ],
-                "success": True,
-            }
-
-        def cleanup(self):
-            pass
-
-    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
-    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
-    monkeypatch.setattr(
-        "ilha.cli_commands.droplets.resolve_existing_remote_target",
-        lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
-    )
-    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
-
-    result = runner.invoke(cli, ["droplet", "doctor", "demo", "--json"])
-    assert result.exit_code == 0, result.output
-    payload = _extract_json(result.output)
-    assert payload["success"] is True
-    assert payload["data"]["branch"] == "demo"
-    assert payload["data"]["smoke_path"] == "/api/health/"
-    assert payload["data"]["checks"][0]["title"] == "docker_compose_ps"
-
-
 def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
     deploy_kwargs = {}
 

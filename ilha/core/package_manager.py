@@ -6,6 +6,7 @@ to enable sharing complete isolated development environments between team member
 """
 
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -20,12 +21,9 @@ from ..core.docker_manager import DockerManager
 from ..core.git_manager import GitManager
 from ..core.environment_manager import EnvironmentManager
 from ..core.worktree_orchestrator import WorktreeOrchestrator
-from ..core.droplet_manager import DropletInfo
 from ..utils.logging import log_info, log_success, log_warning, log_error
 from ..utils.checksum import calculate_file_checksum, verify_file_checksum
 from ..utils.confirmation import confirm_use_existing_worktree
-from ..utils.container_selector import resolve_service_dependencies
-from ..core.worker_configurator import WorkerConfigurator
 
 
 class PackageManager:
@@ -42,7 +40,6 @@ class PackageManager:
         self.git_manager = GitManager(project_root=self.project_root, validate=False)
         self.env_manager = EnvironmentManager(project_root=self.project_root)
         self.orchestrator = WorktreeOrchestrator(project_root=self.project_root)
-        self._worker_config = WorkerConfigurator()
     
     def _apply_domain_or_ip_override(self, worktree_path: Path, domain: Optional[str], 
                                       ip: Optional[str], debug: bool = False,
@@ -122,24 +119,18 @@ class PackageManager:
         
         return True
     
-    def export_package(self, branch_name: str, output_dir: Path, 
-                      include_code: bool = False, compressed: bool = True, skip_volumes: bool = False,
-                      container_filter: Optional[List[Dict[str, str]]] = None,
-                      exclude_deps: Optional[List[str]] = None,
-                      droplet_info: Optional[DropletInfo] = None,
-                      central_droplet_info: Optional[DropletInfo] = None) -> Dict[str, Any]:
+    def export_package(self, branch_name: str, output_dir: Path,
+                      include_code: bool = False, compressed: bool = True,
+                      skip_volumes: bool = False) -> Dict[str, Any]:
         """Export worktree to package - orchestrates existing managers.
-        
+
         Args:
             branch_name: Name of the branch to export
             output_dir: Directory to save the package
             include_code: Whether to include project tar archive
             compressed: Whether to compress the final package
             skip_volumes: Whether to skip volume backup (fallback option)
-            container_filter: Optional list of dicts with 'worktree' and 'container' keys
-                             to filter which containers/volumes to export
-            exclude_deps: Optional list of service names to exclude from dependency resolution
-            
+
         Returns:
             Dictionary with success status, package path, and metadata
         """
@@ -170,47 +161,15 @@ class PackageManager:
             # 4. Backup volumes using existing DockerManager (unless skipped)
             backup_file = None
             if not skip_volumes:
-                volumes_backup_path = temp_package_dir / "volumes" / f"backup_{branch_name}.tar"
-                volumes_backup_path.parent.mkdir(exist_ok=True)
-                
-                # If container_filter is provided, only backup volumes for selected containers
-                if container_filter:
-                    log_info(f"Backing up volumes for selected containers in {branch_name}...")
-                    # Collect volumes for all selected containers
-                    selected_volumes = set()
-                    for selection in container_filter:
-                        if selection.get('worktree') == branch_name:
-                            container_name = selection.get('container')
-                            volumes = self.docker_manager.get_volumes_for_service(branch_name, container_name)
-                            selected_volumes.update(volumes)
-                            log_info(f"  Container '{container_name}': {len(volumes)} volume(s)")
-                    
-                    if selected_volumes:
-                        log_info(f"Backing up {len(selected_volumes)} selected volume(s)...")
-                        backup_file = self._backup_selected_volumes(
-                            branch_name, 
-                            list(selected_volumes), 
-                            temp_package_dir / "volumes"
-                        )
-                        # If backup was attempted but failed, return error
-                        if not backup_file:
-                            return {
-                                "success": False,
-                                "error": "Failed to backup selected volumes"
-                            }
-                    else:
-                        log_warning("No volumes found for selected containers")
-                        backup_file = None
-                        # No volumes found is valid - continue with export
-                else:
-                    log_info(f"Backing up all volumes for {branch_name}...")
-                    backup_file = self.docker_manager.backup_volumes(branch_name, temp_package_dir / "volumes")
-                    # If backup was attempted but failed, return error
-                    if not backup_file:
-                        return {
-                            "success": False,
-                            "error": "Failed to backup volumes"
-                        }
+                (temp_package_dir / "volumes").mkdir(exist_ok=True)
+                log_info(f"Backing up all volumes for {branch_name}...")
+                backup_file = self.docker_manager.backup_volumes(branch_name, temp_package_dir / "volumes")
+                # If backup was attempted but failed, return error
+                if not backup_file:
+                    return {
+                        "success": False,
+                        "error": "Failed to backup volumes"
+                    }
             else:
                 log_warning("Skipping volume backup as requested")
             
@@ -226,11 +185,20 @@ class PackageManager:
                         "success": False,
                         "error": "Failed to create project archive"
                     }
-            
+
+            # 5b. Package environment files (.env, .ilha, compose) into
+            # environment/. import_package's _restore_environment_files reads from
+            # this directory; without it the restore silently no-ops.
+            log_info(f"Packaging environment files for {branch_name}...")
+            if not self._copy_environment_files(worktree_path, temp_package_dir):
+                return {
+                    "success": False,
+                    "error": "Failed to package environment files"
+                }
+
             # 6. Generate metadata with checksums
             metadata = self._generate_metadata(
-                branch_name, temp_package_dir, include_code, skip_volumes, container_filter,
-                exclude_deps=exclude_deps, droplet_info=droplet_info, central_droplet_info=central_droplet_info
+                branch_name, temp_package_dir, include_code, skip_volumes
             )
             
             # 7. Compress package if requested
@@ -432,11 +400,6 @@ class PackageManager:
             if not env_success:
                 log_warning("Failed to restore some environment files")
             
-            # Configure worker environment if metadata indicates worker deployment
-            if metadata.get('vpc_deployment', {}).get('is_worker'):
-                log_info("Detected worker deployment, configuring environment variables...")
-                self._worker_config.configure_worker_environment(worktree_path, metadata)
-            
             # Apply domain/ip overrides if provided (DRY: uses shared helper method)
             self._apply_domain_or_ip_override(worktree_path, domain, ip, debug=debug)
             
@@ -576,11 +539,6 @@ class PackageManager:
             # the .env is in the worktree directory, so we use relative paths
             if not self._fix_env_file_paths_for_standalone(worktree_path):
                 log_warning("Failed to fix env_file paths, docker compose may fail to find .env")
-            
-            # Configure worker environment if metadata indicates worker deployment
-            if metadata.get('vpc_deployment', {}).get('is_worker'):
-                log_info("Detected worker deployment, configuring environment variables...")
-                self._worker_config.configure_worker_environment(worktree_path, metadata)
             
             # Fix PROJECT_ROOT and build context for standalone deployment
             # The .ilha/ was extracted with source machine paths, now update for target server.
@@ -788,64 +746,34 @@ class PackageManager:
             log_error(f"Failed to create project archive: {e}")
             return False
     
-    def _copy_environment_files(self, worktree_path: Path, package_dir: Path, 
-                                container_filter: Optional[List[Dict[str, str]]] = None,
-                                exclude_deps: Optional[List[str]] = None,
-                                droplet_info: Optional[DropletInfo] = None) -> bool:
-        """Copy environment files to package directory.
-        
+    def _copy_environment_files(self, worktree_path: Path, package_dir: Path) -> bool:
+        """Copy environment files (.env, .ilha, compose) into the package.
+
         Args:
             worktree_path: Path to worktree directory
             package_dir: Path to package directory
-            container_filter: Optional list of dicts with 'worktree' and 'container' keys
-                             to filter which services to include in compose file
-            exclude_deps: Optional list of service names to exclude from dependency resolution
-            droplet_info: Optional droplet info containing private IP for VPC port bindings
         """
         try:
             env_dir = package_dir / "environment"
             env_dir.mkdir(exist_ok=True)
-            
+
             # Copy .env file
             env_file = worktree_path / ".env"
             if env_file.exists():
                 shutil.copy2(env_file, env_dir / ".env")
-            
+
             # Copy .ilha directory
             ilha_dir = worktree_path / ".ilha"
             if ilha_dir.exists():
                 shutil.copytree(ilha_dir, env_dir / ".ilha")
-            
+
             # Copy docker-compose.ilha.yml
             compose_file = worktree_path / "docker-compose.ilha.yml"
             if compose_file.exists():
                 shutil.copy2(compose_file, env_dir / "docker-compose.ilha.yml")
-            
-            # Extract private IP from droplet info if available
-            private_ip = None
-            if droplet_info:
-                private_ip = getattr(droplet_info, 'private_ip_address', None)
-            
-            # If container_filter is provided, create filtered compose file
-            if container_filter:
-                worktree_compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
-                if worktree_compose_file.exists():
-                    filtered_compose = self._worker_config.filter_compose_services(
-                        worktree_compose_file, container_filter, worktree_path, exclude_deps, private_ip
-                    )
-                    if filtered_compose:
-                        # Remove version field if it's null (Docker Compose v2 doesn't require it)
-                        from ..utils.file_utils import clean_compose_version_field
-                        clean_compose_version_field(filtered_compose)
-                        
-                        filtered_path = env_dir / ".ilha" / "docker-compose.worktree.filtered.yml"
-                        filtered_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(filtered_path, 'w') as f:
-                            yaml.dump(filtered_compose, f, default_flow_style=False, sort_keys=False)
-                        log_info(f"Created filtered compose file with {len(filtered_compose.get('services', {}))} service(s)")
-            
+
             return True
-            
+
         except Exception as e:
             log_error(f"Failed to copy environment files: {e}")
             return False
@@ -878,7 +806,6 @@ class PackageManager:
                 preserve_compose = False
                 if preserve_domain_settings and existing_compose_file.exists():
                     try:
-                        import yaml
                         with open(existing_compose_file) as f:
                             existing_data = yaml.safe_load(f) or {}
                         # Check if compose file has domain/IP in labels (not localhost)
@@ -958,118 +885,8 @@ class PackageManager:
             log_error(f"Failed to restore environment files: {e}")
             return False
     
-    def _backup_selected_volumes(self, branch_name: str, volume_names: List[str], backup_dir: Path) -> Optional[Path]:
-        """Backup only selected volumes to a tar file.
-        
-        Args:
-            branch_name: Branch name for the worktree
-            volume_names: List of volume names to backup
-            backup_dir: Directory to save the backup
-            
-        Returns:
-            Path to backup file if successful, None otherwise
-        """
-        import tempfile
-        backup_file = backup_dir / f"backup_{branch_name}.tar"
-        
-        log_info(f"Backing up {len(volume_names)} selected volume(s) for {branch_name} to {backup_file}")
-        
-        # Check if worktree is running before backup
-        was_running = self.docker_manager._is_worktree_running(branch_name)
-        if was_running:
-            log_info(f"Worktree containers are running, stopping them safely before backup...")
-            from ..core.worktree_orchestrator import WorktreeOrchestrator
-            orchestrator = WorktreeOrchestrator(project_root=self.project_root)
-            stop_result = orchestrator.stop_worktree(branch_name)
-            if not stop_result.get("success"):
-                log_warning("Failed to stop containers, but continuing with backup")
-            else:
-                log_success("Containers stopped successfully")
-        
-        # Create backup directory
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        temp_backup_dir = backup_dir / "temp_backup"
-        temp_backup_dir.mkdir(exist_ok=True)
-        
-        try:
-            from ..utils.validation import validate_volume_exists
-            
-            # Backup each selected volume
-            for volume_name in volume_names:
-                if not validate_volume_exists(volume_name):
-                    log_warning(f"Volume {volume_name} not found, skipping")
-                    continue
-                
-                log_info(f"Backing up volume: {volume_name}")
-                
-                # Use file-level backup
-                volume_backup = temp_backup_dir / f"{volume_name}.tar.gz"
-                
-                try:
-                    subprocess.run([
-                        "docker", "run", "--rm",
-                        "-v", f"{volume_name}:/data",
-                        "-v", f"{temp_backup_dir.absolute()}:/backup",
-                        "alpine", "tar", "czf", f"/backup/{volume_name}.tar.gz", "-C", "/data", "."
-                    ], check=True, capture_output=True, text=True)
-                    log_success(f"Volume backup created: {volume_name}.tar.gz")
-                except subprocess.CalledProcessError as e:
-                    log_error(f"Failed to backup volume {volume_name}: {e}")
-                    if e.stderr:
-                        log_error(f"Error details: {e.stderr}")
-                    continue
-            
-            # Create combined backup
-            subprocess.run([
-                "tar", "czf", str(backup_file), "-C", str(temp_backup_dir), "."
-            ], check=True, capture_output=True)
-            
-            # Cleanup temp directory
-            shutil.rmtree(temp_backup_dir)
-            
-            log_success(f"Backup created: {backup_file}")
-            
-            # Restart containers if they were running before
-            if was_running:
-                log_info("Restarting worktree containers in background...")
-                from ..core.worktree_orchestrator import WorktreeOrchestrator
-                orchestrator = WorktreeOrchestrator(project_root=self.project_root)
-                import threading
-                
-                def start_in_background():
-                    start_result = orchestrator.start_worktree(branch_name)
-                    if start_result.get("success"):
-                        log_success("Containers restarted successfully")
-                    else:
-                        log_warning(f"Failed to restart containers: {start_result.get('error', 'Unknown error')}")
-                
-                thread = threading.Thread(target=start_in_background, daemon=True)
-                thread.start()
-            
-            return backup_file
-            
-        except subprocess.CalledProcessError as e:
-            log_error(f"Failed to create backup: {e}")
-            # Cleanup temp directory
-            if temp_backup_dir.exists():
-                shutil.rmtree(temp_backup_dir)
-            
-            # Try to restart containers if they were running
-            if was_running:
-                log_info("Attempting to restart containers after backup failure...")
-                try:
-                    from ..core.worktree_orchestrator import WorktreeOrchestrator
-                    orchestrator = WorktreeOrchestrator(project_root=self.project_root)
-                    orchestrator.start_worktree(branch_name)
-                except Exception as restart_error:
-                    log_error(f"Failed to restart containers: {restart_error}")
-            
-            return None
-    
-    def _generate_metadata(self, branch_name: str, package_dir: Path, include_code: bool, 
-                          skip_volumes: bool = False, container_filter: Optional[List[Dict[str, str]]] = None,
-                          exclude_deps: Optional[List[str]] = None, droplet_info: Optional[DropletInfo] = None,
-                          central_droplet_info: Optional[DropletInfo] = None) -> Dict[str, Any]:
+    def _generate_metadata(self, branch_name: str, package_dir: Path, include_code: bool,
+                          skip_volumes: bool = False) -> Dict[str, Any]:
         """Generate package metadata with checksums."""
         metadata = {
             "package_version": "1.0",
@@ -1079,45 +896,9 @@ class PackageManager:
             "project_name": get_project_name(),
             "include_code": include_code,
             "skip_volumes": skip_volumes,
-            "container_filter": container_filter if container_filter else None,
             "checksums": {}
         }
-        
-        # Add VPC deployment metadata if relevant
-        # Only include when: droplet has VPC info OR exclude_deps is used (indicates worker deployment)
-        vpc_deployment = None
-        
-        # Get central server private IP from central_droplet_info if available
-        central_server_private_ip = None
-        if central_droplet_info:
-            central_server_private_ip = getattr(central_droplet_info, 'private_ip_address', None)
-        
-        if droplet_info:
-            # Check if droplet has VPC information
-            private_ip = getattr(droplet_info, 'private_ip_address', None)
-            vpc_uuid = getattr(droplet_info, 'vpc_uuid', None)
-            
-            if private_ip or vpc_uuid or exclude_deps:
-                vpc_deployment = {
-                    "is_worker": bool(exclude_deps),
-                    "excluded_services": exclude_deps if exclude_deps else [],
-                    "central_server_private_ip": central_server_private_ip,  # Populated from central_droplet_info
-                    "vpc_uuid": vpc_uuid,
-                    "private_ip_address": private_ip
-                }
-        elif exclude_deps:
-            # Worker deployment without droplet info (e.g., manual export)
-            vpc_deployment = {
-                "is_worker": True,
-                "excluded_services": exclude_deps,
-                "central_server_private_ip": central_server_private_ip,  # Populated from central_droplet_info
-                "vpc_uuid": None,
-                "private_ip_address": None
-            }
-        
-        if vpc_deployment:
-            metadata["vpc_deployment"] = vpc_deployment
-        
+
         # Calculate checksums for all files
         for file_path in package_dir.rglob('*'):
             if file_path.is_file():
@@ -1176,8 +957,6 @@ class PackageManager:
         Returns:
             True if git was initialized successfully, False otherwise
         """
-        import subprocess
-        
         try:
             # Find and remove invalid .git files (worktree references)
             # These are small files containing "gitdir: /path/to/original/.git/worktrees/..."
@@ -1342,8 +1121,7 @@ class PackageManager:
         Returns:
             True if paths were fixed successfully, False otherwise
         """
-        import yaml
-        
+
         try:
             compose_file = worktree_path / ".ilha" / "docker-compose.overlay.yml"
             if not compose_file.exists():

@@ -22,21 +22,23 @@ import tempfile
 import time
 import uuid
 import fnmatch
-import random
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, Optional, List, Tuple, Dict, Any, Set
 
 from ...config.settings import get_script_dir, get_worktree_dir
+from ...exceptions import VolumeBackupError
 from ...core.dns_manager import DNSManager, parse_domain, is_domain
 from ...core.droplet_manager import DropletInfo
 from ...core.environment_manager import EnvironmentManager
-from ...utils.checksum import calculate_file_checksum
 from ...utils.compose_external_volumes import (
     compose_service_is_buildable,
     compose_web_image_reference,
     list_external_volume_host_names,
 )
+from ...utils.compose_yaml import compose_flags_str
 from ...utils.caddy_config import ensure_caddy_labels_and_network
 from ...utils.env_loader import load_env_file
 from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
@@ -54,7 +56,6 @@ from ...utils.logging import (
 from ...utils.ssh_manager import SSHConnectionManager, SCPTarget
 from ...utils.streaming import execute_with_streaming
 from ...utils.validation import validate_branch_name
-from .deploy_doctor import DeployDoctor
 from .deploy_preflight import DeployPreflight
 from .deploy_service_config import DeployServiceConfig, load_deploy_service_config
 from ...scripts.http_probe import build_probe_shell_chain, normalize_path as _normalize_http_path
@@ -73,7 +74,7 @@ class SlimDeployManager:
 
     # Compose flags for every remote `docker compose` invocation: ship both the
     # user's compose (base) and ilha's overlay so server merges them at runtime.
-    COMPOSE_FLAGS = "-f docker-compose.yml -f docker-compose.overlay.yml"
+    COMPOSE_FLAGS = compose_flags_str()
 
     # Timeouts (seconds) for parallel futures
     _FUTURE_TIMEOUTS = {
@@ -142,9 +143,8 @@ class SlimDeployManager:
         self.ssh = SSHConnectionManager()
         self.transfer = TransferManager()
         self.disk = RemoteDiskManager(self.ssh, self.REMOTE_APP_ROOT)
-        self.doctor_mgr = DeployDoctor(self.ssh, self.REMOTE_APP_ROOT)
-        self.preflight = DeployPreflight(self.project_root)
         self.services = load_deploy_service_config(self.project_root)
+        self.preflight = DeployPreflight(self.project_root)
         self._session_id = uuid.uuid4().hex[:8]
         self._tracker: Optional[StageTracker] = None
         self._last_report: Dict[str, Any] = {
@@ -304,9 +304,23 @@ class SlimDeployManager:
             return True
         script = r"""set -euo pipefail
 cd /app
-set -a
-[ -f .env ] && source .env
-set +a
+# Read only the Postgres vars this script needs WITHOUT `source`-ing .env.
+# Sourcing evaluates the file, so a value containing $(...) or `...` (e.g. from
+# a restored volume or a compose default) would execute as a command. Capturing
+# a value via $(...) assigns it literally and never re-evaluates its contents.
+_read_env() {
+  [ -f .env ] || return 0
+  line=$(grep -E "^$1=" .env | tail -n1) || return 0
+  val=${line#*=}
+  case "$val" in
+    \"*\") val=${val#\"}; val=${val%\"} ;;
+    \'*\') val=${val#\'}; val=${val%\'} ;;
+  esac
+  printf '%s' "$val"
+}
+POSTGRES_USER=$(_read_env POSTGRES_USER)
+POSTGRES_PASSWORD=$(_read_env POSTGRES_PASSWORD)
+POSTGRES_DB=$(_read_env POSTGRES_DB)
 docker compose --env-file .env __COMPOSE_FLAGS__ up -d db
 for i in $(seq 1 90); do
   if docker compose --env-file .env __COMPOSE_FLAGS__ exec -T db pg_isready -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
@@ -349,13 +363,6 @@ echo OK
             failure_category="remote_data_error",
         )
         return False
-
-    @staticmethod
-    def _safe_int(value: str, default: int = 0) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
 
     def _load_deployignore_patterns(
         self,
@@ -434,13 +441,7 @@ echo OK
         command: List[str],
         timeout: int = 30,
     ) -> Tuple[int, str, str]:
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-            return result.returncode, result.stdout or "", result.stderr or ""
-        except subprocess.TimeoutExpired:
-            return 1, "", f"Local command timed out after {timeout}s"
-        except Exception as exc:
-            return 1, "", str(exc)
+        return self.ssh.run_local_text(command, timeout=timeout)
 
     def _run_deploy_preflight(
         self,
@@ -887,52 +888,6 @@ echo OK
             )
         return f"curl -fsS --max-time 5 {shlex.quote(url)}{tail}"
 
-    def _doctor_collect_command(
-        self,
-        title: str,
-        command: str,
-        *,
-        username: str,
-        server: str,
-        local: bool = False,
-        timeout: int = 30,
-    ) -> Dict[str, Any]:
-        if local:
-            code, stdout, stderr = self._run_local_text(["zsh", "-lc", command], timeout=timeout)
-        else:
-            code, stdout, stderr = self._run_remote_text(username, server, command, timeout=timeout)
-        return {
-            "title": title,
-            "command": command,
-            "success": code == 0,
-            "stdout": stdout.strip(),
-            "stderr": stderr.strip(),
-        }
-
-    def doctor(
-        self,
-        *,
-        branch_name: str,
-        scp_target: str,
-        domain: Optional[str] = None,
-        ip: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        target = SCPTarget(scp_target)
-        preflight = self._run_deploy_preflight(branch_name)
-        smoke_path = preflight["smoke_path"] if preflight else "/"
-
-        report = self.doctor_mgr.doctor(
-            username=target.username,
-            server=target.server,
-            smoke_path=smoke_path,
-            source_manifest=self._last_report.get("source_manifest"),
-            drift_report=self._last_report.get("drift_report"),
-            domain=domain,
-        )
-        report["branch"] = branch_name
-        report["target"] = scp_target
-        return report
-
     # ──────────────────────────────────────────────────────────────────
     # Public entry point
     # ──────────────────────────────────────────────────────────────────
@@ -1173,7 +1128,23 @@ echo OK
             volume_tar = None
             if restore_volumes and not skip_volume_backup:
                 log_step("Backing up volumes")
-                volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+                try:
+                    volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+                except VolumeBackupError as exc:
+                    # A requested restore cannot proceed safely without a backup;
+                    # aborting here prevents the app coming up on a fresh/empty DB.
+                    log_error(str(exc))
+                    self._set_failure(
+                        error_code="volume_backup_error",
+                        stage="volume_backup",
+                        root_cause=str(exc),
+                        suggested_actions=[
+                            "Re-run with --skip-volume-backup only if you intend "
+                            "to start from existing remote volumes.",
+                            "Check Docker is running and the named volumes exist locally.",
+                        ],
+                    )
+                    return False
                 if volume_tar:
                     self._last_report["volume_backup_path"] = str(volume_tar)
             elif restore_volumes and skip_volume_backup:
@@ -1366,7 +1337,7 @@ echo OK
                     stage="smoke_checks",
                     root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
-                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote `docker compose ps` and service logs on this target.",
                         "Inspect remote compose ps output and service logs.",
                     ],
                     failure_category="remote_runtime_error",
@@ -1509,6 +1480,15 @@ echo OK
                     self._last_report["success"] = True
                     log_success("Slim put (db-only) completed successfully!")
                     return True
+                except VolumeBackupError as exc:
+                    log_error(str(exc))
+                    self._set_failure(
+                        error_code="volume_backup_error",
+                        stage="volume_backup",
+                        root_cause=str(exc),
+                        suggested_actions=["Check Docker is running and the named volumes exist locally."],
+                    )
+                    return False
                 finally:
                     _cleanup_deploy_dir(deploy_dir)
 
@@ -1564,7 +1544,7 @@ echo OK
                     stage="smoke_checks",
                     root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
-                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote `docker compose ps` and service logs on this target.",
                         "Inspect remote compose ps output and service logs.",
                     ],
                     failure_category="remote_runtime_error",
@@ -1595,7 +1575,19 @@ echo OK
                 render_deploy_report(self._last_report)
                 return False
             log_step("Backing up volumes")
-            volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+            try:
+                volume_tar = self._backup_volumes_locally(branch_name, deploy_dir)
+            except VolumeBackupError as exc:
+                log_error(str(exc))
+                self._set_failure(
+                    error_code="volume_backup_error",
+                    stage="volume_backup",
+                    root_cause=str(exc),
+                    suggested_actions=["Check Docker is running and the named volumes exist locally."],
+                )
+                _cleanup_deploy_dir(deploy_dir)
+                render_deploy_report(self._last_report)
+                return False
             log_step("Syncing to server")
             self.ssh.ensure_host_key(server)
             if not self._rsync_to_server(deploy_dir, username, server):
@@ -1656,7 +1648,7 @@ echo OK
                     stage="smoke_checks",
                     root_cause=self._describe_smoke_failure(smoke_report),
                     suggested_actions=[
-                        "Run `ilha droplet doctor` for this target.",
+                        "Inspect remote `docker compose ps` and service logs on this target.",
                         "Inspect remote compose ps output and service logs.",
                     ],
                     failure_category="remote_runtime_error",
@@ -2194,36 +2186,78 @@ echo OK
         if footprint.has_postgres and (
             "DATABASE_URL" not in merged or not merged["DATABASE_URL"]
         ):
-            user = merged.get("POSTGRES_USER", "biuser")
-            password = merged.get("POSTGRES_PASSWORD", "bipassword")
-            db = merged.get("POSTGRES_DB", "business_intelligence")
-            merged["DATABASE_URL"] = f"postgres://{user}:{password}@db:5432/{db}"
-            if password == "bipassword":
+            # Host is the configured db service name (compose network hostname),
+            # not a hardcoded ``db`` — a project whose service is e.g. ``postgres``
+            # would otherwise get an unreachable DATABASE_URL. Credentials come
+            # from the project's own POSTGRES_* (pulled from compose defaults in
+            # Layer 2.5); no project-specific literals are baked in.
+            db_host = self.services.db_service or "db"
+            user = merged.get("POSTGRES_USER", "postgres")
+            password = merged.get("POSTGRES_PASSWORD", "")
+            db = merged.get("POSTGRES_DB", user)
+            merged["DATABASE_URL"] = f"postgres://{user}:{password}@{db_host}:5432/{db}"
+            if not password:
                 log_warning(
-                    "DATABASE_URL synthesized with default password 'bipassword'. "
+                    "DATABASE_URL synthesized without a POSTGRES_PASSWORD. "
                     "Set POSTGRES_PASSWORD in your .env for production."
                 )
 
-        # ── Write top-level .env (used by ``docker compose --env-file`` and sourced by scripts) ──
-        # Quote values so shell `source .env` does not treat space-separated parts as commands
+        # ── Strip deploy-only / provider control-plane secrets ──
+        # The DigitalOcean API token grants full account control (create/destroy
+        # droplets, edit DNS). It legitimately lives in the operator's project
+        # .env for DNS/droplet commands, but must NEVER be shipped to a workload
+        # server: an app RCE or any local read there would escalate to full
+        # cloud-account takeover. Keep such secrets on the operator machine / CI.
+        DEPLOY_ONLY_SECRETS = {
+            "DIGITALOCEAN_API_TOKEN",
+            "DIGITALOCEAN_TOKEN",
+            "DO_API_TOKEN",
+            "DO_TOKEN",
+        }
+        stripped = [k for k in list(merged) if k in DEPLOY_ONLY_SECRETS]
+        for k in stripped:
+            merged.pop(k, None)
+        if stripped:
+            log_info(f"Stripped deploy-only secret(s) from server .env: {', '.join(stripped)}")
+
+        # Warn if the environment still carries the publicly-known insecure
+        # SECRET_KEY (legacy worktrees created before per-env key generation).
+        from ...config.settings import INSECURE_DEFAULT_SECRET_KEY
+        if merged.get("DJANGO_SECRET_KEY") == INSECURE_DEFAULT_SECRET_KEY:
+            log_warning(
+                "DJANGO_SECRET_KEY is the insecure shared default — anyone can forge "
+                "sessions/CSRF tokens. Set a unique DJANGO_SECRET_KEY in this "
+                "worktree's .env before deploying to production."
+            )
+
+        # ── Write top-level .env (used by ``docker compose --env-file``) ──
+        # Quote values for the env-file format.
         def _env_line(key: str, value: str) -> str:
             safe = str(value).replace("\\", "\\\\").replace('"', '\\"')
             return f'{key}="{safe}"'
 
+        payload = "\n".join(_env_line(k, v) for k, v in merged.items()) + "\n"
+
+        # Secret-bearing files must not be world-readable. write_text() honours
+        # umask (typically 0644) and rsync -a preserves the mode onto the server,
+        # so tighten to 0600 (owner-only) on every copy.
+        def _write_secret_file(path: Path, content: str) -> None:
+            path.write_text(content)
+            path.chmod(0o600)
+
         env_path = deploy_dir / ".env"
-        lines = [_env_line(k, v) for k, v in merged.items()]
-        env_path.write_text("\n".join(lines) + "\n")
+        _write_secret_file(env_path, payload)
         log_info(f"Merged .env written ({len(merged)} vars)")
 
         # ── Also write .env inside code/ (referenced by compose env_file) ──
         code_env = deploy_dir / "code" / ".env"
-        code_env.write_text("\n".join(lines) + "\n")
+        _write_secret_file(code_env, payload)
 
         # ── Update the env.ilha inside code/.ilha/ (loaded *second* by compose,
         #    so it must not revert production overrides to localhost defaults) ──
         code_env_ilha = deploy_dir / "code" / ".ilha" / "env.ilha"
         if code_env_ilha.exists():
-            code_env_ilha.write_text("\n".join(lines) + "\n")
+            _write_secret_file(code_env_ilha, payload)
             log_info("Updated code/.ilha/env.ilha with production overrides")
 
     # ──────────────────────────────────────────────────────────────────
@@ -2360,11 +2394,18 @@ echo OK
                 self._last_backup_volume_names = list(existing.values())
                 return backup_path
             else:
-                log_warning("Volume backup returned no data")
-                return None
+                # We KNOW there are volumes present on the host (``existing`` is
+                # non-empty), so a null/absent archive here is a real failure,
+                # not "nothing to back up". Raise so the caller aborts instead
+                # of restoring nothing and booting on a fresh/empty volume.
+                raise VolumeBackupError(
+                    "Volume backup produced no archive for volumes present on host: "
+                    f"{', '.join(existing.values())}"
+                )
+        except VolumeBackupError:
+            raise
         except Exception as exc:
-            log_warning(f"Volume backup failed: {exc}")
-            return None
+            raise VolumeBackupError(f"Volume backup failed: {exc}") from exc
 
     def services_resolved_compose_project_name(self, branch_name: str) -> str:
         """Return the effective ``COMPOSE_PROJECT_NAME`` for this deploy.
@@ -2629,14 +2670,7 @@ echo "Volume restore complete"
         command: str,
         timeout: int = 30,
     ) -> Tuple[int, str, str]:
-        ssh_cmd = self.ssh.build_ssh_command(username, server, command)
-        try:
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-            return result.returncode, result.stdout or "", result.stderr or ""
-        except subprocess.TimeoutExpired:
-            return 1, "", f"Remote command timed out after {timeout}s"
-        except Exception as exc:
-            return 1, "", str(exc)
+        return self.ssh.run_remote_text(username, server, command, timeout=timeout)
 
     # ──────────────────────────────────────────────────────────────────
     # Internal: rsync
@@ -2644,7 +2678,15 @@ echo "Volume restore complete"
     def _rsync_streaming_once(
         self, cmd: List[str]
     ) -> Tuple[bool, int, List[str]]:
-        """Run rsync with progress streaming. Returns (timed_out, returncode, out_lines)."""
+        """Run rsync with progress streaming. Returns (timed_out, returncode, out_lines).
+
+        Output is drained on a background reader thread and consumed through a
+        queue with a bounded ``get(timeout=…)``. This enforces the wall-clock
+        deadline even when rsync produces NO output at all — a blocking
+        ``readline()`` loop would sit inside readline forever on a stalled
+        SSH/TCP connection and never re-check the deadline (the exact hang this
+        watchdog exists to prevent).
+        """
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -2655,36 +2697,50 @@ echo "Volume restore complete"
             bufsize=1,
         )
         out_lines: List[str] = []
+        line_q: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _drain(stream, q: "queue.Queue") -> None:
+            try:
+                for raw in iter(stream.readline, ""):
+                    q.put(raw)
+            finally:
+                q.put(None)  # sentinel: stdout closed / EOF
+
+        assert process.stdout is not None
+        reader = threading.Thread(target=_drain, args=(process.stdout, line_q), daemon=True)
+        reader.start()
+
         deadline = time.time() + self._RSYNC_MAX_WAIT_SEC
         timed_out = False
-        try:
-            assert process.stdout is not None
-            for line in iter(process.stdout.readline, ""):
-                if time.time() > deadline:
-                    timed_out = True
-                    break
-                line = line.rstrip()
-                out_lines.append(line)
-                if "%" in line or "speedup" in line.lower():
-                    log_info(f"  {line}")
-        finally:
-            if timed_out or time.time() > deadline:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 timed_out = True
-                process.kill()
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    pass
-            else:
-                try:
-                    process.wait(timeout=max(1, deadline - time.time()))
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    process.kill()
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        pass
+                break
+            try:
+                raw = line_q.get(timeout=min(remaining, 5.0))
+            except queue.Empty:
+                # No output this slice — loop and re-check the wall-clock
+                # deadline. This is what lets a silent stall time out.
+                continue
+            if raw is None:
+                break  # EOF
+            line = raw.rstrip()
+            out_lines.append(line)
+            if "%" in line or "speedup" in line.lower():
+                log_info(f"  {line}")
+
+        if timed_out:
+            process.kill()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
         return timed_out, int(process.returncode or 0), out_lines
 
     def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
@@ -3018,11 +3074,9 @@ echo "Caddy proxy started"
 set -euo pipefail
 cd {self.REMOTE_APP_ROOT}
 
-# Load env vars
-set -a
-[ -f .env ] && source .env
-set +a
-
+# NOTE: intentionally do NOT `source .env` here — `docker compose --env-file`
+# performs variable interpolation from the file directly, and sourcing an
+# untrusted .env would execute $(...) / `...` embedded in a value.
 docker compose --env-file .env {self.COMPOSE_FLAGS} build 2>&1
 echo "Build complete"
 """

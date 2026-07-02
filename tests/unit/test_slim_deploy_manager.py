@@ -413,39 +413,6 @@ def test_run_smoke_checks_marks_web_container_probe_when_web_service_exists(tmp_
     assert report["checks"][0]["probe"] == "web_container"
 
 
-def test_doctor_skips_missing_worker_service(tmp_path: Path, monkeypatch):
-    mgr = SlimDeployManager(project_root=tmp_path)
-    monkeypatch.setattr(
-        mgr,
-        "_run_deploy_preflight",
-        lambda _branch: {
-            "smoke_path": "/api/health/",
-            "manifest": {"branch_name": "demo"},
-            "drift_report": {"status": "ok", "differences": []},
-        },
-    )
-    mgr._last_report["source_manifest"] = {"branch_name": "demo", "source_path": "/tmp/demo"}
-    mgr._last_report["drift_report"] = {"status": "ok", "differences": []}
-    monkeypatch.setattr(mgr.doctor_mgr, "_remote_service_exists", lambda _u, _s, service: service == "web")
-    monkeypatch.setattr(
-        mgr.doctor_mgr,
-        "_doctor_collect_command",
-        lambda title, command, **kwargs: {
-            "title": title,
-            "command": command,
-            "success": True,
-            "stdout": "ok",
-            "stderr": "",
-        },
-    )
-
-    report = mgr.doctor(branch_name="demo", scp_target="root@1.2.3.4:/root", domain="demo.example.com")
-    skipped = [check for check in report["checks"] if check.get("skipped")]
-    assert report["success"] is True
-    assert report["smoke_path"] == "/api/health/"
-    assert any(check["title"] == "rq-worker-1_logs" for check in skipped)
-
-
 def test_wait_for_dns_resolution_returns_true_on_resolve(tmp_path: Path, monkeypatch):
     """Polling exits as soon as ``socket.gethostbyname`` returns an answer."""
     mgr = SlimDeployManager(project_root=tmp_path)

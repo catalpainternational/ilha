@@ -13,8 +13,13 @@ class DropletStoredConfig(BaseModel):
     ip: Optional[str] = None
     domain: Optional[str] = None
     api_token: Optional[str] = None
-    remote_user: Optional[str] = Field(default="root")
-    ssh_port: int = Field(default=22, ge=1, le=65535)
+    # Default None (not "root"/22) so an unset per-droplet value INHERITS the
+    # global default_remote_user / default_ssh_port. A truthy default here made
+    # `stored.remote_user or global.default_remote_user` always short-circuit,
+    # rendering the global settings dead. MergedDeployConfig supplies the final
+    # "root"/22 fallback.
+    remote_user: Optional[str] = None
+    ssh_port: Optional[int] = Field(default=None, ge=1, le=65535)
     docker_compose_file: Optional[str] = None
     environment_variables: Dict[str, str] = Field(default_factory=dict)
     custom_build_args: Dict[str, str] = Field(default_factory=dict)
@@ -35,8 +40,10 @@ class DropletStoredConfig(BaseModel):
 
     @field_validator("ssh_port")
     @classmethod
-    def validate_port(cls, v: int) -> int:
-        """Validate SSH port is in valid range."""
+    def validate_port(cls, v: Optional[int]) -> Optional[int]:
+        """Validate SSH port is in valid range (None = inherit global default)."""
+        if v is None:
+            return v
         if not (1 <= v <= 65535):
             raise ValueError(f"SSH port {v} out of range [1, 65535]")
         return v
@@ -121,7 +128,9 @@ class MergedDeployConfig(BaseModel):
     custom_build_args: Dict[str, str] = Field(default_factory=dict)
     # Deploy settings
     auto_backup: bool = Field(default=True)
-    health_check_timeout: int = Field(default=300)
+    # Bounds mirror GlobalIlhaConfig.health_check_timeout so the merged/effective
+    # config validates the same range instead of silently accepting nonsense.
+    health_check_timeout: int = Field(default=300, ge=30, le=3600)
     worker_services: Optional[str] = None
     web_service: Optional[str] = None
 

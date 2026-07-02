@@ -44,33 +44,6 @@ from ilha.utils.validation import (
 )
 
 
-def _print_doctor_report(report: Dict[str, Any]) -> None:
-    print_plain("")
-    print_plain("Doctor report:")
-    if report.get("source_manifest"):
-        manifest = report["source_manifest"]
-        print_plain(f"  Source path: {manifest.get('source_path')}")
-        print_plain(f"  Branch: {manifest.get('branch_name')}")
-        print_plain(f"  Git branch: {manifest.get('git_branch') or 'unknown'}")
-        print_plain(f"  Dirty: {manifest.get('git_dirty')}")
-    print_plain(f"  Smoke path: {report.get('smoke_path')}")
-    print_plain("")
-    for check in report.get("checks", []):
-        title = check.get("title", "check")
-        if check.get("skipped"):
-            print_plain(f"{title}: skipped ({check.get('reason', 'not applicable')})")
-            continue
-        status = "ok" if check.get("success") else "failed"
-        print_plain(f"{title}: {status}")
-        if check.get("stdout"):
-            for line in check["stdout"].splitlines():
-                print_plain(f"  {line}")
-        if check.get("stderr"):
-            for line in check["stderr"].splitlines():
-                print_plain(f"  {line}")
-        print_plain("")
-
-
 def register_commands(cli) -> None:
     @cli.group()
     @add_verbose_option
@@ -331,7 +304,6 @@ def register_commands(cli) -> None:
         help="Always create a new droplet even if one with the resolved name exists (suffixed with -2, -3, …).",
     )
     @click.option("--vpc-uuid", help="VPC UUID for the droplet")
-    @click.option("--central-droplet-name", help="Reuse VPC UUID from central droplet")
     @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
     @click.option(
         "--disk-recovery",
@@ -400,7 +372,6 @@ def register_commands(cli) -> None:
         reuse_existing: bool,
         force_new: bool,
         vpc_uuid: Optional[str],
-        central_droplet_name: Optional[str],
         use_staging_certificates: bool,
         disk_recovery: str,
         retry_on_disk_reclaim: bool,
@@ -482,8 +453,6 @@ def register_commands(cli) -> None:
                         resolved_image, ssh_keys, tags, None, None, json,
                     )
 
-                # Resolve VPC UUID from central droplet if requested
-                resolved_vpc_uuid = vpc_uuid
                 token = DropletManager.resolve_droplet_token(effective_token)
                 provider = None
                 if token:
@@ -529,15 +498,6 @@ def register_commands(cli) -> None:
                     if not json:
                         log_info(f"Reusing droplet '{droplet_name}' at {existing.ip_address}")
                 else:
-                    if central_droplet_name and not vpc_uuid and provider:
-                        droplets_list = provider.list_droplets()
-                        for d in droplets_list:
-                            if d.name == central_droplet_name and d.vpc_uuid:
-                                resolved_vpc_uuid = d.vpc_uuid
-                                if not json:
-                                    log_info(f"Using VPC UUID from '{central_droplet_name}': {resolved_vpc_uuid}")
-                                break
-
                     # Generate unique name (suffixes -2, -3 if --force-new lands on a collision)
                     if provider:
                         droplet_name = _generate_unique_droplet_name(droplet_name, provider)
@@ -556,7 +516,7 @@ def register_commands(cli) -> None:
                         wait=True,
                         api_token=effective_token,
                         json=json,
-                        vpc_uuid=resolved_vpc_uuid,
+                        vpc_uuid=vpc_uuid,
                         return_droplet=True,
                     )
                     if not created_droplet:
@@ -956,12 +916,17 @@ def register_commands(cli) -> None:
         if follow:
             # Stream mode: pipe directly to terminal
             ssh_cmd = ssh.build_ssh_command(username, server, cmd)
+            proc = None
             try:
                 proc = subprocess.Popen(ssh_cmd, stdout=sys.stdout, stderr=sys.stderr)
                 proc.wait()
             except KeyboardInterrupt:
-                proc.terminate()
-                proc.wait()
+                # proc may be unbound if Popen itself raised / Ctrl-C landed during
+                # spawn; guard so the handler doesn't mask the real error with a
+                # NameError.
+                if proc is not None:
+                    proc.terminate()
+                    proc.wait()
         else:
             try:
                 result = ssh.execute_remote(username, server, cmd, timeout=60, check=False)
@@ -975,77 +940,6 @@ def register_commands(cli) -> None:
                     JSONOutput.print_error(f"Error fetching logs: {exc}")
                 else:
                     error_exit(f"Error fetching logs: {exc}")
-
-    @droplet.command("doctor")
-    @click.argument("branch_name", required=False)
-    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
-    @click.option("--domain", help="Domain for the deployment (e.g., beta.example.com)")
-    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
-    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
-    @add_json_option
-    @add_verbose_option
-    def droplet_doctor(
-        branch_name: Optional[str],
-        scp_target: Optional[str],
-        domain: Optional[str],
-        ip: Optional[str],
-        api_token: Optional[str],
-        json: bool,
-    ):
-        """Collect read-only diagnostics for an existing slim deploy target."""
-        from ilha.commands.push.slim_deploy_manager import SlimDeployManager
-
-        if domain and ip:
-            if json:
-                JSONOutput.print_error("--domain and --ip are mutually exclusive")
-            else:
-                error_exit("--domain and --ip are mutually exclusive")
-            return
-
-        branch_name = auto_detect_branch_name(branch_name, json)
-        if not branch_name:
-            return
-
-        check_prerequisites_no_git()
-
-        try:
-            scp_target, domain, ip, _, _ = resolve_existing_remote_target(
-                branch_name=branch_name,
-                scp_target=scp_target,
-                domain=domain,
-                ip=ip,
-                api_token=api_token,
-                json=json,
-            )
-        except ValueError as exc:
-            if json:
-                JSONOutput.print_error(str(exc))
-            else:
-                error_exit(str(exc))
-            return
-        except Exception as exc:
-            if json:
-                JSONOutput.print_error(f"Error resolving rsync target: {exc}")
-            else:
-                error_exit(f"Error resolving rsync target: {exc}")
-            return
-
-        deploy_mgr = SlimDeployManager()
-        try:
-            report = deploy_mgr.doctor(
-                branch_name=branch_name,
-                scp_target=scp_target,
-                domain=domain or None,
-                ip=ip or None,
-            )
-        finally:
-            deploy_mgr.cleanup()
-
-        if json:
-            JSONOutput.print_json(JSONOutput.success("Doctor report collected", data=report))
-        else:
-            _print_doctor_report(report)
-
 
 def _print_elapsed(start_time: float, json: bool) -> None:
     elapsed = time.time() - start_time

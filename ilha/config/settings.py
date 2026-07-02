@@ -59,6 +59,11 @@ PROTECTED_BRANCHES = {"main", "master",}
 # Branch name validation pattern
 BRANCH_NAME_PATTERN = r"^[a-zA-Z0-9_.-]+$"
 
+# Publicly-known placeholder. A deploy that ships this as DJANGO_SECRET_KEY lets
+# anyone forge session cookies / CSRF tokens, so it must never reach production —
+# generate a unique key per environment with generate_secret_key() instead.
+INSECURE_DEFAULT_SECRET_KEY = "django-insecure-secret-key"
+
 # Default environment variables (legacy defaults, overridden by config)
 DEFAULT_ENV_VARS = {
     "POSTGRES_USER": "user",
@@ -66,10 +71,20 @@ DEFAULT_ENV_VARS = {
     "POSTGRES_DB": "database",
     "ALLOWED_HOSTS": "localhost,127.0.0.1,*.localhost,web",
     "DEBUG": "True",
-    "DJANGO_SECRET_KEY": "django-insecure-secret-key",
+    "DJANGO_SECRET_KEY": INSECURE_DEFAULT_SECRET_KEY,
     "SITE_DOMAIN": "localhost:8000",
     "CADDY_EMAIL": "admin@example.com",
 }
+
+
+def generate_secret_key() -> str:
+    """Return a cryptographically strong, unique Django SECRET_KEY.
+
+    Used when generating a new environment so each one gets its own key and no
+    deployment ever ships the shared, publicly-known insecure default.
+    """
+    import secrets
+    return secrets.token_urlsafe(64)
 
 # Deployment defaults helpers (Phase 2)
 def _get_config_value(path_keys: list[str], default: Optional[str] = None) -> Optional[str]:
@@ -186,20 +201,13 @@ def sanitize_project_name(name: str) -> str:
     return sanitized.lower()
 
 def sanitize_hostname(name: str) -> str:
-    """Sanitize name for use in hostnames (RFC 1034/1035 compliant).
-    
-    Converts underscores to hyphens and removes invalid characters.
-    This ensures hostnames are valid for web browsers and Django's ALLOWED_HOSTS.
+    """Sanitize a name for use in hostnames (RFC 1034/1035 compliant).
+
+    The transformation is identical to :func:`sanitize_project_name` (both map
+    to the same lowercase, dash-only charset), so this is a thin alias — keeping
+    one implementation avoids the two silently diverging.
     """
-    import re
-    # Replace underscores with hyphens for hostname compatibility
-    sanitized = name.replace('_', '-')
-    # Replace other non-alphanumeric (except dash) with dash
-    sanitized = re.sub(r'[^a-zA-Z0-9-]', '-', sanitized)
-    # Remove leading/trailing dashes
-    sanitized = sanitized.strip('-')
-    # Convert to lowercase for consistency
-    return sanitized.lower()
+    return sanitize_project_name(name)
 
 def get_worktree_dir() -> str:
     """Get worktree directory from config"""
@@ -264,18 +272,22 @@ def resolve_default_branch(project_root: Path) -> str:
 
 # Docker Compose command detection
 def get_compose_command() -> str:
-    """Get the appropriate docker compose command."""
+    """Get the appropriate docker compose command.
+
+    Probes are bounded by a timeout so a wedged Docker daemon cannot hang the
+    CLI indefinitely (an unbounded ``docker compose version`` can block).
+    """
     import subprocess
     try:
-        subprocess.run(["docker", "compose", "version"], 
-                      capture_output=True, check=True)
+        subprocess.run(["docker", "compose", "version"],
+                      capture_output=True, check=True, timeout=10)
         return "docker compose"
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         try:
-            subprocess.run(["docker-compose", "version"], 
-                          capture_output=True, check=True)
+            subprocess.run(["docker-compose", "version"],
+                          capture_output=True, check=True, timeout=10)
             return "docker-compose"
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
             # Fallback to docker-compose if both fail
             return "docker-compose"
 

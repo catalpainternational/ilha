@@ -29,9 +29,12 @@ class ConfigLoader:
             ilhaCommandError: If config file is invalid YAML or fails validation
         """
         if not cls.CONFIG_PATH.exists():
-            # Return minimal valid config with no API token requirement
-            # Validation will happen when a token is actually needed
-            return GlobalIlhaConfig(default_api_token=None)
+            # No config yet — return a minimal, fully-defaulted object WITHOUT
+            # running the token-required validator. A token is only needed when
+            # actually deploying, which get_merged_deploy_config / get_api_token
+            # enforce at the point of use (model_construct skips validators but
+            # still applies field defaults).
+            return GlobalIlhaConfig.model_construct()
 
         try:
             with open(cls.CONFIG_PATH) as f:
@@ -103,28 +106,33 @@ class ConfigLoader:
                 "or configure ~/.ilha/config.yml with default_api_token or per-droplet api_token."
             )
 
-        # Merge all settings
+        # Merge all settings. Build the base kwargs from stored/global/env, then
+        # let cli_overrides win via dict.update — spreading **cli_overrides on top
+        # of explicit keyword args raised "multiple values for keyword argument"
+        # whenever an override key (api_token, domain, ip, ssh_port, …) collided.
+        merged_kwargs: Dict[str, Any] = dict(
+            api_token=api_token,
+            branch=branch,
+            droplet_name=droplet_name,
+            ip=stored_droplet.ip,
+            domain=stored_droplet.domain,
+            remote_user=stored_droplet.remote_user
+            or global_config.default_remote_user,
+            ssh_port=stored_droplet.ssh_port
+            or global_config.default_ssh_port,
+            docker_compose_file=Path(stored_droplet.docker_compose_file)
+            if stored_droplet.docker_compose_file
+            else None,
+            environment_variables=stored_droplet.environment_variables,
+            custom_build_args=stored_droplet.custom_build_args,
+            auto_backup=global_config.auto_backup_before_deploy,
+            health_check_timeout=global_config.health_check_timeout,
+        )
+        if cli_overrides:
+            merged_kwargs.update(cli_overrides)
+
         try:
-            merged = MergedDeployConfig(
-                api_token=api_token,
-                branch=branch,
-                droplet_name=droplet_name,
-                ip=stored_droplet.ip,
-                domain=stored_droplet.domain,
-                remote_user=stored_droplet.remote_user
-                or global_config.default_remote_user,
-                ssh_port=stored_droplet.ssh_port
-                or global_config.default_ssh_port,
-                docker_compose_file=Path(stored_droplet.docker_compose_file)
-                if stored_droplet.docker_compose_file
-                else None,
-                environment_variables=stored_droplet.environment_variables,
-                custom_build_args=stored_droplet.custom_build_args,
-                auto_backup=global_config.auto_backup_before_deploy,
-                health_check_timeout=global_config.health_check_timeout,
-                **(cli_overrides or {}),
-            )
-            return merged
+            return MergedDeployConfig(**merged_kwargs)
         except ValueError as e:
             raise ilhaCommandError(f"Merged config invalid: {e}")
 
