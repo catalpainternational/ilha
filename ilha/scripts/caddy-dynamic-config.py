@@ -46,9 +46,14 @@ class CaddyDynamicConfig:
     
     def __init__(self, caddy_admin_url: str = None):
         """Initialize the configuration manager."""
-        # Auto-detect the correct Caddy admin URL based on execution context
-        self.caddy_admin_url = caddy_admin_url or default_caddy_admin_url(
-            in_container=self._is_running_in_container()
+        # Honour CADDY_ADMIN_URL when set (in-netns container), else auto-detect.
+        # Run from the host (local `ilha up`), the loopback-bound admin is not
+        # reachable; the long-running caddy-docker-monitor daemon reconciles
+        # routes, so this one-shot degrades gracefully.
+        self.caddy_admin_url = (
+            caddy_admin_url
+            or os.environ.get("CADDY_ADMIN_URL")
+            or default_caddy_admin_url(in_container=self._is_running_in_container())
         )
         
         self.known_containers = set()
@@ -247,9 +252,13 @@ class CaddyDynamicConfig:
         
         config = {
             "admin": {
-                "listen": "0.0.0.0:2019",
+                # Loopback only — an unauthenticated admin API must not be
+                # reachable by app containers on the proxy network. Must match
+                # the static Caddyfile (admin localhost:2019) since this block is
+                # pushed on every reload.
+                "listen": "localhost:2019",
                 "enforce_origin": False,
-                "origins": ["//0.0.0.0:2019"]
+                "origins": ["//localhost:2019"]
             },
             "apps": {
                 "http": {

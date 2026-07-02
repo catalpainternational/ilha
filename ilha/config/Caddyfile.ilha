@@ -7,10 +7,13 @@
     servers {
         protocols h1 h2
     }
-    # Admin API listens on all interfaces inside the container.
-    # Security: port 2019 is NOT published to the host (see docker-compose).
-    # Only containers on the ilha_caddy_proxy network can reach it.
-    admin 0.0.0.0:2019
+    # Admin API bound to the container loopback ONLY. The API is unauthenticated,
+    # so binding 0.0.0.0 exposed it to every container on the ilha_caddy_proxy
+    # network — including untrusted worktree/app containers, which could then
+    # rewrite the global proxy config (redirect/MITM every hosted domain).
+    # The route monitor reaches it via 127.0.0.1 by sharing this container's
+    # network namespace (network_mode: service:caddy in docker-compose).
+    admin localhost:2019
 }
 
 # Default route for unknown domains

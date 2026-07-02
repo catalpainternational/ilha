@@ -45,7 +45,14 @@ class CaddyDockerMonitor:
     
     def __init__(self, caddy_admin_url: Optional[str] = None):
         """Initialize the monitor."""
-        self.caddy_admin_url = caddy_admin_url or default_caddy_admin_url(in_container=True)
+        # CADDY_ADMIN_URL is set to http://127.0.0.1:2019 in docker-compose: the
+        # monitor shares Caddy's network namespace (network_mode: service:caddy),
+        # so it reaches the loopback-bound admin API over 127.0.0.1.
+        self.caddy_admin_url = (
+            caddy_admin_url
+            or os.environ.get("CADDY_ADMIN_URL")
+            or default_caddy_admin_url(in_container=True)
+        )
         self.known_containers = set()
         try:
             # Prefer DOCKER_HOST env var (points to docker-socket-proxy in production),
@@ -186,9 +193,13 @@ class CaddyDockerMonitor:
             srv0["automatic_https"] = {"disable_redirects": True}
         config = {
             "admin": {
-                "listen": "0.0.0.0:2019",
+                # Loopback only — an unauthenticated admin API must not be
+                # reachable by app containers on the proxy network. This block
+                # is pushed on every reload, so it must match the static
+                # Caddyfile (admin localhost:2019), or a load would re-open it.
+                "listen": "localhost:2019",
                 "enforce_origin": False,
-                "origins": ["//0.0.0.0:2019"]
+                "origins": ["//localhost:2019"]
             },
             "apps": {
                 "http": {

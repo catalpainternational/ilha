@@ -25,9 +25,12 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      # Admin API bound to localhost only — reachable from host scripts (e.g. caddy_swap)
-      # but not from the internet. UFW/iptables don't need to block it.
-      - "127.0.0.1:2019:2019"
+      # Admin API (:2019) is intentionally NOT published. It is bound to the
+      # container loopback (Caddyfile: admin localhost:2019) and reached only by
+      # caddy-monitor, which shares this container's network namespace. This keeps
+      # the unauthenticated admin API off both the internet AND the shared proxy
+      # network (untrusted app containers). Manual host debugging:
+      #   docker exec ilha_caddy_proxy wget -qO- http://127.0.0.1:2019/config/
     environment:
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.com}
     volumes:
@@ -43,10 +46,17 @@ services:
   caddy-monitor:
     image: python:3.11-slim
     container_name: caddy_monitor
+    # Share Caddy's network namespace so the monitor reaches the loopback-bound
+    # admin API at 127.0.0.1:2019 — no admin port is exposed on the proxy network.
+    # (network_mode is mutually exclusive with `networks:`; DNS for
+    # docker-socket-proxy still resolves via Caddy's ilha_caddy_proxy membership.)
+    network_mode: "service:caddy"
     environment:
       USE_STAGING_CERTIFICATES: ${USE_STAGING_CERTIFICATES:-}
       # Connect to Docker via the socket proxy, not the raw socket
       DOCKER_HOST: tcp://docker-socket-proxy:2375
+      # Reach Caddy's loopback admin API (shared netns).
+      CADDY_ADMIN_URL: http://127.0.0.1:2019
     volumes:
       - {MONITOR_SCRIPT_PATH}:/app/monitor.py
       - {HELPER_UTILS_PATH}:/app/caddy_admin_utils.py
@@ -55,8 +65,6 @@ services:
     depends_on:
       - caddy
       - docker-socket-proxy
-    networks:
-      - ilha_caddy_proxy
     restart: unless-stopped
 
 volumes:
