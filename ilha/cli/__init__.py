@@ -5,13 +5,13 @@ Click CLI framework for ilha CLI.
 from __future__ import annotations
 
 import sys
+from functools import lru_cache
 from typing import List, Sequence
 
 import click
 
 from ilha.cli.constants import ALIAS_FLAGS, COMPOSE_PASSTHROUGH_COMMANDS, RESERVED_COMMANDS
 from ilha.cli.helpers import verbose_callback
-from ilha.cli_commands import register_all_commands
 from ilha.commands.completion import CompletionManager
 from ilha.commands.worktree import WorktreeManager
 from ilha.utils.completion_helper import get_completion_for_context
@@ -136,15 +136,41 @@ Examples:
         is_eager=True,
     )(cli)
 
+    # Imported here, not at module top, so that ``import ilha.cli`` pulls in no
+    # command modules. A command module importing ``ilha.cli.helpers`` before
+    # ilha.cli finishes initializing used to re-enter registration mid-flight
+    # and deadlock the import graph; deferring keeps ilha.cli side-effect free.
+    from ilha.cli_commands import register_all_commands
+
     register_all_commands(cli)
     return cli
 
 
-cli = _build_cli()
+@lru_cache(maxsize=1)
+def get_cli() -> click.Group:
+    """Build (once) and return the root CLI group.
+
+    Lazy so that ``import ilha.cli`` has no side effects. The Click tree — and
+    the command modules it registers — is constructed only on first use
+    (``main()``, or the first read of ``ilha.cli.cli``).
+    """
+    return _build_cli()
+
+
+def __getattr__(name: str):  # PEP 562
+    """Keep ``ilha.cli.cli`` / ``from ilha.cli import cli`` working lazily.
+
+    The build is deferred until the ``cli`` attribute is actually read, so
+    merely importing this module (or a command module that transitively imports
+    it) never triggers command registration.
+    """
+    if name == "cli":
+        return get_cli()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _resolve_command(path: Sequence[str]):
-    command = cli
+    command = get_cli()
     for name in path:
         commands = getattr(command, "commands", None)
         if not commands:
@@ -190,7 +216,7 @@ def completion_status(*args, **kwargs):
 def main():
     """Main entry point for the CLI."""
     try:
-        cli()
+        get_cli()()
     except KeyboardInterrupt:
         log_error("Operation cancelled by user")
         sys.exit(1)
@@ -201,6 +227,7 @@ def main():
 
 __all__ = [
     "cli",
+    "get_cli",
     "main",
     "up",
     "_completion",
