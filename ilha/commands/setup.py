@@ -143,8 +143,16 @@ class SetupManager:
                 log_info("--force flag set, overwriting existing .ilha configuration...")
                 force_overwrite = True
             elif non_interactive:
-                log_warning(".ilha directory already exists. Skipping overwrite prompt in non-interactive mode.")
-                return False
+                # Don't bail: refresh the ilha-owned overlay from the (possibly
+                # hand-edited) manifest while preserving the user-owned config.yml
+                # and env.ilha. This makes `ilha setup` idempotent and lets a
+                # manifest edit take effect without an interactive prompt. Use
+                # --force to also re-derive the manifest from detection.
+                log_info(
+                    ".ilha already exists; refreshing the overlay from the existing "
+                    "manifest and keeping config.yml / env.ilha (use --force to reset)."
+                )
+                force_overwrite = False
             else:
                 log_warning(f"The directory {self.ilha_dir} already exists.")
                 if not prompt_yes_no("Overwrite existing .ilha config (config.yml) and env override (env.ilha)?", default=False):

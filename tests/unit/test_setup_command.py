@@ -177,3 +177,35 @@ def test_detect_docker_compose_prefers_yml(setup_manager, mock_prompts):
     detected = setup_manager.detect_docker_compose()
 
     assert detected.name == "docker-compose.yml"
+
+
+def test_setup_refreshes_overlay_from_edited_manifest(setup_manager, mock_prompts):
+    """A manifest edit takes effect on a non-interactive re-run.
+
+    Regression for the integration gap where re-running setup non-interactively
+    bailed out on an existing .ilha and never regenerated the overlay — so a
+    hand-declared web service never routed.
+    """
+    from ilha.config.manifest import load_manifest, write_manifest, WebService
+
+    # 'server' is not a conventional web-service name → nothing routable at first.
+    write_compose(
+        setup_manager.project_root,
+        {"services": {"server": {"image": "myco/server", "expose": ["3000"]}}},
+    )
+    assert setup_manager.setup_project(non_interactive=True) is True
+    assert load_manifest(setup_manager.project_root).web == []
+
+    # User declares it in the manifest, then re-runs setup (non-interactive).
+    m = load_manifest(setup_manager.project_root)
+    m.web = [WebService(service="server", port=3000)]
+    write_manifest(setup_manager.project_root, m)
+    assert setup_manager.setup_project(non_interactive=True) is True
+
+    # The overlay now routes server:3000, and the manifest edit is preserved.
+    overlay = yaml.safe_load(
+        (setup_manager.ilha_dir / "docker-compose.overlay.yml").read_text()
+    )
+    labels = overlay["services"]["server"]["labels"]
+    assert labels["caddy.proxy.reverse_proxy"].endswith("-server:3000")
+    assert load_manifest(setup_manager.project_root).web[0].service == "server"
