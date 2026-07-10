@@ -1839,142 +1839,28 @@ echo OK
         except Exception as exc:
             log_warning(f"Could not update compose labels: {exc}")
 
+    # The deploy-time compose transforms are pure functions in deploy_compose.py.
+    # These methods stay as thin delegators so the manager's surface and existing
+    # call sites/tests are unchanged.
     def _strip_host_port_publishes(self, compose_data: dict) -> None:
-        """Remove ``ports:`` from every service in the (base) compose copy.
+        from .deploy_compose import strip_host_port_publishes
 
-        Caddy reaches each service over the ``ilha_caddy_proxy`` docker
-        network, so dropping host port publishes never breaks routing — it
-        only closes the surface that bots scan. Postgres/Redis on
-        ``0.0.0.0:5433/6379`` is the exact attack surface this prevents.
-
-        Applied to the BASE compose copy (not the overlay) because compose
-        v2's merge ignores ``ports: []`` from a later file — the only
-        reliable wipe is to remove the key from the source compose itself.
-        """
-        services = compose_data.get("services") or {}
-        stripped: List[str] = []
-        for svc_name, svc_config in services.items():
-            if not isinstance(svc_config, dict):
-                continue
-            if "ports" not in svc_config:
-                continue
-            del svc_config["ports"]
-            stripped.append(svc_name)
-        if stripped:
-            log_info(
-                f"Closed host port publishes for prod deploy: {', '.join(stripped)} "
-                f"(Caddy reaches services over the docker network, not host ports)"
-            )
-
-    # Services matching these patterns keep elevated privileges (Playwright/Chromium).
-    _PRIVILEGED_SERVICE_PATTERNS = ("web", "rq-worker")
-
-    # Keys removed from non-privileged services during deploy assembly.
-    _PRIVILEGE_KEYS = ("security_opt", "cap_add", "ipc", "shm_size")
+        strip_host_port_publishes(compose_data)
 
     def _strip_unnecessary_privileges(self, compose_data: dict) -> None:
-        """Remove elevated Docker privileges from services that don't need them.
+        from .deploy_compose import strip_unnecessary_privileges
 
-        Services whose name starts with one of ``_PRIVILEGED_SERVICE_PATTERNS``
-        (e.g. ``web``, ``rq-worker-1``) keep their privileges because they run
-        Playwright/Chromium.  All other services (``db``, ``redis``, ``caddy``,
-        etc.) have ``security_opt``, ``cap_add``, ``ipc``, and ``shm_size``
-        stripped for defense in depth.
-        """
-        services = compose_data.get("services")
-        if not services:
-            return
-        for svc_name, svc_config in services.items():
-            if not isinstance(svc_config, dict):
-                continue
-            if any(svc_name.startswith(prefix) for prefix in self._PRIVILEGED_SERVICE_PATTERNS):
-                continue
-            removed = []
-            for key in self._PRIVILEGE_KEYS:
-                if key in svc_config:
-                    del svc_config[key]
-                    removed.append(key)
-            if removed:
-                log_info(f"Stripped privileges from service '{svc_name}': {', '.join(removed)}")
-
-    # Subdirectory (relative to the deploy root) where the worktree code is
-    # copied. The base compose lives one level above, so user-written relative
-    # paths must be retargeted into this subdirectory before deploy.
-    _CODE_SUBDIR = "./code"
+        strip_unnecessary_privileges(compose_data)
 
     def _retarget_relative_path(self, value: str) -> str:
-        """Prefix ``./code/`` onto a relative path; leave absolute/var refs alone.
+        from .deploy_compose import retarget_relative_path
 
-        Callers must ensure the value is unambiguously a path (e.g. an
-        ``env_file`` entry, ``build.context``, or a volume source already
-        confirmed to start with ``.``). For volume short-syntax, bare names
-        like ``foo:/x`` are named volumes — caller filters those out before
-        calling here.
-        """
-        if not isinstance(value, str) or not value:
-            return value
-        if value.startswith(("/", "~", "$")):
-            return value
-        if value == ".":
-            return self._CODE_SUBDIR
-        if value.startswith("./"):
-            return f"{self._CODE_SUBDIR}/{value[2:]}"
-        if value.startswith("../"):
-            return f"{self._CODE_SUBDIR}/{value}"
-        return f"{self._CODE_SUBDIR}/{value}"
+        return retarget_relative_path(value)
 
     def _retarget_paths_to_code_subdir(self, compose_data: dict) -> None:
-        """Rewrite relative paths in each service so they resolve under ``./code/``.
+        from .deploy_compose import retarget_paths_to_code_subdir
 
-        Why: the base compose is copied to ``<deploy_dir>/docker-compose.yml`` but
-        the worktree code is copied to ``<deploy_dir>/code/``. Without this
-        retarget, ``build.context: .`` resolves to the deploy root (no Dockerfile
-        there) and bind-mount sources like ``./frontend`` miss the project files.
-        """
-        services = compose_data.get("services") or {}
-        for svc in services.values():
-            if not isinstance(svc, dict):
-                continue
-
-            build = svc.get("build")
-            if isinstance(build, str):
-                svc["build"] = self._retarget_relative_path(build)
-            elif isinstance(build, dict) and "context" in build:
-                build["context"] = self._retarget_relative_path(build["context"])
-
-            volumes = svc.get("volumes")
-            if isinstance(volumes, list):
-                new_volumes = []
-                for vol in volumes:
-                    if isinstance(vol, str):
-                        # Short form: SOURCE:TARGET[:MODE]. Only retarget when the
-                        # source is a path (starts with '.'); named volumes have
-                        # no leading dot/slash and are left alone.
-                        if vol.startswith("."):
-                            head, sep, tail = vol.partition(":")
-                            if sep:
-                                vol = f"{self._retarget_relative_path(head)}:{tail}"
-                        new_volumes.append(vol)
-                    elif isinstance(vol, dict):
-                        if vol.get("type") == "bind" and isinstance(vol.get("source"), str):
-                            vol["source"] = self._retarget_relative_path(vol["source"])
-                        new_volumes.append(vol)
-                    else:
-                        new_volumes.append(vol)
-                svc["volumes"] = new_volumes
-
-            env_file = svc.get("env_file")
-            if isinstance(env_file, str):
-                svc["env_file"] = self._retarget_relative_path(env_file)
-            elif isinstance(env_file, list):
-                svc["env_file"] = [
-                    self._retarget_relative_path(p) if isinstance(p, str) else p
-                    for p in env_file
-                ]
-
-            extends = svc.get("extends")
-            if isinstance(extends, dict) and isinstance(extends.get("file"), str):
-                extends["file"] = self._retarget_relative_path(extends["file"])
+        retarget_paths_to_code_subdir(compose_data)
 
     def _strip_privileges_in_compose(self, compose_path: Path) -> None:
         """Load the base compose, apply deploy transforms, and rewrite it in place.
@@ -2075,33 +1961,27 @@ echo OK
           ``${PROJECT_ROOT}/.env``, and the env.ilha values would otherwise
           overwrite the production overrides with localhost defaults.
         """
-        from ...utils.env_loader import load_env_file
+        from ...utils.env_loader import load_env_file, merge_env_layers
         from ...utils.path_utils import get_env_compose_file_path
 
         REMOTE_CODE_DIR = f"{self.REMOTE_APP_ROOT}/code"
 
-        merged: dict = {}
-
-        # Layer 1: project root .env
         root_env = self.project_root / ".env"
-        if root_env.exists():
-            merged.update(load_env_file(root_env))
-
-        # Layer 2: worktree .ilha/env.ilha (overrides root .env)
         env_ilha = get_env_compose_file_path(worktree_path)
-        if env_ilha.exists():
-            merged.update(load_env_file(env_ilha))
 
-        # Layer 2.5: compose ``db`` service environment defaults.
-        # If a project declares ``POSTGRES_USER: ${POSTGRES_USER:-pivot}`` in
-        # its compose, the ``pivot`` default is baked into the running
-        # container but never lands in the deployed ``.env`` — leaving ilha's
-        # post-restore Postgres validator (which sources the .env to find
-        # the right -U/-d args) falling back to ``postgres``/``postgres``.
-        # Pull the compose defaults forward into merged so the .env on the
-        # server reflects what the db container actually uses.
-        for key, value in self._extract_compose_db_env_defaults(worktree_path).items():
-            merged.setdefault(key, value)
+        # Layers (later wins): root .env < worktree env.ilha. The compose ``db``
+        # service ``${VAR:-default}`` values are folded in as base_defaults so
+        # they fill only the gaps — an explicit user-set value still wins. This
+        # matters because, e.g., a compose ``POSTGRES_USER: ${POSTGRES_USER:-pivot}``
+        # bakes ``pivot`` into the container but never lands in the deployed
+        # ``.env``; without this, ilha's post-restore Postgres validator (which
+        # sources the .env for the right -U/-d args) would fall back to
+        # ``postgres``/``postgres``. Uses the shared merge_env_layers contract.
+        merged: dict = merge_env_layers(
+            load_env_file(root_env) if root_env.exists() else {},
+            load_env_file(env_ilha) if env_ilha.exists() else {},
+            base_defaults=self._extract_compose_db_env_defaults(worktree_path),
+        )
 
         # Layer 3: deployment overrides
         # PROJECT_ROOT must point to the code directory on the server so that

@@ -70,28 +70,29 @@ class TestConfiguration:
         assert volume_names["redis"] == "test-project-test-branch_redis_data"
         assert volume_names["media"] == "test-project-test-branch_media_files"
     
+    @patch('ilha.config.settings.resolve_project_name')
     @patch('ilha.config.settings.get_project_name')
-    def test_generate_env_compose_content_non_django(self, mock_project_name):
+    def test_generate_env_compose_content_non_django(self, mock_project_name, mock_resolve):
         """Non-Django projects emit ilha plumbing only (bare-host SITE_DOMAIN)."""
         mock_project_name.return_value = "test_project"
+        mock_resolve.return_value = "test_project"
         content = generate_env_compose_content("test-branch", has_django=False)
 
         assert "COMPOSE_PROJECT_NAME=test-project-test-branch" in content
         assert "SITE_DOMAIN=test-project-test-branch.localhost" in content  # bare host
         assert "SITE_DOMAIN=http://" not in content
         assert "# ilha environment configuration for test-branch" in content
-        assert "ILHA_SUBNET_INTERNAL=" in content
-        assert "ILHA_SUBNET_WEB=" in content
-        assert ".0/24" in content
         # Django-only siblings must not be emitted for a non-Django project
         assert "ALLOWED_HOSTS" not in content
         assert "CSRF_TRUSTED_ORIGINS" not in content
         assert "USE_X_FORWARDED_HOST" not in content
 
+    @patch('ilha.config.settings.resolve_project_name')
     @patch('ilha.config.settings.get_project_name')
-    def test_generate_env_compose_content_django(self, mock_project_name):
+    def test_generate_env_compose_content_django(self, mock_project_name, mock_resolve):
         """Django projects also get ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST."""
         mock_project_name.return_value = "test_project"
+        mock_resolve.return_value = "test_project"
         content = generate_env_compose_content("test-branch", has_django=True)
 
         assert "SITE_DOMAIN=test-project-test-branch.localhost" in content

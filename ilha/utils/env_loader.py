@@ -48,35 +48,64 @@ def parse_env_content(content: str) -> Dict[str, str]:
 
 def load_env_file(env_path: Path) -> Dict[str, str]:
     """Load and parse .env file.
-    
+
     Parses a .env file with the following rules:
     - Lines starting with # are comments (ignored)
     - Empty lines are ignored
     - Lines with format KEY=VALUE are parsed
     - Whitespace around keys and values is stripped
     - Lines without = are ignored
-    
+
     Args:
         env_path: Path to .env file
-        
+
     Returns:
-        Dictionary of key-value pairs from .env file, or empty dict if file
-        doesn't exist or parsing fails
+        Dictionary of key-value pairs from .env file. An absent file yields an
+        empty dict — that is a legitimate "no environment", not a failure.
+
+    Raises:
+        EnvFileError: if the file exists but cannot be read (permissions,
+            corruption, non-UTF-8). Previously this was swallowed to ``{}``,
+            which silently ran the worktree with an empty environment and
+            surfaced as confusing failures much later. Callers that genuinely
+            want best-effort loading (global/home config) already catch broadly.
     """
     if not env_path.exists():
         return {}
 
     try:
         content = env_path.read_text(encoding='utf-8')
-    except (IOError, OSError) as e:
-        log_warning(f"Failed to read .env file at {env_path}: {e}")
-        return {}
+    except (IOError, OSError, UnicodeDecodeError) as e:
+        from ..exceptions import EnvFileError
+        raise EnvFileError(f"Failed to read env file at {env_path}: {e}") from e
 
-    try:
-        return parse_env_content(content)
-    except Exception as e:
-        log_warning(f"Error parsing .env file at {env_path}: {e}")
-        return {}
+    return parse_env_content(content)
+
+
+def merge_env_layers(
+    *layers: Optional[Mapping[str, str]],
+    base_defaults: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """Merge ordered env layers into one dict — the single precedence contract.
+
+    Later layers win (``layers[-1]`` overrides ``layers[0]``). ``base_defaults``
+    are folded in with ``setdefault`` semantics: they fill only keys that no
+    layer provided, so they never override an explicit value. This models the
+    compose ``${VAR:-default}`` case — the container's baked-in default should
+    surface only when nothing else set the key.
+
+    Both the deploy path (``SlimDeployManager._build_merged_env``) and any
+    env-inspection/validation route through here so the same ``.env`` /
+    ``env.ilha`` pair resolves identically everywhere.
+    """
+    merged: Dict[str, str] = {}
+    for layer in layers:
+        if layer:
+            merged.update(layer)
+    if base_defaults:
+        for key, value in base_defaults.items():
+            merged.setdefault(key, value)
+    return merged
 
 
 def upsert_env_vars(

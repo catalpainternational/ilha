@@ -5,11 +5,9 @@ This module contains all configuration constants and settings used throughout
 the ilha CLI application.
 """
 
-import hashlib
-import os
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 # Version information
 VERSION = "0.9.4"
@@ -431,44 +429,43 @@ def extract_domain_from_site_domain(site_domain: str) -> str:
     return domain
 
 # Environment file generation
-def get_worktree_network_subnets(branch_name: str) -> Tuple[str, str]:
-    """Return unique /24 subnets for a worktree (internal, web) to avoid pool overlap.
-
-    Uses deterministic hash of compose project name so each worktree gets distinct
-    subnets. Use ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB in docker-compose.overlay.yml
-    networks section (e.g. subnet: ${ILHA_SUBNET_INTERNAL}).
-    """
-    project_name = sanitize_project_name(get_project_name())
-    compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
-    seed = int(hashlib.sha256(compose_project_name.encode()).hexdigest()[:8], 16)
-    # 127 pairs (internal_octet, internal_octet+1) in 10.201.x.0/24 to avoid overlap
-    internal_octet = (seed % 127) * 2 + 1
-    web_octet = internal_octet + 1
-    return f"10.201.{internal_octet}.0/24", f"10.201.{web_octet}.0/24"
-
-
-def generate_env_compose_content(branch_name: str, *, has_django: bool = False) -> str:
+def generate_env_compose_content(
+    branch_name: str,
+    *,
+    project_root: Optional[Path] = None,
+    has_django: Optional[bool] = None,
+) -> str:
     """Generate env.ilha content for a worktree.
 
-    Always emits ilha-owned plumbing: COMPOSE_PROJECT_NAME, PROJECT_ROOT, SITE_DOMAIN
-    (bare host, used by Caddy labels), and per-worktree subnet vars. When
-    ``has_django`` is True, also emits Django-specific siblings (ALLOWED_HOSTS,
-    CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST) derived from SITE_DOMAIN.
+    Single source of truth for non-domain env.ilha generation — both the
+    project-root ``ilha setup`` path and per-worktree creation route here
+    (EnvironmentManager delegates to this) so the two can't drift.
+
+    Always emits ilha-owned plumbing: COMPOSE_PROJECT_NAME, PROJECT_ROOT and
+    SITE_DOMAIN (bare host, used by Caddy labels). When Django is detected (or
+    ``has_django`` is forced True), also emits Django-specific siblings
+    (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS, USE_X_FORWARDED_HOST) derived from
+    SITE_DOMAIN.
+
+    Args:
+        project_root: Root to resolve the project name / footprint against;
+            defaults to ``get_project_root()``.
+        has_django: Force the Django-sibling emission; when None, detect it
+            against ``project_root``.
     """
-    project_root = get_project_root()
-    project_name = sanitize_project_name(get_project_name())  # Converts underscores to hyphens
+    if project_root is None:
+        project_root = get_project_root()
+    project_name = sanitize_project_name(resolve_project_name(project_root))  # underscores -> hyphens
     compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
     site_domain = f"{compose_project_name}.localhost"  # bare host
-    internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
+    if has_django is None:
+        from ..utils.project_footprint import detect_project_footprint
+        has_django = detect_project_footprint(project_root).has_django
 
     content = f"""# ilha environment configuration for {branch_name}
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
 SITE_DOMAIN={site_domain}
-
-# Per-worktree network subnets (avoid pool overlap; use in docker-compose overlay)
-ILHA_SUBNET_INTERNAL={internal_subnet}
-ILHA_SUBNET_WEB={web_subnet}
 """
 
     if has_django:

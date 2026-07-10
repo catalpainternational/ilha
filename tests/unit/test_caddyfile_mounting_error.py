@@ -81,7 +81,7 @@ class TestCaddyfileMountingError:
         result = worktree_manager.start_worktree(branch_name)
         
         assert result is False
-        worktree_manager.orchestrator.start_worktree.assert_called_once_with(branch_name, profile=None)
+        worktree_manager.orchestrator.start_worktree.assert_called_once_with(branch_name, profile=None, preflight=True)
     
     @patch('subprocess.run')
     def test_docker_compose_command_with_caddyfile_error(self, mock_run, docker_manager):

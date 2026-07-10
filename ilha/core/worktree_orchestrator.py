@@ -406,12 +406,16 @@ class WorktreeOrchestrator:
                 "error": f"Exception during worktree creation: {str(e)}"
             }
     
-    def start_worktree(self, branch_name: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    def start_worktree(
+        self, branch_name: str, profile: Optional[str] = None, *, preflight: bool = True
+    ) -> Dict[str, Any]:
         """Start worktree environment with complete orchestration.
-        
+
         Args:
             branch_name: Name of the branch/worktree to start
             profile: Optional Docker Compose profile to use
+            preflight: Run blocking config checks before `docker compose up`.
+                Set False (``ilha up --no-preflight``) to bypass.
         """
         # Validate worktree exists
         if not self.git_manager.validate_worktree_exists(branch_name):
@@ -477,9 +481,6 @@ class WorktreeOrchestrator:
         env_file = worktree_path / ".ilha" / "env.ilha"
         main_env_file = worktree_path / ".env"
 
-        # Ensure env.ilha has per-worktree subnet vars (Option 3; patches older worktrees)
-        self.env_manager.ensure_worktree_env_has_subnet_vars(worktree_path, resolved_branch_name)
-
         if not env_file.exists() or not main_env_file.exists():
             # Try to create missing environment files
             if not self.env_manager.create_worktree_env(resolved_branch_name, worktree_path):
@@ -493,6 +494,31 @@ class WorktreeOrchestrator:
                 return {
                     "success": False,
                     "error": "Environment files not found after creation"
+                }
+
+        # Preflight: block on error-severity config problems (unroutable services,
+        # missing/insecure env) before spending time on `docker compose up`. Runs
+        # here — after env files are ensured — so it validates real content. Same
+        # engine `ilha doctor` uses; Docker daemon checks are skipped (we already
+        # started Caddy above, so Docker is up).
+        if preflight:
+            from .worktree_checks import (
+                WorktreeCheckContext,
+                run_worktree_checks,
+                errors_only,
+            )
+
+            ctx = WorktreeCheckContext.load(resolved_branch_name)
+            blocking = errors_only(run_worktree_checks(ctx, include_docker=False))
+            if blocking:
+                lines = [f"  ✗ {r.message}\n      → {r.remedy}" for r in blocking]
+                return {
+                    "success": False,
+                    "error": (
+                        "Preflight found blocking problems (use --no-preflight to bypass):\n"
+                        + "\n".join(lines)
+                    ),
+                    "checks": [r.to_dict() for r in blocking],
                 }
 
         # Get the full compose project name (project-branch format)

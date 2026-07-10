@@ -6,34 +6,25 @@ configuration management for worktree environments.
 """
 
 import os
-import socket
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 from ..config.settings import (
     generate_env_compose_content,
-    get_worktree_network_subnets,
     get_volume_names,
     DEFAULT_ENV_VARS,
     get_project_root,
     get_worktree_paths,
-    get_worktree_dir,
 )
 from ..utils.logging import log_info, log_success, log_warning
 from ..utils.path_utils import (
-    get_env_file_path, 
+    get_env_file_path,
     get_env_compose_file_path,
     copy_env_file
 )
 from ..utils.caddy_config import ensure_caddy_labels_and_network, update_allowed_hosts_in_compose, update_vite_allowed_hosts_in_compose
 from ..utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ..core.dns_manager import is_domain
-
-HOST_PORT_RANGES: Dict[str, tuple[int, int]] = {
-    "ilha_DB_HOST_PORT": (55432, 56431),
-    "ilha_REDIS_HOST_PORT": (56379, 57378),
-    "ilha_WEB_HOST_PORT": (58000, 58999),
-}
 
 
 class EnvironmentManager:
@@ -51,130 +42,7 @@ class EnvironmentManager:
         else:
             self.project_root = Path(project_root).resolve()
 
-    def _build_host_port_section(self, branch_name: str) -> str:
-        """Build host port assignments for env.ilha."""
-        host_ports = self._calculate_host_ports(branch_name)
-        if not host_ports:
-            return ""
-        lines = [f"{var}={value}" for var, value in host_ports.items()]
-        return "\n".join(lines) + "\n"
 
-    def _calculate_host_ports(self, branch_name: str) -> Dict[str, int]:
-        """Assign deterministic host ports for key services."""
-        used_ports = self._collect_used_host_ports()
-        existing_ports = self._read_existing_host_ports(branch_name)
-
-        # Reserve existing ports so we don't reassign them
-        for var, value in existing_ports.items():
-            used_ports.setdefault(var, set()).add(value)
-
-        assigned: Dict[str, int] = {}
-        for var, port_range in HOST_PORT_RANGES.items():
-            if var in existing_ports:
-                assigned[var] = existing_ports[var]
-                continue
-
-            allocated = self._allocate_host_port(var, used_ports.get(var, set()), port_range, branch_name)
-            assigned[var] = allocated
-            if allocated > 0:
-                used_ports.setdefault(var, set()).add(allocated)
-
-        return assigned
-
-    def _collect_used_host_ports(self) -> Dict[str, Set[int]]:
-        """Scan existing worktrees to understand which host ports are taken."""
-        used: Dict[str, Set[int]] = {var: set() for var in HOST_PORT_RANGES}
-        directories_to_scan = []
-
-        worktree_root = self.project_root / get_worktree_dir()
-        if worktree_root.exists():
-            directories_to_scan.append(worktree_root)
-
-        legacy_root = self.project_root.parent
-        if legacy_root.exists():
-            directories_to_scan.append(legacy_root)
-
-        for root in directories_to_scan:
-            for candidate in root.iterdir():
-                if not candidate.is_dir():
-                    continue
-                env_file = candidate / ".ilha" / "env.ilha"
-                env_ports = self._extract_host_ports(env_file)
-                for var, value in env_ports.items():
-                    used.setdefault(var, set()).add(value)
-
-        return used
-
-    def _read_existing_host_ports(self, branch_name: str) -> Dict[str, int]:
-        """Read previously assigned host ports for a branch if env.ilha exists."""
-        host_ports: Dict[str, int] = {}
-        worktree_path = self.project_root / get_worktree_dir() / branch_name
-        legacy_path = self.project_root.parent / branch_name
-
-        env_path = get_env_compose_file_path(worktree_path)
-        if not env_path.exists() and legacy_path.exists():
-            env_path = get_env_compose_file_path(legacy_path)
-
-        host_ports.update(self._extract_host_ports(env_path))
-        return host_ports
-
-    def _extract_host_ports(self, env_path: Path) -> Dict[str, int]:
-        """Extract host port values from an env.ilha file."""
-        from ..utils.env_loader import load_env_file
-
-        if not env_path.exists():
-            return {}
-
-        try:
-            env_vars = load_env_file(env_path)
-        except Exception:
-            return {}
-
-        extracted: Dict[str, int] = {}
-        for var in HOST_PORT_RANGES.keys():
-            raw_value = env_vars.get(var)
-            if raw_value is None:
-                continue
-            try:
-                value = int(raw_value)
-            except (TypeError, ValueError):
-                continue
-            extracted[var] = value
-        return extracted
-
-    def _allocate_host_port(
-        self,
-        var_name: str,
-        used_ports: Set[int],
-        port_range: tuple[int, int],
-        branch_name: str,
-    ) -> int:
-        """Find the first available host port in the configured range."""
-        start, end = port_range
-        for port in range(start, end + 1):
-            if port in used_ports:
-                continue
-            if self._is_port_available(port):
-                log_info(f"Assigned {var_name}={port} for branch {branch_name}")
-                return port
-
-        log_warning(
-            f"No free ports available in range {start}-{end} for {var_name}. "
-            "Falling back to Docker auto-assignment."
-        )
-        return 0
-
-    @staticmethod
-    def _is_port_available(port: int) -> bool:
-        """Check if a host port is available on the current machine."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind(("", port))
-            except OSError:
-                return False
-        return True
-    
     def create_worktree_env(self, branch_name: str, worktree_path: Path, 
                            source_env_path: Optional[Path] = None,
                            domain: Optional[str] = None) -> bool:
@@ -248,9 +116,10 @@ class EnvironmentManager:
             resolve_project_name,
             get_allowed_hosts_for_worktree,
             build_allowed_hosts_with_container,
-            generate_secret_key,
             DEFAULT_ENV_VARS,
         )
+        from ..config.env_schema import generate_default_app_env
+        from ..utils.project_footprint import detect_project_footprint
 
         env_file = worktree_path / ".env"
 
@@ -258,14 +127,17 @@ class EnvironmentManager:
         if env_file.exists():
             return True
 
-        # Give every new environment its own strong SECRET_KEY so no deploy ever
-        # ships the shared, publicly-known insecure default.
-        secret_key = generate_secret_key()
+        # App-owned secrets/creds come from the declared env schema: a unique
+        # SECRET_KEY per environment (never the public insecure default) and, for
+        # Postgres projects, *generated* POSTGRES_* creds so the app and the db
+        # container start in agreement — no manual "make these match" step.
+        footprint = detect_project_footprint(self.project_root)
+        app_env = generate_default_app_env(footprint)
 
         # Create default environment content with project prefix
         project_name = sanitize_project_name(resolve_project_name(self.project_root))
         compose_project_name = f"{project_name}-{branch_name}"
-        
+
         # Use domain override if provided, otherwise use localhost
         if domain:
             from ..core.dns_manager import get_base_domain
@@ -281,41 +153,52 @@ class EnvironmentManager:
             site_domain = f"{project_name}-{branch_name}.localhost"
             allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
             csrf_trusted_origins = ""
-        
-        default_env_content = f"""# Default environment configuration for {branch_name}
-# This file was automatically created by ilha
 
-# Database configuration
-# IMPORTANT: Set these values to match your PostgreSQL container configuration
-# These values must match POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB
-# in your docker-compose.yml file
-POSTGRES_USER=
-POSTGRES_PASSWORD=
-POSTGRES_DB=
+        lines = [
+            f"# Default environment configuration for {branch_name}",
+            "# This file was automatically created by ilha",
+        ]
 
-# Django configuration
-DEBUG=True
-DJANGO_SECRET_KEY={secret_key}
-ALLOWED_HOSTS={allowed_hosts}
-SITE_DOMAIN={site_domain}
-"""
+        if footprint.has_postgres:
+            lines += [
+                "",
+                "# Database configuration (generated so the app and the Postgres",
+                "# container agree; change all three together if you point at an",
+                "# external database).",
+                f"POSTGRES_USER={app_env['POSTGRES_USER']}",
+                f"POSTGRES_PASSWORD={app_env['POSTGRES_PASSWORD']}",
+                f"POSTGRES_DB={app_env['POSTGRES_DB']}",
+            ]
+
+        lines += [
+            "",
+            "# Application configuration",
+            f"DEBUG={app_env.get('DEBUG', 'True')}",
+        ]
+        if "DJANGO_SECRET_KEY" in app_env:
+            lines.append(f"DJANGO_SECRET_KEY={app_env['DJANGO_SECRET_KEY']}")
+        lines += [
+            f"ALLOWED_HOSTS={allowed_hosts}",
+            f"SITE_DOMAIN={site_domain}",
+        ]
         if csrf_trusted_origins:
-            default_env_content += (
-                "USE_X_FORWARDED_HOST=True\n"
-                "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https\n"
-                f"CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}\n"
-            )
-        default_env_content += f"""
+            lines += [
+                "USE_X_FORWARDED_HOST=True",
+                "SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https",
+                f"CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}",
+            ]
+        lines += [
+            "",
+            "# Redis configuration",
+            f"REDIS_HOST={compose_project_name}-redis",
+            "REDIS_PORT=6379",
+            "REDIS_DB=0",
+            "",
+            "# Caddy configuration",
+            f"CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}",
+        ]
+        default_env_content = "\n".join(lines) + "\n"
 
-# Redis configuration
-REDIS_HOST={compose_project_name}-redis
-REDIS_PORT=6379
-REDIS_DB=0
-
-# Caddy configuration
-CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
-"""
-        
         try:
             env_file.write_text(default_env_content)
             log_info(f"Created default .env file for {branch_name}")
@@ -327,63 +210,13 @@ CADDY_EMAIL={DEFAULT_ENV_VARS['CADDY_EMAIL']}
     def _generate_env_compose_content(self, branch_name: str, *, has_django: Optional[bool] = None) -> str:
         """Generate env.ilha content for a worktree using self.project_root.
 
-        Always emits ilha-owned plumbing. Emits Django-specific siblings only when
-        ``has_django`` is True. If ``has_django`` is None, detect against
-        ``self.project_root``.
+        Thin wrapper over the canonical ``settings.generate_env_compose_content``
+        (single source of truth) so the project-root and per-worktree paths
+        share one generator.
         """
-        from ..config.settings import sanitize_project_name, resolve_project_name, get_allowed_hosts_for_worktree
-        from ..utils.project_footprint import detect_project_footprint
-
-        project_name = sanitize_project_name(resolve_project_name(self.project_root))
-        compose_project_name = f"{project_name}-{branch_name}"
-        site_domain = f"{compose_project_name}.localhost"  # bare host
-
-        if has_django is None:
-            has_django = detect_project_footprint(self.project_root).has_django
-
-        internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
-        base_content = f"""# ilha environment configuration for {branch_name}
-COMPOSE_PROJECT_NAME={compose_project_name}
-PROJECT_ROOT={self.project_root}
-SITE_DOMAIN={site_domain}
-
-# Per-worktree network subnets (avoid pool overlap; use in docker-compose overlay)
-ILHA_SUBNET_INTERNAL={internal_subnet}
-ILHA_SUBNET_WEB={web_subnet}
-"""
-
-        if has_django:
-            allowed_hosts = get_allowed_hosts_for_worktree(branch_name)
-            csrf_trusted_origins = f"http://{site_domain},https://{site_domain}"
-            base_content += f"""
-# Django-specific (emitted because Django was detected in this project)
-ALLOWED_HOSTS={allowed_hosts}
-CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
-USE_X_FORWARDED_HOST=True
-"""
-
-        host_port_section = self._build_host_port_section(branch_name)
-        if host_port_section:
-            base_content = f"{base_content}\n{host_port_section}"
-        return base_content
-
-    def ensure_worktree_env_has_subnet_vars(self, worktree_path: Path, branch_name: str) -> None:
-        """Append ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB to env.ilha if missing.
-
-        Allows existing worktrees created before per-worktree subnets to get the vars on next up.
-        """
-        env_file = worktree_path / ".ilha" / "env.ilha"
-        if not env_file.exists():
-            return
-        try:
-            content = env_file.read_text()
-            if "ILHA_SUBNET_INTERNAL" in content:
-                return
-            internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
-            append = f"\n# Per-worktree network subnets (avoid pool overlap)\nILHA_SUBNET_INTERNAL={internal_subnet}\nILHA_SUBNET_WEB={web_subnet}\n"
-            env_file.write_text(content.rstrip() + append)
-        except Exception:
-            pass
+        return generate_env_compose_content(
+            branch_name, project_root=self.project_root, has_django=has_django,
+        )
 
     def get_worktree_volume_names(self, branch_name: str) -> Dict[str, str]:
         """Get worktree-specific volume names."""
@@ -829,10 +662,8 @@ CSRF_TRUSTED_ORIGINS={csrf_trusted_origins}
 USE_SECURE_COOKIES={str(use_secure_cookies)}
 """
 
-        host_port_section = self._build_host_port_section(branch_name)
-        if host_port_section:
-            base_content = f"{base_content}\n{host_port_section}"
         return base_content
+
     def _update_volumes_for_production(self, compose_data: Dict, worktree_path: Path) -> bool:
         """Update volumes in compose data for production mode.
         

@@ -17,9 +17,47 @@ from ilha.utils.env_loader import (
     load_env_file,
     load_env_from_home,
     load_env_from_project_root,
+    merge_env_layers,
     parse_env_content,
     upsert_env_vars,
 )
+
+
+# ---------------------------------------------------------------------------
+# merge_env_layers — the single precedence contract
+# ---------------------------------------------------------------------------
+
+def test_merge_later_layer_wins():
+    assert merge_env_layers({"A": "1", "B": "1"}, {"B": "2"}) == {"A": "1", "B": "2"}
+
+
+def test_merge_base_defaults_fill_gaps_only():
+    # base_defaults must NOT override an explicit value from any layer.
+    merged = merge_env_layers(
+        {"POSTGRES_USER": "explicit"},
+        base_defaults={"POSTGRES_USER": "compose-default", "POSTGRES_DB": "app"},
+    )
+    assert merged["POSTGRES_USER"] == "explicit"   # explicit wins
+    assert merged["POSTGRES_DB"] == "app"          # gap filled by default
+
+
+def test_merge_skips_none_and_empty_layers():
+    assert merge_env_layers(None, {}, {"A": "1"}, None) == {"A": "1"}
+
+
+def test_merge_no_args_is_empty():
+    assert merge_env_layers() == {}
+
+
+def test_merge_base_defaults_applied_after_all_layers():
+    # A key absent from every layer but present in base_defaults appears;
+    # a key present in a layer is untouched even if base_defaults also has it.
+    merged = merge_env_layers(
+        {"A": "layer"},
+        {"B": "layer"},
+        base_defaults={"A": "def", "C": "def"},
+    )
+    assert merged == {"A": "layer", "B": "layer", "C": "def"}
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +189,14 @@ def test_load_env_file_valid(tmp_path):
     assert load_env_file(p) == {"FOO": "bar", "BAZ": "q"}
 
 
-def test_load_env_file_unreadable_returns_empty(tmp_path, monkeypatch):
+def test_load_env_file_unreadable_raises(tmp_path, monkeypatch):
+    """An existing-but-unreadable env file must surface, not silently yield {}.
+
+    Swallowing a read failure to {} ran the worktree with an empty environment
+    and failed confusingly far downstream — so we raise EnvFileError instead.
+    """
+    from ilha.exceptions import EnvFileError
+
     p = tmp_path / ".env"
     p.write_text("FOO=bar\n", encoding="utf-8")
 
@@ -159,7 +204,8 @@ def test_load_env_file_unreadable_returns_empty(tmp_path, monkeypatch):
         raise OSError("permission denied")
 
     monkeypatch.setattr(Path, "read_text", boom)
-    assert load_env_file(p) == {}
+    with pytest.raises(EnvFileError):
+        load_env_file(p)
 
 
 def test_load_env_file_empty_file(tmp_path):

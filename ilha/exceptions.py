@@ -41,3 +41,13 @@ class VolumeBackupError(ilhaError):
     """
 
 
+class EnvFileError(ilhaError):
+    """Raised when an env file exists but cannot be read.
+
+    Distinct from "the file is absent" (a legitimate empty environment, ``{}``):
+    an unreadable/corrupt file that silently parses to ``{}`` is the worst
+    outcome — the worktree comes up with an empty environment and fails far
+    downstream. Surface it at the read site instead.
+    """
+
+

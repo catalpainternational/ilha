@@ -5,7 +5,7 @@ Unit tests for environment manager.
 import pytest
 from unittest.mock import Mock, patch, mock_open
 from pathlib import Path
-from ilha.core.environment_manager import EnvironmentManager, HOST_PORT_RANGES
+from ilha.core.environment_manager import EnvironmentManager
 
 
 class TestEnvironmentManager:
@@ -340,35 +340,3 @@ class TestEnvironmentManager:
         assert result == False
         assert mock_unlink.call_count == 2
 
-    def test_host_port_assignment_generates_unique_values(self, tmp_path, monkeypatch):
-        """Host ports should be assigned within the configured ranges."""
-        project_root = tmp_path
-        (project_root / "worktrees").mkdir(parents=True, exist_ok=True)
-        env_manager = EnvironmentManager(project_root=project_root)
-
-        host_ports = env_manager._calculate_host_ports("alpha")
-
-        assert set(host_ports.keys()) == set(HOST_PORT_RANGES.keys())
-        for var, port in host_ports.items():
-            start, end = HOST_PORT_RANGES[var]
-            assert start <= port <= end
-
-    def test_host_port_assignment_preserves_existing_values(self, tmp_path):
-        """Existing host port assignments should be reused when regenerating env files."""
-        project_root = tmp_path
-        branch_dir = project_root / "worktrees" / "alpha"
-        ilha_dir = branch_dir / ".ilha"
-        ilha_dir.mkdir(parents=True, exist_ok=True)
-        env_file = ilha_dir / "env.ilha"
-        env_file.write_text(
-            "ilha_DB_HOST_PORT=16000\n"
-            "ilha_REDIS_HOST_PORT=27000\n"
-            "ilha_WEB_HOST_PORT=38500\n"
-        )
-
-        env_manager = EnvironmentManager(project_root=project_root)
-        host_ports = env_manager._calculate_host_ports("alpha")
-
-        assert host_ports["ilha_DB_HOST_PORT"] == 16000
-        assert host_ports["ilha_REDIS_HOST_PORT"] == 27000
-        assert host_ports["ilha_WEB_HOST_PORT"] == 38500
