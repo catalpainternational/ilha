@@ -17,6 +17,33 @@ from ilha.utils.logging import log_info, log_success
 from ilha.utils.pattern_matcher import has_wildcard
 
 
+_CHECK_SYMBOLS = {"ok": "✓", "warning": "⚠", "error": "✗"}
+
+
+def _resolve_current_branch() -> Optional[str]:
+    """Best-effort branch for the current directory (worktree or project root)."""
+    from ilha.utils.path_utils import detect_execution_context
+
+    try:
+        _, branch_name, _ = detect_execution_context()
+        return branch_name
+    except Exception:
+        return None
+
+
+def _render_check_report(branch: str, results) -> None:
+    """Render a doctor report as a ✓/⚠/✗ list. Empty results == healthy."""
+    click.echo(f"ilha doctor — {branch}")
+    if not results:
+        click.echo("  ✓ all checks passed")
+        return
+    for r in results:
+        symbol = _CHECK_SYMBOLS.get(r.severity, "?")
+        click.echo(f"  {symbol} [{r.check_id}] {r.message}")
+        if r.remedy and r.severity != "ok":
+            click.echo(f"      → {r.remedy}")
+
+
 def register_commands(cli) -> None:
     """Register worktree management commands."""
 
@@ -60,15 +87,23 @@ def register_commands(cli) -> None:
         help="Run containers in detached mode (default: True)",
     )
     @click.option("--profile", help="Docker Compose profile to use (e.g., worker)")
+    @click.option(
+        "--no-preflight",
+        is_flag=True,
+        default=False,
+        help="Skip the blocking config checks (routability, env) run before start.",
+    )
     @add_json_option
     @add_verbose_option
     @command_wrapper()
-    def up(branch_name: str, detach: bool, profile: Optional[str], json: bool):
+    def up(branch_name: str, detach: bool, profile: Optional[str], no_preflight: bool, json: bool):
         """Start the worktree environment for the specified branch."""
         if not detach:
             raise ilhaCommandError("Usage: ilha <worktree_name> up -d")
         worktree_manager = WorktreeManager()
-        success = worktree_manager.start_worktree(branch_name, profile=profile)
+        success = worktree_manager.start_worktree(
+            branch_name, profile=profile, preflight=not no_preflight
+        )
         if not success:
             raise ilhaCommandError(f"Failed to start worktree environment for {branch_name}")
         log_success(f"Worktree environment started for {branch_name}")
@@ -96,6 +131,52 @@ def register_commands(cli) -> None:
                 f"Worktree environment stopped for {branch_name}",
                 {"branch_name": branch_name},
             )
+
+    @cli.command()
+    @click.argument("branch_name", required=False)
+    @add_json_option
+    @add_verbose_option
+    @command_wrapper(require_prerequisites=False)
+    def doctor(branch_name: Optional[str], json: bool):
+        """Diagnose a worktree's configuration and report problems with fixes.
+
+        Runs the same checks the `up` preflight enforces, but reports all of
+        them (warnings included) instead of blocking on the first error. Exits
+        non-zero when a blocking (error-severity) problem is found.
+        """
+        from ilha.core.worktree_checks import (
+            WorktreeCheckContext,
+            run_worktree_checks,
+            has_errors,
+        )
+
+        branch = branch_name or _resolve_current_branch()
+        if not branch:
+            raise ilhaCommandError(
+                "Could not determine a worktree. Pass a branch: `ilha doctor <branch>`."
+            )
+
+        ctx = WorktreeCheckContext.load(branch)
+        results = run_worktree_checks(ctx)
+        blocking = has_errors(results)
+
+        if not json:
+            _render_check_report(branch, results)
+
+        if blocking:
+            n = sum(1 for r in results if r.severity == "error")
+            raise ilhaCommandError(
+                f"doctor: {n} blocking problem(s) found for '{branch}'",
+                error_code="doctor_failed",
+                details={"branch": branch, "checks": [r.to_dict() for r in results]},
+            )
+
+        if json:
+            return JSONOutput.success(
+                f"doctor: '{branch}' passed all checks",
+                {"branch": branch, "checks": [r.to_dict() for r in results]},
+            )
+        log_success(f"doctor: '{branch}' passed all checks")
 
     def _handle_pattern_operation(
         branch_name: str,

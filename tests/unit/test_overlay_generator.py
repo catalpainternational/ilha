@@ -12,6 +12,33 @@ def _gen(user_compose: dict, *, domain=None, ip=None):
     return generate_overlay(user_compose, domain=domain, ip=ip)
 
 
+def test_manifest_routes_nonstandard_service_name():
+    """The headline manifest win: a service the heuristics can't see (name not in
+    the allowlist, custom port) still routes when the manifest declares it."""
+    user = {"services": {"server": {"image": "myco/server"}}}
+
+    # Heuristics alone: 'server' is invisible → nothing routable.
+    heuristic = generate_overlay(user)
+    assert "labels" not in heuristic["services"]["server"]
+    assert "networks" not in heuristic  # no routable service
+
+    # Manifest authoritative: 'server' routes on its declared port 3000.
+    manifest = generate_overlay(user, routable={"server": 3000})
+    svc = manifest["services"]["server"]
+    assert svc["labels"]["caddy.proxy.reverse_proxy"].endswith("-server:3000")
+    assert svc["expose"] == ["3000"]
+    assert manifest["networks"] == {"ilha_caddy_proxy": {"external": True}}
+
+
+def test_manifest_overrides_heuristic_routability():
+    """A manifest that omits a conventionally-named service makes it non-routable."""
+    user = {"services": {"app": {"expose": ["8000"]}, "web": {"expose": ["9000"]}}}
+    # Only 'app' is in the manifest; 'web' (a heuristic match) is intentionally out.
+    overlay = generate_overlay(user, routable={"app": 8000})
+    assert "labels" in overlay["services"]["app"]
+    assert "labels" not in overlay["services"]["web"]
+
+
 def test_django_postgres_canonical():
     """A typical Django+Postgres project: web is routable, db is not."""
     user = {

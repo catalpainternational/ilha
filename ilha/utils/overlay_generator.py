@@ -101,6 +101,7 @@ def _is_external_volume(volume_config: Any) -> bool:
 def generate_overlay(
     user_compose: Dict[str, Any],
     *,
+    routable: Optional[Dict[str, int]] = None,
     domain: Optional[str] = None,
     ip: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -109,6 +110,12 @@ def generate_overlay(
     The user's compose dict is treated as read-only — this function never
     mutates it. The returned dict is what ilha writes to
     ``.ilha/docker-compose.overlay.yml``.
+
+    ``routable`` is an authoritative ``{service_name: port}`` map from the
+    ratified manifest (``.ilha/ilha.yml``). When provided, it decides exactly
+    which services are web-routable and on what port — no guessing. When None
+    (a project with no manifest yet), the historical name/image heuristics
+    apply, preserving old behavior.
 
     Django-specific deltas live in env.ilha (gated by ``has_django`` in
     ``generate_env_compose_content``); the overlay itself is framework-neutral.
@@ -134,9 +141,15 @@ def generate_overlay(
             ],
         }
 
-        if _is_routable(service_name, sc):
+        if routable is not None:
+            service_routable = service_name in routable
+            port = routable.get(service_name)
+        else:
+            service_routable = _is_routable(service_name, sc)
+            port = _detect_service_port(sc, service_name=service_name) if service_routable else None
+
+        if service_routable:
             any_routable = True
-            port = _detect_service_port(sc, service_name=service_name)
             # Compose appends list values during multi-file merges. Use its
             # explicit reset tag so base host-port mappings do not leak into
             # worktree environments.

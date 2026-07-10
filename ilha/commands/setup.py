@@ -176,8 +176,21 @@ class SetupManager:
             )
             return False
 
+        # 2.5 Ratify the project manifest (.ilha/ilha.yml). This is the single
+        # authority for which services are web-routable (and their port), the db,
+        # and the volumes to clone. Detection proposes it; the user ratifies/edits
+        # it; the overlay is generated from it (no silent per-command heuristics).
+        manifest = self._ratify_manifest(
+            compose_file, project_name, force=force_overwrite, non_interactive=non_interactive
+        )
+        if manifest is None:
+            # No routable service and the user declined to proceed.
+            return False
+
         # 3. Generate the compose overlay (.ilha/docker-compose.overlay.yml).
-        if not self._write_compose_overlay(compose_file, domain=domain, ip=ip):
+        if not self._write_compose_overlay(
+            compose_file, routable=manifest.routable_ports(), domain=domain, ip=ip
+        ):
             return False
 
         # 4. Create config.yml
@@ -602,10 +615,79 @@ if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
         
         return None
     
+    def _ratify_manifest(
+        self,
+        compose_file: Path,
+        project_name: Optional[str],
+        *,
+        force: bool,
+        non_interactive: bool,
+    ):
+        """Load or propose the project manifest (.ilha/ilha.yml) and show it.
+
+        Respects a hand-edited manifest: re-running setup without --force keeps
+        the existing manifest rather than clobbering the user's edits. Returns
+        the manifest, or None if there is no routable service and the user
+        declines to proceed.
+        """
+        import yaml
+
+        from ..config.manifest import load_manifest, write_manifest, manifest_from_detection
+        from ..utils.project_footprint import detect_project_footprint
+
+        try:
+            user_compose = yaml.safe_load(compose_file.read_text()) or {}
+        except Exception as e:
+            log_error(f"Failed to read compose file: {e}")
+            return None
+
+        try:
+            existing = load_manifest(self.project_root)
+        except Exception as e:
+            log_warning(f"Existing .ilha/ilha.yml is invalid ({e}); regenerating from detection.")
+            existing = None
+
+        if existing is not None and not force:
+            log_info("Using existing .ilha/ilha.yml (edit it to change routing/services).")
+            manifest = existing
+        else:
+            resolved_name = project_name or self.project_root.name
+            footprint = detect_project_footprint(self.project_root)
+            manifest = manifest_from_detection(user_compose, footprint, resolved_name)
+            write_manifest(self.project_root, manifest)
+            log_success("Wrote project manifest: .ilha/ilha.yml")
+            self._display_manifest(manifest)
+
+        if not manifest.web:
+            log_warning(
+                "No web-routable service was detected. Nothing will be reachable via a "
+                "domain until you add a service under `web:` in .ilha/ilha.yml."
+            )
+            if not non_interactive:
+                if not prompt_yes_no("Continue setup with no routable service?", default=False):
+                    log_info("Setup stopped. Edit .ilha/ilha.yml `web:` and re-run `ilha setup`.")
+                    return None
+        return manifest
+
+    def _display_manifest(self, manifest) -> None:
+        """Print the ratification summary — what ilha understood about the project."""
+        log_info("ilha will run this project as:")
+        if manifest.web:
+            for w in manifest.web:
+                dom = w.domain or "<project>-<branch>.localhost"
+                log_info(f"  - web: {w.service} (port {w.port}) -> {dom}")
+        else:
+            log_info("  - web: (none detected)")
+        if manifest.db:
+            log_info(f"  - db:  {manifest.db.service} ({manifest.db.engine})")
+        if manifest.volumes:
+            log_info(f"  - volumes cloned per worktree: {', '.join(manifest.volumes)}")
+
     def _write_compose_overlay(
         self,
         source_compose: Path,
         *,
+        routable: Optional[Dict[str, int]] = None,
         domain: Optional[str] = None,
         ip: Optional[str] = None,
     ) -> bool:
@@ -638,7 +720,7 @@ if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
                 f"Caddy proxy via the `ilha-proxy` project."
             )
 
-        overlay = generate_overlay(user_compose, domain=domain, ip=ip)
+        overlay = generate_overlay(user_compose, routable=routable, domain=domain, ip=ip)
 
         target = self.ilha_dir / "docker-compose.overlay.yml"
         target.parent.mkdir(parents=True, exist_ok=True)

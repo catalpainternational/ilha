@@ -14,6 +14,7 @@ RESERVED_COMMANDS = {
     "delete-all",
     "list",
     "prune",
+    "doctor",
     "volumes",
     "setup",
     "server-import",
