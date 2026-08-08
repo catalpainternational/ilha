@@ -14,7 +14,7 @@ from .logging import log_warning
 
 EnvLayer = Union[Path, Mapping[str, str], None]
 
-SENSITIVE_ENV_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_PRIVATE_KEY")
+SENSITIVE_ENV_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_PRIVATE_KEY", "_API_KEY")
 DEFAULT_SENSITIVE_EXACT_KEYS = frozenset(
     {
         "DIGITALOCEAN_API_TOKEN",

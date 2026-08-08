@@ -134,22 +134,23 @@ class DropletCommands:
         *,
         api_token: Optional[str] = None,
         branch: Optional[str] = None,
+        require_tags: Optional[List[str]] = None,
     ) -> List[DropletInfo]:
-        """List droplets that include the given tag, optionally filtered by branch tag."""
+        """List droplets that include the given tag (and every ``require_tags``
+        entry), optionally filtered by branch tag."""
         provider, error_msg = self._get_provider(api_token, json=False)
         if error_msg or not provider:
             raise ilhaCommandError(error_msg or "DigitalOcean provider unavailable")
         droplets = provider.list_droplets()
         branch_tag = f"branch:{branch}" if branch else None
-        results: List[DropletInfo] = []
-        for droplet in droplets:
-            tags = droplet.tags or []
-            if tag not in tags:
-                continue
-            if branch_tag and branch_tag not in tags:
-                continue
-            results.append(droplet)
-        return results
+        wanted = [tag, *(require_tags or [])]
+        if branch_tag:
+            wanted.append(branch_tag)
+        return [
+            droplet
+            for droplet in droplets
+            if all(w in (droplet.tags or []) for w in wanted)
+        ]
     
     def _resolve_droplet_identifiers(self, identifiers: str, api_token: Optional[str] = None, json: bool = False) -> Tuple[List[int], List[Dict[str, Any]]]:
         """Resolve comma-separated droplet identifiers (IDs or names) to droplet IDs.

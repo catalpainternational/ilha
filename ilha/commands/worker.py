@@ -25,6 +25,7 @@ from ilha.utils.logging import log_info, log_success
 
 DEFAULT_WORKER_TAG = "worker"
 DEFAULT_MANAGED_TAG = "ilha-managed"
+PROJECT_TAG_PREFIX = "ilha-project"
 DEFAULT_WORKER_SERVICE = "rq-worker-1"
 CLOUD_INIT_TEMPLATE = "worker_cloud_init.sh.tpl"
 REQUIRED_WORKER_ENV_KEYS = ("DB_HOST", "REDIS_HOST", "COMPOSE_PROJECT_NAME")
@@ -35,6 +36,27 @@ DEFAULT_ENV_EXCLUDE = (
     "DJANGO_SECRET_KEY",
 )
 ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
+
+
+def project_scope_tag(project_root: Path) -> str:
+    """Tag that pins a worker fleet to one project.
+
+    Fleet selection by ``worker`` + ``branch:<name>`` alone is account-wide:
+    two ilha projects in the same DigitalOcean account, both with a
+    ``staging`` branch, would otherwise list — and destroy — each other's
+    droplets.
+    """
+    name = re.sub(r"[^a-zA-Z0-9_-]", "-", project_root.name).strip("-") or "project"
+    return f"{PROJECT_TAG_PREFIX}:{name}"
+
+
+def has_project_context(project_root: Path) -> bool:
+    """True when ``project_root`` is a real ilha project (has .ilha/config.yml).
+
+    ``get_project_root`` falls back to the cwd, so a bare cwd name must not be
+    trusted as a fleet scope for destructive operations.
+    """
+    return (project_root / ILHA_DIR / "config.yml").exists()
 
 
 @dataclass(frozen=True)
@@ -53,6 +75,7 @@ class WorkerPoolConfig:
     central_droplet_name: Optional[str] = None
     env_allowlist: Tuple[str, ...] = ()
     env_exclude: Tuple[str, ...] = DEFAULT_ENV_EXCLUDE
+    env_overrides: Tuple[Tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -119,6 +142,12 @@ class WorkerManager:
         elif isinstance(env_exclude, str):
             env_exclude = [k.strip() for k in env_exclude.split(",") if k.strip()]
 
+        env_overrides = merged.get("env_overrides") or {}
+        if not isinstance(env_overrides, dict):
+            raise ilhaCommandError(
+                "worker_pool.env_overrides must be a mapping of ENV_VAR: value"
+            )
+
         return WorkerPoolConfig(
             worker_service=str(merged.get("worker_service") or DEFAULT_WORKER_SERVICE),
             size=str(merged.get("size") or "s-2vcpu-4gb"),
@@ -132,6 +161,7 @@ class WorkerManager:
             central_droplet_name=merged.get("central_droplet_name"),
             env_allowlist=tuple(str(k) for k in env_allowlist),
             env_exclude=tuple(str(k) for k in env_exclude),
+            env_overrides=tuple(sorted((str(k), str(v)) for k, v in env_overrides.items())),
         )
 
     def resolve_worktree_path(self, branch_name: str) -> Path:
@@ -195,13 +225,18 @@ class WorkerManager:
             redis_port = str(updated_env.get("REDIS_PORT") or "6379")
             redis_db = str(updated_env.get("REDIS_DB") or "0")
             updated_env["REDIS_URL"] = f"redis://{central_private_ip}:{redis_port}/{redis_db}"
-            db_port = str(updated_env.get("DB_PORT") or "5432")
-            db_user = str(updated_env.get("POSTGRES_USER") or "biuser")
-            db_pass = str(updated_env.get("POSTGRES_PASSWORD") or "bipassword")
-            db_name = str(updated_env.get("POSTGRES_DB") or "business_intelligence")
-            updated_env["DATABASE_URL"] = (
-                f"postgres://{db_user}:{db_pass}@{central_private_ip}:{db_port}/{db_name}"
-            )
+            # DATABASE_URL is only assembled when its credentials are actually
+            # present. Fabricated fallbacks would produce a URL that connects
+            # nowhere while looking configured; the compose file's own
+            # interpolation remains the source of truth otherwise.
+            db_user = updated_env.get("POSTGRES_USER")
+            db_pass = updated_env.get("POSTGRES_PASSWORD")
+            db_name = updated_env.get("POSTGRES_DB")
+            if db_user and db_pass and db_name:
+                db_port = str(updated_env.get("DB_PORT") or "5432")
+                updated_env["DATABASE_URL"] = (
+                    f"postgres://{db_user}:{db_pass}@{central_private_ip}:{db_port}/{db_name}"
+                )
 
         return updated_env, compose_copy
 
@@ -241,22 +276,20 @@ class WorkerManager:
         exclude = pool_cfg.env_exclude
         needed_keys = self._worker_env_keys(compose_data, worker_service)
 
-        filtered: Dict[str, str] = {}
-        for key in sorted(needed_keys):
-            if key in source_env:
-                filtered[key] = source_env[key]
-
-        if allowlist:
-            for key, value in source_env.items():
-                if key.upper() in allowlist:
-                    filtered[key] = value
-            return filtered
-
-        return {
-            key: value
-            for key, value in filtered.items()
-            if not self._is_sensitive_env_key(key, exclude=exclude)
+        # Sensitive keys are stripped first; the allowlist then re-adds
+        # specific keys as explicit opt-ins. It must never disable the filter
+        # wholesale — allowlisting one password is not consent to ship every
+        # API key the compose file references into cloud-init user data.
+        filtered = {
+            key: source_env[key]
+            for key in sorted(needed_keys)
+            if key in source_env
+            and not self._is_sensitive_env_key(key, exclude=exclude)
         }
+        for key, value in source_env.items():
+            if key.upper() in allowlist:
+                filtered[key] = value
+        return filtered
 
     @staticmethod
     def _write_private_file(path: Path, content: str, *, mode: int = 0o600) -> None:
@@ -332,6 +365,10 @@ class WorkerManager:
             central_private_ip,
             excluded,
         )
+        # Pool-level overrides apply last: they exist to pin values that must
+        # differ on ephemeral workers (e.g. RQ_QUEUE_NAMES=scraping) no matter
+        # what the central environment or compose defaults say.
+        env_vars.update(dict(pool_cfg.env_overrides))
         env_vars.setdefault("COMPOSE_PROJECT_NAME", f"worker-{branch_name}")
 
         missing = [key for key in REQUIRED_WORKER_ENV_KEYS if not str(env_vars.get(key, "")).strip()]
@@ -402,11 +439,34 @@ class WorkerManager:
         branch_tag = f"branch:{branch_name}"
         if branch_tag not in tags:
             tags.append(branch_tag)
+        scope_tag = self.project_tag()
+        if scope_tag not in tags:
+            tags.append(scope_tag)
         for tag in extra_tags or []:
             if tag and tag not in tags:
                 tags.append(tag)
         return tags
 
+    def project_tag(self) -> str:
+        return project_scope_tag(self.project_root)
+
+    def has_project_context(self) -> bool:
+        return has_project_context(self.project_root)
+
     def generate_worker_name(self, branch_name: str, index: int) -> str:
         safe_branch = re.sub(r"[^a-zA-Z0-9-]", "-", branch_name).strip("-") or "worker"
         return f"worker-{safe_branch}-{index}"
+
+    @staticmethod
+    def next_worker_index(existing_names: List[str]) -> int:
+        """First index that cannot collide with a live droplet's name.
+
+        ``len(existing) + 1`` reuses an index as soon as any lower-numbered
+        droplet is destroyed, minting a second droplet with an existing name.
+        """
+        indices = []
+        for name in existing_names:
+            match = re.search(r"-(\d+)$", name or "")
+            if match:
+                indices.append(int(match.group(1)))
+        return (max(indices) + 1) if indices else 1

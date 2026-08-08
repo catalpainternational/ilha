@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
 # Version information
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 AUTHOR = "ilha Contributors"
 
 # Default project configuration (used if .ilha/config.yml doesn't exist)

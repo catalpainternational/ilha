@@ -3,8 +3,22 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
-apt-get install -y ca-certificates curl gnupg lsb-release
+# A transient mirror/network failure here would otherwise strand a droplet
+# that is tagged (and billed, and counted as fleet capacity) but runs nothing.
+apt_retry() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return 0
+    fi
+    echo "apt step failed (attempt $attempt/3): $*" >&2
+    sleep 10
+  done
+  return 1
+}
+
+apt_retry apt-get update
+apt_retry apt-get install -y ca-certificates curl gnupg lsb-release
 
 if ! command -v docker >/dev/null 2>&1; then
   install -m 0755 -d /etc/apt/keyrings
@@ -14,8 +28,8 @@ if ! command -v docker >/dev/null 2>&1; then
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
     $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     > /etc/apt/sources.list.d/docker.list
-  apt-get update
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  apt_retry apt-get update
+  apt_retry apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 fi
 
 systemctl enable --now docker

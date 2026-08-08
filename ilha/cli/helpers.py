@@ -127,13 +127,15 @@ def command_wrapper(
                         details=exc.details,
                         json_output=True,
                     )
-                else:
-                    error_exit(exc.message, exit_code=exc.exit_code)
+                    # The error envelope alone is not enough: subprocess
+                    # callers gate on the exit code before parsing anything.
+                    raise SystemExit(exc.exit_code or 1)
+                error_exit(exc.message, exit_code=exc.exit_code)
             except Exception as exc:
                 if json_enabled:
                     JSONOutput.print_error(str(exc), error_code="command_error", json_output=True)
-                else:
-                    raise
+                    raise SystemExit(1)
+                raise
 
         return wrapper
 

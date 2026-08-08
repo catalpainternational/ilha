@@ -13,7 +13,25 @@ from ilha.commands.worker import DEFAULT_WORKER_TAG, WorkerManager
 from ilha.core.droplet_manager import DropletManager
 from ilha.exceptions import ilhaCommandError
 from ilha.utils.json_output import JSONOutput
-from ilha.utils.logging import log_info, log_success, print_plain
+from ilha.utils.logging import log_info, log_success, log_warning, print_plain
+
+
+def _fleet_scope_tags(mgr: WorkerManager, *, destructive: bool) -> List[str]:
+    """Project tags that scope fleet listings and destroys.
+
+    Without a real project context the scope tag would be derived from the
+    bare cwd name — fine to warn about for a read-only listing, but never an
+    acceptable basis for a destroy.
+    """
+    if mgr.has_project_context():
+        return [mgr.project_tag()]
+    if destructive:
+        raise ilhaCommandError(
+            "No ilha project context here (.ilha/config.yml not found). "
+            "Run from the project directory, or destroy specific droplets with --ids."
+        )
+    log_warning("No ilha project context; listing worker droplets across all projects")
+    return []
 
 
 def _resolve_central_private_ip(
@@ -191,8 +209,13 @@ def register_commands(cli) -> None:
         user_data = mgr.render_cloud_init(bundle, secrets_profile=secrets_profile)
         droplet_cmds = DropletCommands()
 
-        existing = droplet_cmds.list_droplets_by_tag(DEFAULT_WORKER_TAG, api_token=api_token, branch=branch)
-        start_index = len(existing) + 1
+        existing = droplet_cmds.list_droplets_by_tag(
+            DEFAULT_WORKER_TAG,
+            api_token=api_token,
+            branch=branch,
+            require_tags=_fleet_scope_tags(mgr, destructive=False),
+        )
+        start_index = WorkerManager.next_worker_index([d.name for d in existing])
 
         ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else list(pool_cfg.ssh_keys)
         droplet_tags = mgr.worker_tags(branch, list(tags))
@@ -215,7 +238,12 @@ def register_commands(cli) -> None:
                 return_droplet=True,
             )
             if not droplet:
-                raise ilhaCommandError(f"Failed to create worker droplet: {name}")
+                # The already-created droplets ride along in details: they are
+                # live and billing, and the caller must be able to see them.
+                raise ilhaCommandError(
+                    f"Failed to create worker droplet: {name}",
+                    details={"created": created},
+                )
             created.append(
                 {
                     "id": droplet.id,
@@ -365,6 +393,7 @@ def register_commands(cli) -> None:
             DEFAULT_WORKER_TAG,
             api_token=api_token,
             branch=branch,
+            require_tags=_fleet_scope_tags(WorkerManager(), destructive=False),
         )
         rows = [
             {
@@ -376,6 +405,7 @@ def register_commands(cli) -> None:
                 "region": d.region,
                 "size": d.size,
                 "tags": d.tags,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
             }
             for d in droplets
         ]
@@ -403,12 +433,23 @@ def register_commands(cli) -> None:
         target_ids: List[int] = []
 
         if ids:
-            resolved, errors = droplet_cmds._resolve_droplet_identifiers(ids, api_token, json)
-            if errors and not resolved:
-                raise ilhaCommandError(errors[0]["error"])
+            # json=False: mid-command JSON error prints would corrupt stdout
+            # (two JSON documents); resolution failures are raised instead.
+            resolved, errors = droplet_cmds._resolve_droplet_identifiers(ids, api_token, False)
+            if errors:
+                raise ilhaCommandError(
+                    "Could not resolve droplet identifier(s): "
+                    + ", ".join(e["identifier"] or "?" for e in errors),
+                    details={"unresolved": errors, "resolved": resolved},
+                )
             target_ids = resolved
         elif destroy_all:
-            droplets = droplet_cmds.list_droplets_by_tag(DEFAULT_WORKER_TAG, api_token=api_token, branch=branch)
+            droplets = droplet_cmds.list_droplets_by_tag(
+                DEFAULT_WORKER_TAG,
+                api_token=api_token,
+                branch=branch,
+                require_tags=_fleet_scope_tags(WorkerManager(), destructive=True),
+            )
             target_ids = [d.id for d in droplets]
         else:
             raise ilhaCommandError("Specify --ids or --all")
@@ -434,15 +475,17 @@ def register_commands(cli) -> None:
             else:
                 failed.append(droplet_id)
 
-        if json:
-            return JSONOutput.success(
-                "Worker droplets destroyed" if not failed else "Some worker droplets failed to destroy",
-                {"destroyed": destroyed, "failed": failed},
-            )
-        if destroyed:
-            log_success(f"Destroyed {len(destroyed)} worker droplet(s)")
         if failed:
-            raise ilhaCommandError(f"Failed to destroy droplet(s): {', '.join(map(str, failed))}")
+            # A failed destroy leaves billing droplets behind; that is an
+            # error outcome (success: false, exit != 0), never a success
+            # message with a footnote.
+            raise ilhaCommandError(
+                f"Failed to destroy droplet(s): {', '.join(map(str, failed))}",
+                details={"destroyed": destroyed, "failed": failed},
+            )
+        if json:
+            return JSONOutput.success("Worker droplets destroyed", {"destroyed": destroyed, "failed": []})
+        log_success(f"Destroyed {len(destroyed)} worker droplet(s)")
 
     @worker.command("destroy")
     @click.option("--ids", help="Comma-separated droplet IDs or names to destroy")
