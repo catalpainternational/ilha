@@ -11,7 +11,7 @@ from ilha.cli.helpers import add_json_option, add_verbose_option, command_wrappe
 from ilha.commands.secrets import SecretsManager, SopsBackend
 from ilha.exceptions import ilhaCommandError
 from ilha.utils.json_output import JSONOutput
-from ilha.utils.logging import log_success, print_plain
+from ilha.utils.logging import log_success, print_data, print_plain
 
 
 def register_commands(cli) -> None:
@@ -73,7 +73,9 @@ def register_commands(cli) -> None:
                 {"profile": profile_name or mgr.default_profile_name(), "env": env},
             )
         for key in sorted(env):
-            print_plain(f"{key}={env[key]}")
+            # print_data, not print_plain: rich hard-wraps long values at the
+            # terminal width, corrupting piped output.
+            print_data(f"{key}={env[key]}")
 
     @secrets.command("exec")
     @click.argument("profile_name")

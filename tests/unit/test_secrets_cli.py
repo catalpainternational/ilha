@@ -70,3 +70,20 @@ def test_secrets_print_redacts(monkeypatch, runner):
     assert result.exit_code == 0, result.output
     payload = _extract_json(result.output)
     assert payload["data"]["env"]["DJANGO_SECRET_KEY"] == "***"
+
+
+def test_secrets_print_preserves_long_and_bracketed_values(runner, monkeypatch, capfd):
+    """Data fidelity: rich's console hard-wraps long lines at terminal width
+    and eats [bracketed] text as markup — either corrupts `secrets print`
+    output consumed by pipes (a 164-char API key came back 65 chars)."""
+    long_value = "sk-" + "x" * 200
+    bracketed = "prefix[red]suffix"
+    monkeypatch.setattr(
+        "ilha.cli_commands.secrets.SecretsManager.decrypt_profile",
+        lambda self, name=None: {"LONG_KEY": long_value, "BRACKET_KEY": bracketed},
+    )
+    result = runner.invoke(cli, ["secrets", "print", "staging"])
+    assert result.exit_code == 0
+    out = capfd.readouterr().out + result.output
+    assert f"LONG_KEY={long_value}" in out
+    assert f"BRACKET_KEY={bracketed}" in out

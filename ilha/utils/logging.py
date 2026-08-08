@@ -5,6 +5,7 @@ This module provides colored output and logging functionality that matches
 the bash script's output format.
 """
 
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -110,6 +111,18 @@ def print_plain(message: str) -> None:
     """Print plain text without any prefix."""
     if not _quiet_mode:
         console.print(message)
+
+
+def print_data(message: str) -> None:
+    """Print machine-consumable output byte-for-byte.
+
+    ``print_plain`` renders through rich, which hard-wraps long lines at the
+    terminal width (even when piped) and interprets ``[...]`` as markup —
+    both corrupt data. Use this for anything a pipe or file may consume,
+    e.g. decrypted env lines.
+    """
+    if not _quiet_mode:
+        sys.stdout.write(message + "\n")
 
 def show_version() -> None:
     """Show version information."""
