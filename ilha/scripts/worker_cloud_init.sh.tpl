@@ -35,6 +35,7 @@ fi
 systemctl enable --now docker
 
 mkdir -p /app
+umask 077  # env.ilha carries credentials; nothing here needs group/world reads
 echo '{{COMPOSE_B64}}' | base64 -d > /app/docker-compose.yml
 echo '{{ENV_B64}}' | base64 -d > /app/env.ilha
 
