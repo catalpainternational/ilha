@@ -209,3 +209,64 @@ def test_caddy_monitor_excluded_from_overlay():
     overlay = _gen(user)
     assert "web" in overlay["services"]
     assert "caddy-monitor" not in overlay["services"]
+
+
+# ── Path-based routing for two-tier (Django + SPA) projects ─────────────
+
+
+TWO_TIER = {
+    "services": {
+        "web": {"image": "django", "expose": ["8000"]},
+        "frontend": {"image": "node", "expose": ["5173"]},
+    }
+}
+ROUTABLE = {"web": 8000, "frontend": 5173}
+
+
+def test_a_path_constrained_service_says_which_paths_it_owns():
+    overlay = generate_overlay(
+        TWO_TIER, routable=ROUTABLE,
+        path_routes={"web": ["/api/*", "/slack/*"], "frontend": []},
+    )
+    assert overlay["services"]["web"]["labels"]["caddy.proxy.path"] == "/api/*,/slack/*"
+
+
+def test_the_catch_all_service_gets_no_path_label():
+    """An empty list means "everything else". A label there would make it match
+    nothing, and the domain would have no catch-all at all."""
+    overlay = generate_overlay(
+        TWO_TIER, routable=ROUTABLE,
+        path_routes={"web": ["/api/*"], "frontend": []},
+    )
+    assert "caddy.proxy.path" not in overlay["services"]["frontend"]["labels"]
+
+
+def test_two_routable_services_do_not_both_claim_the_whole_domain():
+    """The bug this exists for. Both services declare the same `caddy.proxy`
+    domain, so without a path constraint Caddy ends up with two handlers that
+    each match everything and resolves it by container start order — one way
+    round the SPA is unreachable, the other way the backend is, and a webhook
+    posted to the SPA gets a 200 and an HTML body."""
+    overlay = generate_overlay(
+        TWO_TIER, routable=ROUTABLE,
+        path_routes={"web": ["/api/*"], "frontend": []},
+    )
+    labels = [overlay["services"][s]["labels"] for s in ("web", "frontend")]
+    assert labels[0]["caddy.proxy"] == labels[1]["caddy.proxy"]
+    constrained = [l for l in labels if "caddy.proxy.path" in l]
+    assert len(constrained) == 1
+
+
+def test_a_single_tier_project_is_left_unconstrained():
+    """One routable service needs no split, and inventing one would break it."""
+    overlay = generate_overlay(
+        {"services": {"web": {"image": "django", "expose": ["8000"]}}},
+        routable={"web": 8000},
+    )
+    assert "caddy.proxy.path" not in overlay["services"]["web"]["labels"]
+
+
+def test_omitting_path_routes_keeps_the_previous_behaviour():
+    overlay = generate_overlay(TWO_TIER, routable=ROUTABLE)
+    for service in ("web", "frontend"):
+        assert "caddy.proxy.path" not in overlay["services"][service]["labels"]

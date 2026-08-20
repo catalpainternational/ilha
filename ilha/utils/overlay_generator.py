@@ -14,7 +14,7 @@ not even copied — compose deep-merges base + overlay at runtime.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .caddy_config import (
     WEB_SERVICE_NAMES,
@@ -104,6 +104,7 @@ def generate_overlay(
     routable: Optional[Dict[str, int]] = None,
     domain: Optional[str] = None,
     ip: Optional[str] = None,
+    path_routes: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Build the compose overlay dict for the user's project.
 
@@ -116,6 +117,15 @@ def generate_overlay(
     which services are web-routable and on what port — no guessing. When None
     (a project with no manifest yet), the historical name/image heuristics
     apply, preserving old behavior.
+
+    ``path_routes`` is ``{service_name: [path, ...]}``. A service listed with
+    paths gets a ``caddy.proxy.path`` label so its route only matches those;
+    one listed with an empty list is the catch-all. Without it, two routable
+    services on one domain each emit a bare ``reverse_proxy`` and Caddy is left
+    holding two handlers that both match everything — whichever container it
+    reads first wins, which is a coin toss between "the SPA is unreachable" and
+    "the backend is unreachable". Deploy has always passed this; local setup
+    did not, so dev and production disagreed about their own routing.
 
     Django-specific deltas live in env.ilha (gated by ``has_django`` in
     ``generate_env_compose_content``); the overlay itself is framework-neutral.
@@ -155,12 +165,19 @@ def generate_overlay(
             # worktree environments.
             ovr["ports"] = compose_reset()
             ovr["expose"] = [str(port)]
-            ovr["labels"] = {
+            labels = {
                 "caddy.proxy": proxy_domain,
                 "caddy.proxy.reverse_proxy": (
                     f"${{COMPOSE_PROJECT_NAME}}-{service_name}:{port}"
                 ),
             }
+            # Only when this service is path-constrained. An empty list means
+            # "catch-all" and deliberately emits no label — that is what the
+            # dynamic config sorts last.
+            paths = (path_routes or {}).get(service_name)
+            if paths:
+                labels["caddy.proxy.path"] = ",".join(paths)
+            ovr["labels"] = labels
             # Mapping form so compose deep-merges with whatever the user has.
             ovr["networks"] = {"default": None, "ilha_caddy_proxy": None}
 

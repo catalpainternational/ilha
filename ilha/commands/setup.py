@@ -8,7 +8,7 @@ import re
 import shutil
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from ..config.settings import ILHA_DIR, get_worktree_dir
 from ..utils.logging import log_info, log_success, log_warning, log_error, log_step
@@ -22,6 +22,43 @@ from ..utils.file_utils import (
     replace_gitignore_entry,
     remove_gitignore_entry,
 )
+
+
+
+def _django_spa_path_routes(
+    project_root: Path, user_compose: Dict[str, Any]
+) -> Optional[Dict[str, List[str]]]:
+    """Which paths the backend owns, for a Django+SPA project. None otherwise.
+
+    Read from the very same ``deploy:`` block the push pipeline uses, so a
+    worktree and the droplet cannot disagree about who serves ``/admin`` or
+    ``/slack/*``. Returns None whenever the project is not two-tier or has no
+    api_paths — a single routable service needs no split, and inventing one
+    would break it.
+
+    Never raises. A project that cannot be introspected gets the old
+    unconstrained behaviour rather than a failed setup.
+    """
+    try:
+        from .push.deploy_service_config import load_deploy_service_config
+
+        config = load_deploy_service_config(project_root)
+        names = set((user_compose.get("services") or {}).keys())
+        if (
+            config.frontend_service
+            and config.api_paths
+            and config.frontend_service in names
+            and config.web_service in names
+        ):
+            return {
+                config.web_service: list(config.api_paths),
+                # Explicitly empty: the catch-all, and the thing that makes the
+                # backend's paths win by being sorted ahead of it.
+                config.frontend_service: [],
+            }
+    except Exception as exc:  # noqa: BLE001 — routing is a nicety, setup is not
+        log_warning(f"Could not work out API path routing: {exc}")
+    return None
 
 
 class SetupManager:
@@ -728,7 +765,16 @@ if 'sqlite3' in DATABASES.get('default', {}).get('ENGINE', ''):
                 f"Caddy proxy via the `ilha-proxy` project."
             )
 
-        overlay = generate_overlay(user_compose, routable=routable, domain=domain, ip=ip)
+        # Same split deploy performs, so a worktree routes the way production
+        # will. Without it both `web` and `frontend` claim the whole domain and
+        # Caddy picks by container start order — which silently served Slack's
+        # webhook endpoints the SPA's index.html, a 200 that Slack reads as
+        # success while the backend never sees the event.
+        path_routes = _django_spa_path_routes(self.project_root, user_compose)
+        overlay = generate_overlay(
+            user_compose, routable=routable, domain=domain, ip=ip,
+            path_routes=path_routes,
+        )
 
         target = self.ilha_dir / "docker-compose.overlay.yml"
         target.parent.mkdir(parents=True, exist_ok=True)
