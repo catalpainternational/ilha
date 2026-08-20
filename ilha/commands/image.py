@@ -26,6 +26,7 @@ from ilha.exceptions import ilhaCommandError
 from ilha.utils.compose_external_volumes import expand_compose_vars
 from ilha.utils.confirmation import confirm_action
 from ilha.utils.logging import log_info, log_success, log_warning
+from ilha.utils.dockerignore import assert_build_context_excludes_secrets
 from ilha.utils.env_loader import is_sensitive_env_key
 from ilha.utils.validation import validate_branch_name
 
@@ -441,6 +442,7 @@ class ImageManager:
         build = svc.build
         self._validate_build_args(build.get("args"))
         context = (plan.worktree_path / build["context"]).resolve()
+        assert_build_context_excludes_secrets(context)
         dockerfile = build["dockerfile"]
         dockerfile_path = Path(dockerfile)
         if not dockerfile_path.is_absolute():

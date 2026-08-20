@@ -4,23 +4,30 @@ from __future__ import annotations
 
 import base64
 import copy
-import os
 import re
+import shlex
+import subprocess
 import tempfile
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
 from ilha.commands.image import ImageManager
+from ilha.commands.push.deploy_preflight import DeployPreflight
 from ilha.commands.push.deploy_service_config import load_deploy_service_config
 from ilha.config.settings import ILHA_DIR, get_project_root, get_script_dir
+from ilha.core.droplet_manager import DropletInfo
 from ilha.core.worker_compose import WorkerComposeFilter
 from ilha.exceptions import ilhaCommandError
 from ilha.commands.secrets import SecretsManager
-from ilha.utils.env_loader import is_sensitive_env_key, load_env_file, merge_env_layers
-from ilha.utils.logging import log_info, log_success
+from ilha.utils.env_loader import format_env_text, is_sensitive_env_key, load_env_file, merge_env_layers
+from ilha.utils.logging import log_success
+from ilha.utils.secret_policy import NEVER_ON_WORKER_ENV, blocked_worker_allowlist_keys
+from ilha.utils.ssh_manager import SSHConnectionManager
 
 
 DEFAULT_WORKER_TAG = "worker"
@@ -29,12 +36,18 @@ PROJECT_TAG_PREFIX = "ilha-project"
 DEFAULT_WORKER_SERVICE = "rq-worker-1"
 CLOUD_INIT_TEMPLATE = "worker_cloud_init.sh.tpl"
 REQUIRED_WORKER_ENV_KEYS = ("DB_HOST", "REDIS_HOST", "COMPOSE_PROJECT_NAME")
-DEFAULT_ENV_EXCLUDE = (
-    "DIGITALOCEAN_API_TOKEN",
-    "DOCR_READ_TOKEN",
-    "EMAIL_HOST_PASSWORD",
-    "DJANGO_SECRET_KEY",
+DEFAULT_ENV_EXCLUDE = tuple(
+    sorted(
+        NEVER_ON_WORKER_ENV
+        | {
+            "EMAIL_HOST_PASSWORD",
+            "DJANGO_SECRET_KEY",
+        }
+    )
 )
+REMOTE_WORKER_DIR = "/app"
+DOCKER_READY_RETRIES = 30
+DOCKER_READY_DELAY_SECONDS = 10.0
 ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
 
@@ -165,8 +178,6 @@ class WorkerManager:
         )
 
     def resolve_worktree_path(self, branch_name: str) -> Path:
-        from ilha.commands.push.deploy_preflight import DeployPreflight
-
         return DeployPreflight(self.project_root).resolve_worktree_path(branch_name)
 
     def resolve_compose_file(self, worktree_path: Path) -> Path:
@@ -272,19 +283,26 @@ class WorkerManager:
         worker_service: str,
         pool_cfg: WorkerPoolConfig,
     ) -> Dict[str, str]:
+        blocked = blocked_worker_allowlist_keys(pool_cfg.env_allowlist)
+        if blocked:
+            raise ilhaCommandError(
+                "worker_pool.env_allowlist cannot include control-plane or "
+                f"registry-login keys: {', '.join(blocked)}. Those stay on the "
+                "operator machine; registry login is performed over SSH."
+            )
         allowlist = {k.upper() for k in pool_cfg.env_allowlist}
         exclude = pool_cfg.env_exclude
         needed_keys = self._worker_env_keys(compose_data, worker_service)
 
         # Sensitive keys are stripped first; the allowlist then re-adds
-        # specific keys as explicit opt-ins. It must never disable the filter
-        # wholesale — allowlisting one password is not consent to ship every
-        # API key the compose file references into cloud-init user data.
+        # specific app secrets as explicit opt-ins (LLM keys, DB password).
+        # Control-plane tokens are rejected above, never re-added.
         filtered = {
             key: source_env[key]
             for key in sorted(needed_keys)
             if key in source_env
             and not self._is_sensitive_env_key(key, exclude=exclude)
+            and key.upper() not in NEVER_ON_WORKER_ENV
         }
         for key, value in source_env.items():
             if key.upper() in allowlist:
@@ -319,6 +337,7 @@ class WorkerManager:
             worktree_path=worktree_path,
             exclude_deps=excluded,
             private_ip=central_private_ip,
+            branch_name=branch_name,
         )
         if not filtered or worker_service not in (filtered.get("services") or {}):
             raise ilhaCommandError(
@@ -386,7 +405,7 @@ class WorkerManager:
         if filtered.get("version") is None:
             filtered.pop("version", None)
         compose_path.write_text(yaml.dump(filtered, default_flow_style=False, sort_keys=False, allow_unicode=True))
-        self._write_private_file(env_path, "".join(f"{k}={v}\n" for k, v in env_vars.items()))
+        self._write_private_file(env_path, format_env_text(env_vars))
 
         log_success(f"Worker bundle written to {bundle_dir}")
         return WorkerBundle(
@@ -399,38 +418,184 @@ class WorkerManager:
             output_dir=bundle_dir,
         )
 
-    def render_cloud_init(
-        self,
-        bundle: WorkerBundle,
-        *,
-        registry_token_env: Optional[str] = None,
-        secrets_profile: Optional[str] = None,
-    ) -> str:
-        """Render cloud-init user data that bootstraps Docker and starts the worker."""
+    def render_cloud_init(self, bundle: WorkerBundle) -> str:
+        """Render secret-free cloud-init: install Docker and write compose YAML.
+
+        App env and the registry token are delivered later over SSH. DigitalOcean
+        stores user_data in instance metadata as plaintext.
+        """
         template_path = get_script_dir() / "scripts" / CLOUD_INIT_TEMPLATE
         if not template_path.exists():
             raise ilhaCommandError(f"Cloud-init template not found: {template_path}")
 
         compose_b64 = base64.b64encode(bundle.compose_path.read_bytes()).decode("ascii")
-        env_b64 = base64.b64encode(bundle.env_path.read_bytes()).decode("ascii")
-        token_env = registry_token_env or self.load_pool_config().registry_token_env
-        secrets_mgr = SecretsManager(self.project_root)
-        registry_token = secrets_mgr.resolve_registry_token(
-            token_env,
-            profile_name=secrets_profile,
-            profile_env=bundle.env_vars,
-        )
-        token_b64 = base64.b64encode(registry_token.encode("utf-8")).decode("ascii") if registry_token else ""
-
         template = template_path.read_text()
-        rendered = (
-            template.replace("{{WORKER_SERVICE}}", bundle.worker_service)
-            .replace("{{IMAGE_REF}}", bundle.image_ref)
-            .replace("{{COMPOSE_B64}}", compose_b64)
-            .replace("{{ENV_B64}}", env_b64)
-            .replace("__REGISTRY_TOKEN_B64__", token_b64)
+        return template.replace("{{COMPOSE_B64}}", compose_b64)
+
+    def resolve_registry_token(
+        self,
+        *,
+        secrets_profile: Optional[str] = None,
+        registry_token_env: Optional[str] = None,
+    ) -> str:
+        """Resolve the registry read token from the shell or a SOPS profile."""
+        pool_cfg = self.load_pool_config()
+        token_env = registry_token_env or pool_cfg.registry_token_env
+        secrets_mgr = SecretsManager(self.project_root)
+        token = secrets_mgr.resolve_registry_token(token_env, profile_name=secrets_profile)
+        if not token:
+            raise ilhaCommandError(
+                f"Registry token {token_env} is required to pull worker images. "
+                "Set it in the environment or pass --secrets <profile>."
+            )
+        return token
+
+    @staticmethod
+    def assert_worker_deploy_preflight(
+        *,
+        wait: bool,
+        ssh_keys: Sequence[str],
+        count: int,
+        existing_count: int,
+        max_workers: int,
+        registry_token: Optional[str] = None,
+    ) -> None:
+        """Fail before `create_droplet` when the deploy cannot be completed."""
+        if count < 1:
+            raise ilhaCommandError("--count must be at least 1")
+        if not wait:
+            raise ilhaCommandError(
+                "Worker deploy must wait for SSH: env and registry tokens are not "
+                "placed in cloud-init user_data. Omit --no-wait."
+            )
+        if not [key for key in ssh_keys if str(key).strip()]:
+            raise ilhaCommandError(
+                "SSH keys are required for worker deploy so secrets can be copied "
+                "after the droplet boots. Set worker_pool.ssh_keys or pass --ssh-keys."
+            )
+        if existing_count + count > max_workers:
+            raise ilhaCommandError(
+                f"Would exceed worker_pool.max_workers={max_workers} "
+                f"(existing={existing_count}, requested={count})"
+            )
+        if registry_token is not None and not str(registry_token).strip():
+            raise ilhaCommandError("Registry token is required to pull worker images")
+
+    @staticmethod
+    def select_idle_droplets(
+        droplets: Sequence[DropletInfo],
+        *,
+        idle_after_seconds: int,
+        now: Optional[datetime] = None,
+    ) -> List[DropletInfo]:
+        """Droplets whose created_at is at least *idle_after_seconds* ago.
+
+        Droplets with no created_at are skipped so a missing timestamp cannot
+        look like an idle worker ready to destroy.
+        """
+        if idle_after_seconds <= 0:
+            return []
+        clock = now or datetime.now(timezone.utc)
+        selected: List[DropletInfo] = []
+        for droplet in droplets:
+            created = droplet.created_at
+            if created is None:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if clock.tzinfo is None:
+                clock = clock.replace(tzinfo=timezone.utc)
+            age = (clock - created).total_seconds()
+            if age >= idle_after_seconds:
+                selected.append(droplet)
+        return selected
+
+    def bootstrap_worker(
+        self,
+        bundle: WorkerBundle,
+        host: str,
+        *,
+        username: str = "root",
+        registry_token: str = "",
+        ssh: Optional[SSHConnectionManager] = None,
+        retries: int = DOCKER_READY_RETRIES,
+        retry_delay: float = DOCKER_READY_DELAY_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ) -> None:
+        """Copy env + compose over SSH, docker login, and start the worker.
+
+        The registry token is passed on SSH stdin, not written into user_data
+        or a remote script file.
+        """
+        if not host:
+            raise ilhaCommandError("Worker droplet has no IP address; cannot deliver secrets over SSH")
+        if not registry_token:
+            raise ilhaCommandError("Registry token is required to docker login on the worker")
+
+        conn = ssh or SSHConnectionManager()
+        conn.ensure_host_key(host)
+
+        mkdir_rc, _, mkdir_err = conn.run_remote_text(
+            username, host, f"mkdir -p {REMOTE_WORKER_DIR} && chmod 700 {REMOTE_WORKER_DIR}"
         )
-        return rendered
+        if mkdir_rc != 0:
+            raise ilhaCommandError(f"Failed to prepare {REMOTE_WORKER_DIR} on {host}: {mkdir_err}")
+
+        docker_err = ""
+        for _ in range(max(retries, 1)):
+            rc, _, docker_err = conn.run_remote_text(username, host, "docker info")
+            if rc == 0:
+                break
+            sleep(retry_delay)
+        else:
+            raise ilhaCommandError(
+                f"Docker is not ready on {host} after cloud-init: {docker_err}".strip()
+            )
+
+        for local_path, remote_name in (
+            (bundle.compose_path, "docker-compose.yml"),
+            (bundle.env_path, "env.ilha"),
+        ):
+            scp_cmd = conn.build_scp_command(
+                str(local_path),
+                f"{username}@{host}:{REMOTE_WORKER_DIR}/{remote_name}",
+            )
+            result = run(scp_cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "").strip()
+                raise ilhaCommandError(f"Failed to copy {remote_name} to {host}: {err}")
+
+        chmod_rc, _, chmod_err = conn.run_remote_text(
+            username, host, f"chmod 600 {REMOTE_WORKER_DIR}/env.ilha {REMOTE_WORKER_DIR}/docker-compose.yml"
+        )
+        if chmod_rc != 0:
+            raise ilhaCommandError(f"Failed to restrict env file mode on {host}: {chmod_err}")
+
+        login_cmd = (
+            "read -r t; "
+            'printf %s "$t" | docker login registry.digitalocean.com -u "$t" --password-stdin'
+        )
+        ssh_login = conn.build_ssh_command(username, host, login_cmd)
+        login_result = run(
+            ssh_login,
+            input=registry_token + "\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if login_result.returncode != 0:
+            err = (login_result.stderr or login_result.stdout or "").strip()
+            raise ilhaCommandError(f"docker login failed on {host}: {err}")
+
+        start_cmd = (
+            f"cd {REMOTE_WORKER_DIR} && docker pull {shlex.quote(bundle.image_ref)} && "
+            f"docker compose --env-file env.ilha up -d {shlex.quote(bundle.worker_service)}"
+        )
+        start_rc, _, start_err = conn.run_remote_text(username, host, start_cmd, timeout=300)
+        if start_rc != 0:
+            raise ilhaCommandError(f"Failed to start worker on {host}: {start_err}")
+        log_success(f"Worker {bundle.worker_service} started on {host}")
 
     def worker_tags(self, branch_name: str, extra_tags: Optional[List[str]] = None) -> List[str]:
         """Build droplet tags for worker pool members."""

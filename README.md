@@ -211,11 +211,11 @@ image:
 
 CLI flags override config for one run; add `--save` to persist reusable registry/repository/platform settings. DigitalOcean Container Registry images use `registry.digitalocean.com/<registry>/<repository>/<service>:<tag>` and authenticate via the DigitalOcean API (`docker login` credentials). Published manifests are written to `.ilha/images/<branch>.json`; use `ilha image list --remote` to query DOCR tags via the DO API. Worker deploy reads digest refs from those manifests via `ImageManager.image_ref_for_service`. Future deploy orchestration should consume the manifest digest when available rather than relying on mutable tags.
 
-**Do not bake secrets into images.** `ilha image build` rejects sensitive-looking Docker `build.args` (for example `DJANGO_SECRET_KEY`, `*_TOKEN`, `*_PASSWORD`).
+**Do not bake secrets into images.** `ilha image build` rejects sensitive-looking Docker `build.args` (for example `DJANGO_SECRET_KEY`, `*_TOKEN`, `*_PASSWORD`). It also refuses to build when the context contains `.ilha/`, `secrets/`, or `backups/` unless those paths are listed in `.dockerignore`.
 
 ### SOPS Secret Profiles
 
-Store production secrets in encrypted SOPS files committed to git. Decrypt only at command boundaries (local compose, deploy, worker cloud-init).
+Store production secrets in encrypted SOPS files committed to git. Decrypt only at command boundaries (local compose, deploy). Worker env is copied over SSH after the droplet boots — never via cloud-init user_data.
 
 Configure profiles in `.ilha/config.yml`:
 
@@ -250,13 +250,14 @@ Requires [sops](https://github.com/getsops/sops) and age keys on the machine run
 
 ### Ephemeral Worker Pool
 
-Spin up short-lived RQ worker droplets that pull jobs from central Redis and report to central DB. Workers are bootstrapped via cloud-init with a minimal compose bundle built from the published image manifest.
+Spin up short-lived RQ worker droplets that pull jobs from central Redis and report to central DB. Cloud-init only installs Docker and writes compose YAML (image refs, not secrets). App env and `DOCR_READ_TOKEN` are copied over SSH after the droplet is up — DigitalOcean stores user_data in plaintext metadata.
 
 | Command | Description | Example |
 |---------|-------------|---------|
 | `worker bundle [branch]` | Generate minimal rq-worker compose + env for a droplet | `ilha worker bundle staging --central-droplet-name central` |
-| `worker deploy [branch]` | Deploy worker droplet(s) via cloud-init | `ilha worker deploy staging --count 2 --central-droplet-name central` |
+| `worker deploy [branch]` | Create worker droplet(s), then SSH-copy env and start the worker | `ilha worker deploy staging --count 2 --central-droplet-name central` |
 | `worker list` | List worker-tagged droplets | `ilha worker list --branch staging` |
+| `worker reap` | Destroy workers older than `worker_pool.idle_destroy_after_seconds` | `ilha worker reap --branch staging --dry-run` |
 | `worker destroy` | Destroy worker droplets | `ilha worker destroy --all --branch staging --force` |
 
 **Recommended flow:**
@@ -264,9 +265,9 @@ Spin up short-lived RQ worker droplets that pull jobs from central Redis and rep
 2. Deploy central via `ilha droplet deploy` (db, redis, web on one droplet in a VPC)
 3. `ilha worker deploy staging --count N --central-droplet-name <central>` when jobs need capacity
 4. Autoscale via Django `autoscale_workers` + cron (see `scripts/worker_autoscale.cron` in consuming projects)
-5. `ilha worker destroy --all --branch staging` or idle autoscale teardown when queue is empty
+5. `ilha worker reap --branch staging` or `ilha worker destroy --all --branch staging` when the queue is empty
 
-Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet name, size, region, max workers). Requires `DIGITALOCEAN_API_TOKEN`, `DOCR_READ_TOKEN` (embedded in cloud-init at deploy time), and a published image manifest for the branch.
+Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet name, size, region, `max_workers`, `ssh_keys`). Requires `DIGITALOCEAN_API_TOKEN` on the **operator machine only** (never allowlisted onto workers), `DOCR_READ_TOKEN` for SSH `docker login`, SSH keys, and a published image manifest for the branch. Deploy fails before creating a droplet if the manifest, registry token, SSH keys, or `max_workers` cap is missing.
 
 ### Droplet Management
 | Command | Description | Example |
@@ -275,6 +276,7 @@ Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet na
 | `droplet deploy --no-create` | Deploy to an existing server (skip droplet creation) | `ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root` |
 | `droplet put [branch]` | Update an existing deployment (code + config; brief downtime during web restart) | `ilha droplet put staging` |
 | `droplet logs [branch]` | Tail Docker Compose logs from a remote droplet | `ilha droplet logs staging` or `ilha droplet logs -s web -f` |
+| `ilha doctor [branch]` | Diagnose a **local** worktree (not a remote droplet) | `ilha doctor staging` |
 | `droplet list` | List all droplets (formatted table) | `ilha droplet list` |
 | `droplet list --as-json` | List droplets as JSON | `ilha droplet list --as-json` |
 | `droplet list --as-csv` | List droplets as CSV | `ilha droplet list --as-csv` |
@@ -284,7 +286,6 @@ Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet na
 | `droplet regions --as-csv` | List regions as CSV | `ilha droplet regions --as-csv` |
 | `droplet info <id>` | Get droplet information | `ilha droplet info 12345678` |
 | `droplet destroy <id>` | Destroy a droplet (supports ID or name, comma-separated) | `ilha droplet destroy 12345678` or `ilha droplet destroy my-droplet` or `ilha droplet destroy 123,456,789` |
-| `droplet doctor [branch]` | Run read-only diagnostics on a remote deployment | `ilha droplet doctor staging` |
 
 **Droplet Deploy Options:**
 - `branch_name` (optional argument) - Branch/worktree name (auto-detected from current directory if not provided)
@@ -1055,11 +1056,7 @@ ilha droplet logs staging -n 500
 ilha droplet logs --domain app.example.com -s web -f
 ```
 
-### Run Diagnostics
-```bash
-# Collect read-only diagnostics from the remote server
-ilha droplet doctor staging
-```
+Local worktree diagnostics: `ilha doctor staging`. `ilha droplet doctor` was removed.
 
 ### Multi-Project Deployments
 

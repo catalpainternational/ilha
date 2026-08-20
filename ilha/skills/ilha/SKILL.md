@@ -27,9 +27,10 @@ Concise guidance for working with the ilha CLI: worktree-isolated Docker environ
 | Lifecycle | `ilha create [branch]`, `ilha [branch] up -d`, `ilha [branch] down`, `ilha remove [branch]`, `ilha delete [branch]`, `ilha list` |
 | Compose | `ilha [branch] exec [service] [cmd]`, `ilha [branch] logs [service]`, `ilha [branch] ps`, `ilha [branch] run --rm [service] [cmd]` |
 | Django | `ilha [branch] exec web python manage.py migrate`, `ilha [branch] exec web python manage.py test`, `ilha [branch] exec web python manage.py shell`, `ilha [branch] exec web python manage.py collectstatic` |
-| Droplet | `ilha droplet deploy [branch] --domain [domain]`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy [id]`, `ilha droplet doctor [branch]`, `ilha droplet regions` |
+| Droplet | `ilha droplet deploy [branch] --domain [domain]`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy [id]`, `ilha droplet regions` |
 | Image | `ilha image publish\|list\|destroy [branch]`, `ilha image build\|push` |
-| Worker | `ilha worker deploy\|list\|destroy\|bundle [branch]` |
+| Worker | `ilha worker deploy\|list\|reap\|destroy\|bundle [branch]` |
+| Local diagnostics | `ilha doctor [branch]` (worktree checks; not a remote droplet command) |
 | Packages | `ilha packages export [branch]`, `ilha packages import [file] [--standalone] [--domain or --ip]` |
 | Proxy | `ilha start-proxy`, `ilha stop-proxy` |
 

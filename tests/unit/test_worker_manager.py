@@ -109,15 +109,15 @@ def test_build_bundle_swaps_build_for_image_and_rewrites_env(tmp_path):
     assert oct(bundle.env_path.stat().st_mode & 0o777) == oct(0o600)
 
 
-def test_build_bundle_can_allowlist_sensitive_env(tmp_path):
+def test_build_bundle_rejects_control_plane_allowlist(tmp_path):
     root = _project(tmp_path)
     config_path = root / ".ilha" / "config.yml"
     config = yaml.safe_load(config_path.read_text())
     config.setdefault("worker_pool", {})["env_allowlist"] = ["DIGITALOCEAN_API_TOKEN"]
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     mgr = WorkerManager(root)
-    bundle = mgr.build_bundle("staging", "10.0.0.5")
-    assert bundle.env_vars["DIGITALOCEAN_API_TOKEN"] == "super-secret"
+    with pytest.raises(ilhaCommandError, match="cannot include control-plane"):
+        mgr.build_bundle("staging", "10.0.0.5")
 
 
 def test_build_bundle_merges_sops_profile_env(tmp_path):
@@ -136,29 +136,41 @@ def test_build_bundle_merges_sops_profile_env(tmp_path):
     assert bundle.env_vars["POSTGRES_PASSWORD"] == "from-sops"
 
 
-def test_render_cloud_init_resolves_registry_token_from_profile_env(tmp_path, monkeypatch):
+def test_render_cloud_init_omits_env_and_registry_token(tmp_path, monkeypatch):
     root = _project(tmp_path)
     mgr = WorkerManager(root)
     bundle = mgr.build_bundle("staging", "10.0.0.5")
-    bundle.env_vars["DOCR_READ_TOKEN"] = "profile-token"
+    bundle.env_vars["POSTGRES_PASSWORD"] = "real-pw"
+    bundle.env_path.write_text("POSTGRES_PASSWORD=real-pw\n")
 
-    monkeypatch.delenv("DOCR_READ_TOKEN", raising=False)
-    cloud_init = mgr.render_cloud_init(bundle, registry_token_env="DOCR_READ_TOKEN")
+    monkeypatch.setenv("DOCR_READ_TOKEN", "profile-token")
+    cloud_init = mgr.render_cloud_init(bundle)
+
+    assert "docker-ce" in cloud_init
+    assert "REGISTRY_TOKEN" not in cloud_init
+    assert "ENV_B64" not in cloud_init
+    assert "profile-token" not in cloud_init
+    assert "real-pw" not in cloud_init
+    assert "super-secret" not in cloud_init
+    assert "docker login" not in cloud_init
+    assert "docker compose" not in cloud_init
+    assert "{{COMPOSE_B64}}" not in cloud_init
+
+
+def test_render_cloud_init_embeds_compose_only(tmp_path):
+    root = _project(tmp_path)
+    mgr = WorkerManager(root)
+    bundle = mgr.build_bundle("staging", "10.0.0.5")
+    cloud_init = mgr.render_cloud_init(bundle)
     import base64
 
-    token_b64 = cloud_init.split("REGISTRY_TOKEN_B64='", 1)[1].split("'", 1)[0]
-    assert base64.b64decode(token_b64).decode() == "profile-token"
-
-
-def test_render_cloud_init_includes_image_and_service(tmp_path):
-    root = _project(tmp_path)
-    mgr = WorkerManager(root)
-    bundle = mgr.build_bundle("staging", "10.0.0.5")
-    cloud_init = mgr.render_cloud_init(bundle, registry_token_env="DOCR_READ_TOKEN")
-    assert "docker pull" in cloud_init
-    assert bundle.image_ref in cloud_init
-    assert "rq-worker-1" in cloud_init
-    assert "REGISTRY_TOKEN_B64" in cloud_init
+    marker = "echo '"
+    start = cloud_init.find(marker)
+    assert start != -1
+    b64 = cloud_init[start + len(marker) :].split("'", 1)[0]
+    compose = base64.b64decode(b64).decode()
+    assert "rq-worker-1" in compose
+    assert bundle.image_ref in compose
 
 
 def test_create_droplet_passes_user_data(monkeypatch):
@@ -398,3 +410,130 @@ def test_list_droplets_by_tag_require_tags(monkeypatch):
         "worker", branch="staging", require_tags=["ilha-project:proj"]
     )
     assert [d.id for d in found] == [1]
+
+
+def test_assert_worker_deploy_preflight_enforces_caps_and_ssh():
+    WorkerManager.assert_worker_deploy_preflight(
+        wait=True,
+        ssh_keys=["fingerprint"],
+        count=1,
+        existing_count=9,
+        max_workers=10,
+        registry_token="tok",
+    )
+    with pytest.raises(ilhaCommandError, match="max_workers"):
+        WorkerManager.assert_worker_deploy_preflight(
+            wait=True,
+            ssh_keys=["fingerprint"],
+            count=1,
+            existing_count=10,
+            max_workers=10,
+            registry_token="tok",
+        )
+    with pytest.raises(ilhaCommandError, match="SSH keys"):
+        WorkerManager.assert_worker_deploy_preflight(
+            wait=True,
+            ssh_keys=[],
+            count=1,
+            existing_count=0,
+            max_workers=10,
+            registry_token="tok",
+        )
+    with pytest.raises(ilhaCommandError, match="wait"):
+        WorkerManager.assert_worker_deploy_preflight(
+            wait=False,
+            ssh_keys=["fingerprint"],
+            count=1,
+            existing_count=0,
+            max_workers=10,
+        )
+    with pytest.raises(ilhaCommandError, match="Registry token"):
+        WorkerManager.assert_worker_deploy_preflight(
+            wait=True,
+            ssh_keys=["fingerprint"],
+            count=1,
+            existing_count=0,
+            max_workers=10,
+            registry_token="  ",
+        )
+
+
+def test_select_idle_droplets_skips_missing_created_at():
+    from datetime import datetime, timedelta, timezone
+
+    from ilha.core.droplet_manager import DropletInfo
+
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+
+    def info(id, created_at):
+        return DropletInfo(
+            id=id,
+            name=f"worker-{id}",
+            ip_address="1.2.3.4",
+            status="active",
+            region="syd1",
+            size="s",
+            image="ubuntu",
+            created_at=created_at,
+        )
+
+    old = info(1, now - timedelta(seconds=400))
+    young = info(2, now - timedelta(seconds=10))
+    unknown = info(3, None)
+    selected = WorkerManager.select_idle_droplets(
+        [old, young, unknown],
+        idle_after_seconds=300,
+        now=now,
+    )
+    assert [d.id for d in selected] == [1]
+
+
+def test_bootstrap_worker_passes_token_on_stdin_not_argv(tmp_path):
+    root = _project(tmp_path)
+    mgr = WorkerManager(root)
+    bundle = mgr.build_bundle("staging", "10.0.0.5")
+    runs = []
+
+    class FakeSSH:
+        def ensure_host_key(self, host):
+            return True
+
+        def run_remote_text(self, username, host, command, timeout=30):
+            if command.startswith("mkdir"):
+                return 0, "", ""
+            if command == "docker info":
+                return 0, "", ""
+            if command.startswith("chmod"):
+                return 0, "", ""
+            if "docker pull" in command:
+                return 0, "", ""
+            return 1, "", f"unexpected: {command}"
+
+        def build_scp_command(self, source, target):
+            return ["scp", source, target]
+
+        def build_ssh_command(self, username, server, command=None):
+            return ["ssh", f"{username}@{server}", command or ""]
+
+    def fake_run(cmd, **kwargs):
+        runs.append({"cmd": cmd, "input": kwargs.get("input")})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    mgr.bootstrap_worker(
+        bundle,
+        "203.0.113.9",
+        registry_token="docr-secret-token",
+        ssh=FakeSSH(),
+        retries=1,
+        sleep=lambda _s: None,
+        run=fake_run,
+    )
+
+    scp_cmds = [r["cmd"] for r in runs if r["cmd"] and r["cmd"][0] == "scp"]
+    assert any("env.ilha" in " ".join(c) for c in scp_cmds)
+    login = next(r for r in runs if r["cmd"] and r["cmd"][0] == "ssh")
+    assert login["input"] == "docr-secret-token\n"
+    assert "docr-secret-token" not in " ".join(login["cmd"])
+    joined_scp = " ".join(" ".join(c) for c in scp_cmds)
+    assert "docr-secret-token" not in joined_scp
+

@@ -11,18 +11,19 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Union
 
 from .logging import log_warning
+from .secret_policy import CONTROL_PLANE_ENV_KEYS, REGISTRY_LOGIN_ENV_KEYS
 
 EnvLayer = Union[Path, Mapping[str, str], None]
 
 SENSITIVE_ENV_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_PRIVATE_KEY", "_API_KEY")
 DEFAULT_SENSITIVE_EXACT_KEYS = frozenset(
     {
-        "DIGITALOCEAN_API_TOKEN",
-        "DOCR_READ_TOKEN",
         "DJANGO_SECRET_KEY",
         "EMAIL_HOST_PASSWORD",
         "SECRET_KEY",
     }
+    | CONTROL_PLANE_ENV_KEYS
+    | REGISTRY_LOGIN_ENV_KEYS
 )
 
 

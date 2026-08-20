@@ -90,7 +90,7 @@ def register_commands(cli) -> None:
     @cli.group()
     @add_verbose_option
     def worker():
-        """Manage ephemeral RQ worker droplets (bundle, deploy, list, destroy)."""
+        """Manage ephemeral RQ worker droplets (bundle, deploy, list, reap, destroy)."""
 
     @worker.command("bundle")
     @click.argument("branch_name", required=False)
@@ -123,8 +123,6 @@ def register_commands(cli) -> None:
           ilha worker bundle staging --central-ip 10.0.0.5 --cloud-init
         """
         branch = auto_detect_branch_name(branch_name, json)
-        if not branch:
-            raise ilhaCommandError("Branch name is required")
 
         mgr = WorkerManager()
         pool_cfg = mgr.load_pool_config()
@@ -150,7 +148,7 @@ def register_commands(cli) -> None:
             "env_path": str(bundle.env_path),
         }
         if cloud_init:
-            payload["user_data"] = mgr.render_cloud_init(bundle, secrets_profile=secrets_profile)
+            payload["user_data"] = mgr.render_cloud_init(bundle)
 
         if json:
             return JSONOutput.success("Worker bundle generated", payload)
@@ -183,12 +181,27 @@ def register_commands(cli) -> None:
             raise ilhaCommandError("--count must be at least 1")
 
         branch = auto_detect_branch_name(branch_name, json)
-        if not branch:
-            raise ilhaCommandError("Branch name is required")
 
         mgr = WorkerManager()
         pool_cfg = mgr.load_pool_config()
         central_name = central_droplet_name or pool_cfg.central_droplet_name
+        ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else list(pool_cfg.ssh_keys)
+        droplet_cmds = DropletCommands()
+
+        existing = droplet_cmds.list_droplets_by_tag(
+            DEFAULT_WORKER_TAG,
+            api_token=api_token,
+            branch=branch,
+            require_tags=_fleet_scope_tags(mgr, destructive=False),
+        )
+        WorkerManager.assert_worker_deploy_preflight(
+            wait=wait,
+            ssh_keys=ssh_keys_list,
+            count=count,
+            existing_count=len(existing),
+            max_workers=pool_cfg.max_workers,
+        )
+        registry_token = mgr.resolve_registry_token(secrets_profile=secrets_profile)
         resolved_ip = _resolve_central_private_ip(
             central_ip=central_ip,
             central_droplet_name=central_name,
@@ -206,18 +219,9 @@ def register_commands(cli) -> None:
             worker_service=worker_service,
             secrets_profile=secrets_profile,
         )
-        user_data = mgr.render_cloud_init(bundle, secrets_profile=secrets_profile)
-        droplet_cmds = DropletCommands()
-
-        existing = droplet_cmds.list_droplets_by_tag(
-            DEFAULT_WORKER_TAG,
-            api_token=api_token,
-            branch=branch,
-            require_tags=_fleet_scope_tags(mgr, destructive=False),
-        )
+        user_data = mgr.render_cloud_init(bundle)
         start_index = WorkerManager.next_worker_index([d.name for d in existing])
 
-        ssh_keys_list = [k.strip() for k in ssh_keys.split(",")] if ssh_keys else list(pool_cfg.ssh_keys)
         droplet_tags = mgr.worker_tags(branch, list(tags))
 
         created = []
@@ -230,7 +234,7 @@ def register_commands(cli) -> None:
                 image=image or pool_cfg.image,
                 ssh_keys=ssh_keys_list or None,
                 tags=droplet_tags,
-                wait=wait,
+                wait=True,
                 api_token=api_token,
                 vpc_uuid=resolved_vpc,
                 user_data=user_data,
@@ -255,6 +259,14 @@ def register_commands(cli) -> None:
             )
             if not json:
                 log_info(f"Created worker droplet {droplet.name} (id={droplet.id})")
+            host = droplet.ip_address or droplet.private_ip_address
+            try:
+                mgr.bootstrap_worker(bundle, host or "", registry_token=registry_token)
+            except ilhaCommandError as exc:
+                raise ilhaCommandError(
+                    f"Created {name} but failed to deliver worker secrets: {exc.message}",
+                    details={"created": created},
+                ) from exc
 
         payload = {"branch": branch, "count": len(created), "droplets": created}
         if json:
@@ -274,7 +286,12 @@ def register_commands(cli) -> None:
     @click.option("--tags", multiple=True, help="Additional droplet tags")
     @click.option("--vpc-uuid", help="VPC UUID override")
     @click.option("--api-token", help="DigitalOcean API token")
-    @click.option("--wait", is_flag=True, default=False, help="Wait for droplets to become active")
+    @click.option(
+        "--wait/--no-wait",
+        default=True,
+        show_default=True,
+        help="Wait for SSH and copy env/registry token. --no-wait is rejected (secrets are not in user_data).",
+    )
     @add_secrets_option
     @add_json_option
     @add_verbose_option
@@ -296,12 +313,15 @@ def register_commands(cli) -> None:
         secrets_profile: Optional[str],
         json: bool,
     ):
-        """Deploy ephemeral worker droplets via cloud-init.
+        """Deploy ephemeral worker droplets.
+
+        Cloud-init only installs Docker. Env and the registry token are copied
+        over SSH after the droplet is up (user_data is plaintext in DO metadata).
 
         \b
         Examples:
           ilha worker deploy staging --count 2 --central-droplet-name central
-          ilha worker deploy staging --central-ip 10.0.0.5 --wait --json
+          ilha worker deploy staging --central-ip 10.0.0.5 --json
         """
         return _deploy_worker_droplets(
             branch_name=branch_name,
@@ -334,7 +354,12 @@ def register_commands(cli) -> None:
     @click.option("--tags", multiple=True, help="Additional droplet tags")
     @click.option("--vpc-uuid", help="VPC UUID override")
     @click.option("--api-token", help="DigitalOcean API token")
-    @click.option("--wait", is_flag=True, default=False, help="Wait for droplets to become active")
+    @click.option(
+        "--wait/--no-wait",
+        default=True,
+        show_default=True,
+        help="Wait for SSH and copy env/registry token. --no-wait is rejected (secrets are not in user_data).",
+    )
     @add_secrets_option
     @add_json_option
     @add_verbose_option
@@ -520,29 +545,84 @@ def register_commands(cli) -> None:
             json=json,
         )
 
-    @worker.command("reap", hidden=True)
-    @click.option("--ids", help="Comma-separated droplet IDs or names to destroy")
-    @click.option("--all", "destroy_all", is_flag=True, default=False, help="Destroy all worker-tagged droplets")
-    @click.option("--branch", help="When using --all, filter by branch tag")
+    @worker.command("reap")
+    @click.option("--branch", help="Filter by branch tag")
+    @click.option("--dry-run", is_flag=True, default=False, help="List idle workers without destroying them")
     @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompts")
     @click.option("--api-token", help="DigitalOcean API token")
     @add_json_option
     @add_verbose_option
     @command_wrapper(require_prerequisites=False)
     def worker_reap(
-        ids: Optional[str],
-        destroy_all: bool,
         branch: Optional[str],
+        dry_run: bool,
         force: bool,
         api_token: Optional[str],
         json: bool,
     ):
-        """Deprecated alias for ``worker destroy``."""
-        return _destroy_worker_droplets(
-            ids=ids,
-            destroy_all=destroy_all,
+        """Destroy worker droplets older than worker_pool.idle_destroy_after_seconds.
+
+        Droplets with no created_at timestamp are left alone. This is an age
+        cap, not a Redis-idle probe.
+
+        \b
+        Examples:
+          ilha worker reap --branch staging --dry-run
+          ilha worker reap --branch staging --force
+        """
+        mgr = WorkerManager()
+        pool_cfg = mgr.load_pool_config()
+        droplets = DropletCommands().list_droplets_by_tag(
+            DEFAULT_WORKER_TAG,
+            api_token=api_token,
             branch=branch,
-            force=force,
+            require_tags=_fleet_scope_tags(mgr, destructive=True),
+        )
+        idle = WorkerManager.select_idle_droplets(
+            droplets,
+            idle_after_seconds=pool_cfg.idle_destroy_after_seconds,
+        )
+        rows = [
+            {
+                "id": d.id,
+                "name": d.name,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            }
+            for d in idle
+        ]
+        payload = {
+            "idle_after_seconds": pool_cfg.idle_destroy_after_seconds,
+            "count": len(rows),
+            "droplets": rows,
+        }
+        if dry_run or not idle:
+            if json:
+                return JSONOutput.success(
+                    "Idle worker droplets listed" if dry_run else "No idle worker droplets",
+                    payload,
+                )
+            if not idle:
+                print_plain("No idle worker droplets to reap.")
+                return
+            for row in rows:
+                print_plain(f"{row['name']} (id={row['id']}, created_at={row['created_at']})")
+            return
+
+        if not force:
+            if json:
+                raise ilhaCommandError(
+                    "Pass --force to destroy idle workers, or --dry-run to list them"
+                )
+            names = ", ".join(d.name for d in idle)
+            if not click.confirm(f"Destroy {len(idle)} idle worker droplet(s)? {names}"):
+                print_plain("Aborted.")
+                return
+
+        return _destroy_worker_droplets(
+            ids=",".join(str(d.id) for d in idle),
+            destroy_all=False,
+            branch=branch,
+            force=True,
             api_token=api_token,
             json=json,
         )

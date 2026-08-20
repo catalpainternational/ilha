@@ -28,6 +28,7 @@ def _project(tmp_path: Path, config: dict | None = None, compose: dict | None = 
     (worktree / ".env").write_text("")
     (worktree / "Dockerfile").write_text("FROM scratch\n")
     (worktree / "worker.Dockerfile").write_text("FROM scratch\n")
+    (worktree / ".dockerignore").write_text(".ilha/\nsecrets/\nbackups/\n")
     compose_data = compose or {
         "services": {
             "web": {"build": "."},
@@ -258,6 +259,19 @@ def test_build_rejects_sensitive_build_args(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ilhaCommandError, match="Sensitive values must not be passed"):
+        ImageManager(root).build("staging", ImageOptions(services=("web",)))
+
+
+def test_build_refuses_unignored_ilha_dir_in_context(tmp_path, monkeypatch):
+    root = _project(tmp_path)
+    worktree = root / "worktrees" / "staging"
+    (worktree / ".dockerignore").write_text("*.pyc\n")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: _completed(stdout="abcdef1234567890\n"),
+    )
+
+    with pytest.raises(ilhaCommandError, match=r"\.ilha/"):
         ImageManager(root).build("staging", ImageOptions(services=("web",)))
 
 

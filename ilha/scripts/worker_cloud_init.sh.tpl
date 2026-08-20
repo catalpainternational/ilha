@@ -1,5 +1,10 @@
 #!/bin/bash
 # cloud-init user data for ephemeral ilha worker droplets.
+#
+# Intentionally secret-free: DigitalOcean stores user_data in metadata in
+# plaintext. Compose YAML (image refs, service names) is not a secret.
+# App env and the registry token are delivered over SSH after the droplet
+# is up — see WorkerManager.bootstrap_worker.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -35,16 +40,8 @@ fi
 systemctl enable --now docker
 
 mkdir -p /app
-umask 077  # env.ilha carries credentials; nothing here needs group/world reads
+chmod 700 /app
+umask 077
 echo '{{COMPOSE_B64}}' | base64 -d > /app/docker-compose.yml
-echo '{{ENV_B64}}' | base64 -d > /app/env.ilha
-
-REGISTRY_TOKEN_B64='__REGISTRY_TOKEN_B64__'
-if [ -n "$REGISTRY_TOKEN_B64" ]; then
-  REGISTRY_TOKEN="$(echo "$REGISTRY_TOKEN_B64" | base64 -d)"
-  echo "$REGISTRY_TOKEN" | docker login registry.digitalocean.com -u "$REGISTRY_TOKEN" --password-stdin
-fi
-
-docker pull '{{IMAGE_REF}}'
-cd /app
-docker compose --env-file env.ilha up -d '{{WORKER_SERVICE}}'
+chmod 600 /app/docker-compose.yml
+touch /app/.ilha-docker-ready

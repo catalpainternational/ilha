@@ -75,8 +75,6 @@ def register_commands(cli) -> None:
     ):
         """Build/tag local images for a worktree."""
         branch = auto_detect_branch_name(branch_name, json)
-        if not branch:
-            raise ilhaCommandError("Branch name is required")
         result = ImageManager().build(
             branch,
             _options(
@@ -113,8 +111,6 @@ def register_commands(cli) -> None:
     ):
         """Push already-built images to the configured registry."""
         branch = auto_detect_branch_name(branch_name, json)
-        if not branch:
-            raise ilhaCommandError("Branch name is required")
         result = ImageManager().push(
             branch,
             _options(
@@ -152,8 +148,6 @@ def register_commands(cli) -> None:
     ):
         """Build, push, and record an image manifest."""
         branch = auto_detect_branch_name(branch_name, json)
-        if not branch:
-            raise ilhaCommandError("Branch name is required")
         result = ImageManager().publish(
             branch,
             _options(

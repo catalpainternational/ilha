@@ -36,6 +36,7 @@ from ilha.utils.logging import (
     log_warning,
     print_plain,
 )
+from ilha.exceptions import ilhaCommandError
 from ilha.utils.path_utils import detect_execution_context, get_worktree_branch_name
 from ilha.utils.validation import (
     check_prerequisites,
@@ -433,8 +434,6 @@ def register_commands(cli) -> None:
 
             # Auto-detect branch
             branch_name = auto_detect_branch_name(branch_name, json)
-            if not branch_name:
-                return
 
             check_prerequisites_no_git()
             effective_token = api_token or dns_token
@@ -664,8 +663,8 @@ def register_commands(cli) -> None:
                         details=attach_deploy_report_data({}, deploy_report),
                     )
                 )
-            else:
-                error_exit(f"Deploy error: {exc}")
+                raise SystemExit(1)
+            error_exit(f"Deploy error: {exc}")
 
     @droplet.command("put")
     @click.argument("branch_name", required=False)
@@ -744,8 +743,6 @@ def register_commands(cli) -> None:
                 return
 
             branch_name = auto_detect_branch_name(branch_name, json)
-            if not branch_name:
-                return
 
             check_prerequisites_no_git()
 
@@ -828,8 +825,8 @@ def register_commands(cli) -> None:
                         details=attach_deploy_report_data({}, deploy_report),
                     )
                 )
-            else:
-                error_exit(f"Put error: {exc}")
+                raise SystemExit(1)
+            error_exit(f"Put error: {exc}")
 
     @droplet.command("logs")
     @click.argument("branch_name", required=False)
@@ -867,13 +864,16 @@ def register_commands(cli) -> None:
         if domain and ip:
             if json:
                 JSONOutput.print_error("--domain and --ip are mutually exclusive")
-            else:
-                error_exit("--domain and --ip are mutually exclusive")
-            return
+                raise SystemExit(1)
+            error_exit("--domain and --ip are mutually exclusive")
 
-        branch_name = auto_detect_branch_name(branch_name, json)
-        if not branch_name:
-            return
+        try:
+            branch_name = auto_detect_branch_name(branch_name, json)
+        except ilhaCommandError as exc:
+            if json:
+                JSONOutput.print_error(exc.message, json_output=True)
+                raise SystemExit(exc.exit_code or 1)
+            error_exit(exc.message)
 
         check_prerequisites_no_git()
 
@@ -943,9 +943,26 @@ def register_commands(cli) -> None:
                     print_plain(output.rstrip())
             except Exception as exc:
                 if json:
-                    JSONOutput.print_error(f"Error fetching logs: {exc}")
-                else:
-                    error_exit(f"Error fetching logs: {exc}")
+                    JSONOutput.print_error(f"Error fetching logs: {exc}", json_output=True)
+                    raise SystemExit(1)
+                error_exit(f"Error fetching logs: {exc}")
+
+    @droplet.command("doctor")
+    @click.argument("branch_name", required=False)
+    @add_json_option
+    @add_verbose_option
+    def droplet_doctor(branch_name: Optional[str], json: bool):
+        """Removed. Local worktrees: ``ilha doctor``. Remote: ``ilha droplet logs``."""
+        message = (
+            "`ilha droplet doctor` was removed. "
+            "For a local worktree use `ilha doctor`. "
+            "For a remote deployment use `ilha droplet logs`."
+        )
+        if json:
+            JSONOutput.print_error(message, error_code="command_removed", json_output=True)
+            raise SystemExit(1)
+        error_exit(message)
+
 
 def _print_elapsed(start_time: float, json: bool) -> None:
     elapsed = time.time() - start_time

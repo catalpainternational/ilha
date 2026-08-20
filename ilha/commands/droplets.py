@@ -6,6 +6,7 @@ creating, listing, and destroying droplets.
 """
 
 from typing import Optional, List, Dict, Tuple, Any, Union
+from pathlib import Path
 from ..core.droplet_manager import DropletManager, DropletProvider, DropletInfo
 from ..core.dns_manager import DNSManager
 from ..core import dns_providers  # noqa: F401 - Import to trigger registration
@@ -13,6 +14,8 @@ from ..core.dns_providers.digitalocean import DigitalOceanProvider
 from ..utils.logging import log_info, log_success, log_warning, log_error, log_step, print_plain, emit_error
 from ..utils.confirmation import confirm_action, confirm_by_typing_name
 from ..utils.json_output import JSONOutput
+from ..utils.path_utils import detect_execution_context, get_worktree_branch_name
+from ..config.settings import get_project_root
 from ..exceptions import ilhaCommandError
 from ._constants import DO_TOKEN_NOT_FOUND
 from .models import RemoteTarget, MergedConfig
@@ -1099,22 +1102,23 @@ class DropletCommands:
 
 
 def auto_detect_branch_name(branch_name: Optional[str], json: bool) -> str:
-    """Autodetect the branch name when not explicitly provided."""
+    """Autodetect the branch name when not explicitly provided.
+
+    Raises:
+        ilhaCommandError: when detection fails. Callers must not print a second
+        error or return success; ``command_wrapper`` turns this into a nonzero exit.
+    """
     if branch_name:
         return branch_name
 
     if not json:
         log_info("Branch name not provided, attempting auto-detection...")
 
-    from ..utils.path_utils import detect_execution_context, get_worktree_branch_name
-
     worktree_path, detected_branch, is_worktree = detect_execution_context()
     if is_worktree and detected_branch:
         return detected_branch
 
     try:
-        from ..config.settings import get_project_root
-
         project_root = get_project_root()
         branch = get_worktree_branch_name(project_root)
         if branch:
@@ -1122,23 +1126,16 @@ def auto_detect_branch_name(branch_name: Optional[str], json: bool) -> str:
     except (FileNotFoundError, Exception):
         pass
 
-    from pathlib import Path
     current_path = Path.cwd()
     if "worktrees" in str(current_path):
         branch = get_worktree_branch_name(current_path)
         if branch:
             return branch
 
-    message = (
+    raise ilhaCommandError(
         "Could not detect branch name. Please specify branch_name as argument or use --domain "
         "to auto-detect from subdomain."
     )
-    if json:
-        JSONOutput.print_error(message)
-    else:
-        from ..utils.logging import error_exit
-        error_exit(message)
-    return ""
 
 
 def resolve_droplet_name(branch_name: str, domain: Optional[str], json: bool) -> str:

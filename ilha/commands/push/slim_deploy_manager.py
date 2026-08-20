@@ -41,6 +41,7 @@ from ...utils.compose_external_volumes import (
 from ...utils.compose_yaml import compose_flags_str
 from ...utils.caddy_config import ensure_caddy_labels_and_network
 from ...utils.env_loader import load_env_file
+from ...utils.secret_policy import CONTROL_PLANE_ENV_KEYS
 from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ...utils.logging import (
     log_info,
@@ -2098,13 +2099,7 @@ echo OK
         # .env for DNS/droplet commands, but must NEVER be shipped to a workload
         # server: an app RCE or any local read there would escalate to full
         # cloud-account takeover. Keep such secrets on the operator machine / CI.
-        DEPLOY_ONLY_SECRETS = {
-            "DIGITALOCEAN_API_TOKEN",
-            "DIGITALOCEAN_TOKEN",
-            "DO_API_TOKEN",
-            "DO_TOKEN",
-        }
-        stripped = [k for k in list(merged) if k in DEPLOY_ONLY_SECRETS]
+        stripped = [k for k in list(merged) if k in CONTROL_PLANE_ENV_KEYS]
         for k in stripped:
             merged.pop(k, None)
         if stripped:

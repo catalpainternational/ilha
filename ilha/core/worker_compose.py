@@ -4,12 +4,11 @@ VPC port bindings and service-subset filtering used by ``WorkerManager``.
 The old hub-and-spoke ``configure_worker_environment`` path is gone.
 """
 
-import re
 import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..utils.logging import log_info, log_success, log_warning, log_error
+from ..utils.logging import log_info, log_warning, log_error
 from ..utils.container_selector import resolve_service_dependencies
 
 
@@ -140,14 +139,23 @@ class WorkerComposeFilter:
         services = compose_data.get('services', {})
         configured = False
 
-        # Determine bind address
-        bind_address = "0.0.0.0"
-        if bind_to_private_ip and private_ip:
-            bind_address = private_ip
-            log_info(f"Binding VPC services to private IP: {private_ip}")
-        elif bind_to_private_ip and not private_ip:
-            log_warning("bind_to_private_ip is enabled but no private IP available, falling back to 0.0.0.0")
-            log_warning("This may expose services to the public internet. Consider configuring firewall rules.")
+        # Determine bind address. Never fall back to 0.0.0.0: that publishes
+        # the service on the public interface of a droplet that often has no
+        # firewall. Missing private IP means skip bindings, not widen them.
+        if not private_ip:
+            log_warning(
+                "vpc.auto_bind_ports is enabled but no private IP is available; "
+                "skipping host port bindings rather than listening on 0.0.0.0"
+            )
+            return False
+        if not bind_to_private_ip:
+            log_warning(
+                "vpc.bind_to_private_ip is false; refusing 0.0.0.0 bind. "
+                "Set vpc.bind_to_private_ip: true and pass a VPC private IP."
+            )
+            return False
+        bind_address = private_ip
+        log_info(f"Binding VPC services to private IP: {private_ip}")
 
         for service_name in selected_services:
             if service_name not in services:
@@ -178,7 +186,8 @@ class WorkerComposeFilter:
                                 container_filter: List[Dict[str, str]],
                                 worktree_path: Path,
                                 exclude_deps: Optional[List[str]] = None,
-                                private_ip: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                private_ip: Optional[str] = None,
+                                branch_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Filter compose file to include only selected services and their dependencies.
 
         Args:
@@ -187,6 +196,10 @@ class WorkerComposeFilter:
             worktree_path: Path to worktree directory (for finding branch name)
             exclude_deps: Optional list of service names to exclude from dependency resolution
             private_ip: Optional private IP address for VPC port bindings
+            branch_name: Git/worktree branch to match against ``container_filter``.
+                The directory name is a fallback only — a worktree folder can
+                differ from the branch (``worktrees/staging-17a5ac4`` vs
+                ``staging``).
 
         Returns:
             Filtered compose data dict, or None if filtering fails
@@ -201,19 +214,22 @@ class WorkerComposeFilter:
                 log_warning("No services found in compose file")
                 return None
 
-            # Get branch name from worktree path
-            branch_name = worktree_path.name
+            dir_name = worktree_path.name
+            aliases = {name for name in (branch_name, dir_name) if name}
 
             # Extract service names from container_filter for this branch
             selected_services = []
             for selection in container_filter:
-                if selection.get('worktree') == branch_name:
+                if selection.get('worktree') in aliases:
                     service_name = selection.get('container')
                     if service_name and service_name in services:
                         selected_services.append(service_name)
 
             if not selected_services:
-                log_warning(f"No matching services found in container filter for branch {branch_name}")
+                log_warning(
+                    f"No matching services found in container filter for branch "
+                    f"{branch_name or dir_name}"
+                )
                 return None
 
             log_info(f"Filtering compose file to include services: {', '.join(selected_services)}")

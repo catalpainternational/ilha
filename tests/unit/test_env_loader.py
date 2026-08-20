@@ -44,6 +44,8 @@ def test_sensitive_env_detection():
     }
     assert is_sensitive_env_key("DJANGO_SECRET_KEY")
     assert is_sensitive_env_key("API_TOKEN")
+    assert is_sensitive_env_key("DIGITALOCEAN_API_TOKEN")
+    assert is_sensitive_env_key("DO_TOKEN")
     assert not is_sensitive_env_key("SITE_DOMAIN")
     assert sensitive_env_keys(env) == ["API_TOKEN", "DJANGO_SECRET_KEY"]
 
