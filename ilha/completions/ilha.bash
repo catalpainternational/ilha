@@ -7,7 +7,7 @@ _ilha_completion() {
     _init_completion || return
     
     # Main commands (including aliases)
-    local commands="start-proxy stop-proxy start stop create delete remove remove-all delete-all list prune volumes packages droplet domains setup help completion -D -r"
+    local commands="start-proxy stop-proxy start stop create delete remove remove-all delete-all list prune volumes packages droplet image secrets worker domains setup help completion -D -r"
     
     # Commands that need worktree names
     local worktree_cmds="create delete remove"
@@ -82,7 +82,7 @@ _ilha_completion() {
                 # Third position after worktree_name up/down or docker compose command
                 if [[ "${words[2]}" == "up" ]]; then
                     if [[ "$cur" == -* ]]; then
-                        COMPREPLY=( $(compgen -W "-d --detach" -- "$cur") )
+                        COMPREPLY=( $(compgen -W "-d --detach --secrets" -- "$cur") )
                     else
                         COMPREPLY=()
                     fi
@@ -127,6 +127,30 @@ _ilha_completion() {
             local droplet_subcmds="create list sizes destroy info push"
             if [[ $cword -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "$droplet_subcmds" -- "$cur") )
+            else
+                COMPREPLY=()
+            fi
+            ;;
+        image)
+            local image_subcmds="build push publish list destroy"
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "$image_subcmds" -- "$cur") )
+            else
+                COMPREPLY=()
+            fi
+            ;;
+        secrets)
+            local secrets_subcmds="list edit print exec materialize"
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "$secrets_subcmds" -- "$cur") )
+            else
+                COMPREPLY=()
+            fi
+            ;;
+        worker)
+            local worker_subcmds="bundle deploy list destroy"
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "$worker_subcmds" -- "$cur") )
             else
                 COMPREPLY=()
             fi

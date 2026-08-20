@@ -191,29 +191,11 @@ def _reset_local_pg_password(*, container_override: Optional[str], confirm: bool
     return True
 
 
-def _read_env_file(path: Path) -> Dict[str, str]:
-    """Parse a simple KEY=VALUE .env file, stripping wrap quotes."""
-    out: Dict[str, str] = {}
-    if not path.exists():
-        return out
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            out[key] = value
-    return out
-
-
 def _read_merged_env(project_root: Path) -> Dict[str, str]:
     """.env then .ilha/env.ilha — later wins (matches compose env_file ordering)."""
-    merged: Dict[str, str] = {}
-    merged.update(_read_env_file(project_root / ".env"))
-    merged.update(_read_env_file(project_root / ".ilha" / "env.ilha"))
-    return merged
+    from ilha.utils.env_loader import merge_env_layers
+
+    return merge_env_layers(project_root / ".env", project_root / ".ilha" / "env.ilha")
 
 
 def _container_running(name: str) -> bool:

@@ -29,7 +29,7 @@ def test_inner_nonzero_exit_propagates_without_wrapper_message(monkeypatch, runn
     """A non-zero inner exit must reach the parent shell verbatim with no
     "Failed to run docker compose command" wrapper message."""
 
-    def fake_passthrough(self, branch_name, compose_args):
+    def fake_passthrough(self, branch_name, compose_args, **kwargs):
         return 7
 
     monkeypatch.setattr(
@@ -51,7 +51,7 @@ def test_inner_nonzero_exit_propagates_without_wrapper_message(monkeypatch, runn
 def test_inner_zero_exit_succeeds(monkeypatch, runner):
     monkeypatch.setattr(
         "ilha.core.docker_manager.DockerManager.run_compose_passthrough",
-        lambda self, branch_name, compose_args: 0,
+        lambda self, branch_name, compose_args, **kwargs: 0,
     )
     monkeypatch.setattr(
         "ilha.core.docker_manager.DockerManager.__init__",
@@ -66,7 +66,7 @@ def test_preflight_error_surfaces_specific_message(monkeypatch, runner):
     """ilhaCommandError raised by run_compose_passthrough (e.g. missing
     compose file) must reach the user with its own message intact."""
 
-    def raising(self, branch_name, compose_args):
+    def raising(self, branch_name, compose_args, **kwargs):
         raise ilhaCommandError("docker-compose.yml not found in worktree: /x")
 
     monkeypatch.setattr(

@@ -110,7 +110,12 @@ class WorktreeManager:
             return False, result
     
     def start_worktree(
-        self, branch_name: str, profile: Optional[str] = None, *, preflight: bool = True
+        self,
+        branch_name: str,
+        profile: Optional[str] = None,
+        *,
+        preflight: bool = True,
+        secrets_profile: Optional[str] = None,
     ) -> bool:
         """Start worktree environment - CLI interface.
 
@@ -118,12 +123,20 @@ class WorktreeManager:
             branch_name: Name of the branch/worktree to start
             profile: Optional Docker Compose profile to use
             preflight: Run blocking config checks before starting containers.
+            secrets_profile: Optional SOPS secret profile name
         """
         self._ensure_orchestrator()
         extra = f" (profile: {profile})" if profile else ""
+        if secrets_profile:
+            extra += f" (secrets: {secrets_profile})"
         log_step(f"Starting worktree {branch_name}{extra}")
 
-        result = self.orchestrator.start_worktree(branch_name, profile=profile, preflight=preflight)
+        result = self.orchestrator.start_worktree(
+            branch_name,
+            profile=profile,
+            preflight=preflight,
+            secrets_profile=secrets_profile,
+        )
         
         if result['success']:
             data = result['data']

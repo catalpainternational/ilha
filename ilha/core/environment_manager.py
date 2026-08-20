@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from ..config.settings import (
     generate_env_compose_content,
     get_volume_names,
+    get_worktree_network_subnets,
     DEFAULT_ENV_VARS,
     get_project_root,
     get_worktree_paths,
@@ -414,6 +415,32 @@ class EnvironmentManager:
         from ..config.settings import get_project_name, sanitize_project_name
         project_name = sanitize_project_name(get_project_name())
         return f"{project_name}-{branch_name}.localhost"
+
+    def ensure_worktree_env_has_subnet_vars(self, worktree_path: Path, branch_name: str) -> None:
+        """Append ILHA_SUBNET_INTERNAL and ILHA_SUBNET_WEB to env.ilha if missing.
+
+        Lets worktrees created before per-worktree subnets pick up the vars on
+        the next ``ilha up``.
+        """
+        env_file = worktree_path / ".ilha" / "env.ilha"
+        if not env_file.exists():
+            return
+        try:
+            from ..utils.env_loader import load_env_file, upsert_env_vars
+
+            existing = load_env_file(env_file)
+            if "ILHA_SUBNET_INTERNAL" in existing:
+                return
+            internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
+            upsert_env_vars(
+                env_file,
+                {
+                    "ILHA_SUBNET_INTERNAL": internal_subnet,
+                    "ILHA_SUBNET_WEB": web_subnet,
+                },
+            )
+        except Exception as exc:
+            log_warning(f"Could not ensure subnet vars in {env_file}: {exc}")
 
     def get_access_url(self, branch_name: str) -> str:
         """Get the preferred access URL for a worktree.

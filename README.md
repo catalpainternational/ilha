@@ -174,6 +174,100 @@ ilha supports direct passthrough to Docker Compose commands using the pattern: `
 | `volumes restore <branch> <file>` | Restore from backup | `ilha volumes restore feature-auth backup.tar` |
 | `volumes clean <branch>` | Clean up volumes | `ilha volumes clean feature-auth` |
 
+### Image Publishing
+| Command | Description | Example |
+|---------|-------------|---------|
+| `image build [branch]` | Build and tag local Docker images for buildable compose services | `ilha image build staging --registry catalpa --save` |
+| `image push [branch]` | Push already-built image tags to the configured registry | `ilha image push staging` |
+| `image publish [branch]` | Build, push, and write `.ilha/images/<branch>.json` with exact image refs/digests | `ilha image publish staging` |
+| `image list [branch]` | List published image manifests; add `--remote` to include DOCR tags | `ilha image list staging --remote` |
+| `image destroy <branch>` | Delete published registry tags and local manifest (comma-separated branches supported) | `ilha image destroy staging --force` |
+
+**Image List Options:**
+- `branch_name` (optional argument) - Filter to one branch manifest
+- `--remote` - Query DOCR via DigitalOcean API (requires `DIGITALOCEAN_API_TOKEN`)
+- `--registry <name>` - DigitalOcean Container Registry name (for `--remote`)
+- `--repository <path>` - Repository path prefix (e.g. `bower/web`); defaults from manifest when listing one branch
+- `--json` - Output as JSON
+
+**Image Destroy Options:**
+- `<branch>` (required argument) - One or more comma-separated branch names
+- `--service <name>` - Apply registry deletion to matching compose service(s) only (repeatable)
+- `--manifest-only` - Remove `.ilha/images/<branch>.json` only; skip DOCR tag deletion
+- `--registry-only` - Delete DOCR tags only; keep local manifest
+- `--force` - Skip confirmation prompts
+- `--registry <name>` - Override DigitalOcean registry name for tag deletion
+
+Image preferences are project-local and live in `.ilha/config.yml`:
+
+```yaml
+image:
+  provider: digitalocean
+  registry: catalpa
+  repository: bower
+  platform: linux/amd64
+  tag_template: "{branch}-{sha7}"
+```
+
+CLI flags override config for one run; add `--save` to persist reusable registry/repository/platform settings. DigitalOcean Container Registry images use `registry.digitalocean.com/<registry>/<repository>/<service>:<tag>` and authenticate via the DigitalOcean API (`docker login` credentials). Published manifests are written to `.ilha/images/<branch>.json`; use `ilha image list --remote` to query DOCR tags via the DO API. Worker deploy reads digest refs from those manifests via `ImageManager.image_ref_for_service`. Future deploy orchestration should consume the manifest digest when available rather than relying on mutable tags.
+
+**Do not bake secrets into images.** `ilha image build` rejects sensitive-looking Docker `build.args` (for example `DJANGO_SECRET_KEY`, `*_TOKEN`, `*_PASSWORD`).
+
+### SOPS Secret Profiles
+
+Store production secrets in encrypted SOPS files committed to git. Decrypt only at command boundaries (local compose, deploy, worker cloud-init).
+
+Configure profiles in `.ilha/config.yml`:
+
+```yaml
+secrets:
+  provider: sops
+  default_profile: staging
+  profiles:
+    staging:
+      file: .ilha/env.staging.sops.env
+    production:
+      file: .ilha/env.production.sops.env
+```
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `secrets list` | List configured profiles | `ilha secrets list` |
+| `secrets edit <profile>` | Edit encrypted file with sops | `ilha secrets edit staging` |
+| `secrets print <profile>` | Show decrypted env (`--redact` to hide values) | `ilha secrets print staging --redact` |
+| `secrets exec <profile> -- <cmd>` | Run a command with profile env | `ilha secrets exec staging -- ilha worker deploy staging` |
+| `secrets materialize <profile> --output <path>` | Write plaintext env (requires `--force` to overwrite) | `ilha secrets materialize staging --output .ilha/env.ilha --force` |
+
+Use `--secrets <profile>` on deploy/runtime commands:
+
+```bash
+ilha staging up -d --secrets staging
+ilha droplet deploy staging --domain app.example.com --secrets production
+ilha worker deploy staging --secrets staging --count 2 --central-droplet-name central
+```
+
+Requires [sops](https://github.com/getsops/sops) and age keys on the machine running ilha. SOPS protects secrets at rest in git; runtime droplets still need plaintext env for Docker — restrict worker exposure with `worker_pool.env_allowlist`.
+
+### Ephemeral Worker Pool
+
+Spin up short-lived RQ worker droplets that pull jobs from central Redis and report to central DB. Workers are bootstrapped via cloud-init with a minimal compose bundle built from the published image manifest.
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `worker bundle [branch]` | Generate minimal rq-worker compose + env for a droplet | `ilha worker bundle staging --central-droplet-name central` |
+| `worker deploy [branch]` | Deploy worker droplet(s) via cloud-init | `ilha worker deploy staging --count 2 --central-droplet-name central` |
+| `worker list` | List worker-tagged droplets | `ilha worker list --branch staging` |
+| `worker destroy` | Destroy worker droplets | `ilha worker destroy --all --branch staging --force` |
+
+**Recommended flow:**
+1. `ilha image publish staging` — build, push, and write the image manifest
+2. Deploy central via `ilha droplet deploy` (db, redis, web on one droplet in a VPC)
+3. `ilha worker deploy staging --count N --central-droplet-name <central>` when jobs need capacity
+4. Autoscale via Django `autoscale_workers` + cron (see `scripts/worker_autoscale.cron` in consuming projects)
+5. `ilha worker destroy --all --branch staging` or idle autoscale teardown when queue is empty
+
+Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet name, size, region, max workers). Requires `DIGITALOCEAN_API_TOKEN`, `DOCR_READ_TOKEN` (embedded in cloud-init at deploy time), and a published image manifest for the branch.
+
 ### Droplet Management
 | Command | Description | Example |
 |---------|-------------|---------|
@@ -1129,7 +1223,7 @@ You can verify DNS records in several ways:
 
 ### VPC Deployments (DigitalOcean)
 
-ilha supports VPC (Virtual Private Cloud) deployments for secure private networking between droplets:
+ilha supports VPC (Virtual Private Cloud) deployments for secure private networking between droplets. For ephemeral RQ workers that connect to a central droplet over private IP, see [Ephemeral Worker Pool](#ephemeral-worker-pool) above.
 
 **Central and Worker Droplet Setup:**
 

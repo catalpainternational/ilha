@@ -5,6 +5,7 @@ This module provides colored output and logging functionality that matches
 the bash script's output format.
 """
 
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -17,6 +18,10 @@ from rich.text import Text
 
 # Initialize console for colored output
 console = Console()
+# Diagnostics ([INFO]/[WARNING]/[ERROR]/[SUCCESS]/[PHASE]/[TEST]) go to
+# stderr so stdout stays machine-readable: `--json` consumers parse
+# stdout, and a single stray log line there breaks them.
+diag_console = Console(stderr=True)
 
 # Global verbose mode flag
 _verbose_mode = False
@@ -59,23 +64,23 @@ def log_info(message: str) -> None:
     """Log an info message (only shown in verbose mode)."""
     if _verbose_mode:
         timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        console.print(f"[{timestamp}] [{Colors.BLUE}][INFO][/{Colors.BLUE}] {message}")
+        diag_console.print(f"[{timestamp}] [{Colors.BLUE}][INFO][/{Colors.BLUE}] {message}")
 
 def log_success(message: str) -> None:
     """Log a success message."""
     if not _quiet_mode:
-        console.print(f"[{Colors.GREEN}][SUCCESS][/{Colors.GREEN}] {message}")
+        diag_console.print(f"[{Colors.GREEN}][SUCCESS][/{Colors.GREEN}] {message}")
 
 def log_warning(message: str) -> None:
     """Log a warning message (only shown in verbose mode)."""
     if _verbose_mode:
         timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        console.print(f"[{timestamp}] [{Colors.YELLOW}][WARNING][/{Colors.YELLOW}] {message}")
+        diag_console.print(f"[{timestamp}] [{Colors.YELLOW}][WARNING][/{Colors.YELLOW}] {message}")
 
 def log_error(message: str) -> None:
     """Log an error message."""
     if not _quiet_mode:
-        console.print(f"[{Colors.RED}][ERROR][/{Colors.RED}] {message}")
+        diag_console.print(f"[{Colors.RED}][ERROR][/{Colors.RED}] {message}")
 
 def emit_error(message: str, json: bool) -> None:
     """Emit an error to JSON output or stderr depending on mode.
@@ -95,17 +100,29 @@ def emit_error(message: str, json: bool) -> None:
 def log_phase(message: str) -> None:
     """Log a phase message."""
     if not _quiet_mode:
-        console.print(f"[{Colors.PURPLE}][PHASE][/{Colors.PURPLE}] {message}")
+        diag_console.print(f"[{Colors.PURPLE}][PHASE][/{Colors.PURPLE}] {message}")
 
 def log_test(message: str) -> None:
     """Log a test message."""
     if not _quiet_mode:
-        console.print(f"[{Colors.CYAN}][TEST][/{Colors.CYAN}] {message}")
+        diag_console.print(f"[{Colors.CYAN}][TEST][/{Colors.CYAN}] {message}")
 
 def print_plain(message: str) -> None:
     """Print plain text without any prefix."""
     if not _quiet_mode:
         console.print(message)
+
+
+def print_data(message: str) -> None:
+    """Print machine-consumable output byte-for-byte.
+
+    ``print_plain`` renders through rich, which hard-wraps long lines at the
+    terminal width (even when piped) and interprets ``[...]`` as markup —
+    both corrupt data. Use this for anything a pipe or file may consume,
+    e.g. decrypted env lines.
+    """
+    if not _quiet_mode:
+        sys.stdout.write(message + "\n")
 
 def show_version() -> None:
     """Show version information."""
@@ -247,7 +264,7 @@ def log_step(message: str) -> None:
     regardless of verbose mode.
     """
     if not _quiet_mode:
-        console.print(f"  [{Colors.BLUE}]●[/{Colors.BLUE}] {message}...", highlight=False)
+        diag_console.print(f"  [{Colors.BLUE}]●[/{Colors.BLUE}] {message}...", highlight=False)
 
 
 # ──────────────────────────────────────────────────────────────────

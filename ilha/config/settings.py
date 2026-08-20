@@ -5,12 +5,13 @@ This module contains all configuration constants and settings used throughout
 the ilha CLI application.
 """
 
+import hashlib
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # Version information
-VERSION = "0.9.4"
+VERSION = "0.9.6"
 AUTHOR = "ilha Contributors"
 
 # Default project configuration (used if .ilha/config.yml doesn't exist)
@@ -428,6 +429,22 @@ def extract_domain_from_site_domain(site_domain: str) -> str:
     domain = domain.rstrip('/')
     return domain
 
+
+def get_worktree_network_subnets(branch_name: str) -> Tuple[str, str]:
+    """Return unique /24 subnets for a worktree (internal, web) to avoid pool overlap.
+
+    Uses a deterministic hash of the compose project name so each worktree
+    gets distinct subnets. Overlay compose can reference
+    ``${ILHA_SUBNET_INTERNAL}`` / ``${ILHA_SUBNET_WEB}``.
+    """
+    project_name = sanitize_project_name(get_project_name())
+    compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
+    seed = int(hashlib.sha256(compose_project_name.encode()).hexdigest()[:8], 16)
+    internal_octet = (seed % 127) * 2 + 1
+    web_octet = internal_octet + 1
+    return f"10.201.{internal_octet}.0/24", f"10.201.{web_octet}.0/24"
+
+
 # Environment file generation
 def generate_env_compose_content(
     branch_name: str,
@@ -458,6 +475,7 @@ def generate_env_compose_content(
     project_name = sanitize_project_name(resolve_project_name(project_root))  # underscores -> hyphens
     compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
     site_domain = f"{compose_project_name}.localhost"  # bare host
+    internal_subnet, web_subnet = get_worktree_network_subnets(branch_name)
     if has_django is None:
         from ..utils.project_footprint import detect_project_footprint
         has_django = detect_project_footprint(project_root).has_django
@@ -466,6 +484,10 @@ def generate_env_compose_content(
 COMPOSE_PROJECT_NAME={compose_project_name}
 PROJECT_ROOT={project_root}
 SITE_DOMAIN={site_domain}
+
+# Per-worktree network subnets (avoid pool overlap; use in docker-compose overlay)
+ILHA_SUBNET_INTERNAL={internal_subnet}
+ILHA_SUBNET_WEB={web_subnet}
 """
 
     if has_django:

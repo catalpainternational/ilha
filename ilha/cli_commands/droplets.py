@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import click
 
-from ilha.cli.helpers import add_json_option, add_verbose_option
+from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option
 from ilha.commands.droplets import (
     DropletCommands,
     auto_detect_branch_name,
@@ -349,6 +349,7 @@ def register_commands(cli) -> None:
         help="SHA256:… fingerprint of the server's SSH host key. If set, a mismatch aborts the deploy (MITM defense). Without it, the first-seen key is trusted (TOFU) and logged so you can pin it on the next deploy.",
     )
     @click.option("--smoke-timeout", type=int, default=60, help="Timeout in seconds for post-deploy smoke checks (default: 60)")
+    @add_secrets_option
     @add_json_option
     @add_verbose_option
     def droplet_deploy(
@@ -384,6 +385,7 @@ def register_commands(cli) -> None:
         strict_deploy_drift: bool,
         expected_ssh_fingerprint: Optional[str],
         smoke_timeout: int,
+        secrets_profile: Optional[str],
         json: bool,
     ):
         """Deploy a worktree to a DigitalOcean droplet (slim mode).
@@ -607,6 +609,7 @@ def register_commands(cli) -> None:
                     strict_deploy_drift=strict_deploy_drift,
                     smoke_timeout=smoke_timeout,
                     expected_ssh_fingerprint=expected_ssh_fingerprint,
+                    secrets_profile=secrets_profile,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
@@ -682,6 +685,7 @@ def register_commands(cli) -> None:
         help="Skip Postgres password validation after volume restore (dangerous; use only when intentional).",
     )
     @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_secrets_option
     @add_json_option
     @add_verbose_option
     def droplet_put(
@@ -697,6 +701,7 @@ def register_commands(cli) -> None:
         db_only: bool,
         force_password_reset: bool,
         api_token: Optional[str],
+        secrets_profile: Optional[str],
         json: bool,
     ):
         """Update an existing slim-deployed server.
@@ -781,6 +786,7 @@ def register_commands(cli) -> None:
                     code_only=code_only,
                     db_only=db_only,
                     force_password_reset=force_password_reset,
+                    secrets_profile=secrets_profile,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:

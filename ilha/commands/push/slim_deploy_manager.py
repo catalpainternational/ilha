@@ -915,6 +915,7 @@ echo OK
         restore_volumes: bool = False,
         no_build: bool = False,
         force_password_reset: bool = False,
+        secrets_profile: Optional[str] = None,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
@@ -1055,6 +1056,7 @@ echo OK
                     debug=debug,
                     use_staging_certificates=use_staging_certificates,
                     deployignore=deployignore,
+                    secrets_profile=secrets_profile,
                 )
 
                 try:
@@ -1384,6 +1386,7 @@ echo OK
         db_only: bool = False,
         force_password_reset: bool = False,
         smoke_timeout: int = 60,
+        secrets_profile: Optional[str] = None,
     ) -> bool:
         """Update an existing slim-deployed server.
 
@@ -1502,6 +1505,7 @@ echo OK
                 ip=ip,
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1570,6 +1574,7 @@ echo OK
                 ip=ip,
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1676,6 +1681,7 @@ echo OK
         debug: bool = False,
         use_staging_certificates: bool = False,
         deployignore: Optional[str] = None,
+        secrets_profile: Optional[str] = None,
     ) -> Optional[Path]:
         """Build a flat deploy directory ready to rsync.
 
@@ -1762,6 +1768,7 @@ echo OK
                 deploy_dir, worktree_path, branch_name,
                 domain=domain, ip=ip, debug=debug,
                 use_staging_certificates=use_staging_certificates,
+                secrets_profile=secrets_profile,
             )
 
             # ── caddy/ ──────────────────────────────────────────────
@@ -1948,6 +1955,7 @@ echo OK
         ip: Optional[str] = None,
         debug: bool = False,
         use_staging_certificates: bool = False,
+        secrets_profile: Optional[str] = None,
     ) -> None:
         """Build a single .env file by merging project .env + worktree env.ilha,
         then applying domain/IP overrides.
@@ -1969,17 +1977,19 @@ echo OK
         root_env = self.project_root / ".env"
         env_ilha = get_env_compose_file_path(worktree_path)
 
-        # Layers (later wins): root .env < worktree env.ilha. The compose ``db``
-        # service ``${VAR:-default}`` values are folded in as base_defaults so
-        # they fill only the gaps — an explicit user-set value still wins. This
-        # matters because, e.g., a compose ``POSTGRES_USER: ${POSTGRES_USER:-pivot}``
-        # bakes ``pivot`` into the container but never lands in the deployed
-        # ``.env``; without this, ilha's post-restore Postgres validator (which
-        # sources the .env for the right -U/-d args) would fall back to
-        # ``postgres``/``postgres``. Uses the shared merge_env_layers contract.
+        secrets_layer = None
+        if secrets_profile:
+            from ...commands.secrets import SecretsManager
+
+            secrets_layer = SecretsManager(self.project_root).decrypt_profile(secrets_profile)
+            log_info(f"Merged SOPS secret profile: {secrets_profile}")
+
+        # Layers (later wins): root .env < worktree env.ilha < SOPS profile.
+        # Compose ``db`` ``${VAR:-default}`` values fill only the gaps.
         merged: dict = merge_env_layers(
             load_env_file(root_env) if root_env.exists() else {},
             load_env_file(env_ilha) if env_ilha.exists() else {},
+            secrets_layer,
             base_defaults=self._extract_compose_db_env_defaults(worktree_path),
         )
 
@@ -2111,12 +2121,9 @@ echo OK
             )
 
         # ── Write top-level .env (used by ``docker compose --env-file``) ──
-        # Quote values for the env-file format.
-        def _env_line(key: str, value: str) -> str:
-            safe = str(value).replace("\\", "\\\\").replace('"', '\\"')
-            return f'{key}="{safe}"'
+        from ...utils.env_loader import format_env_text
 
-        payload = "\n".join(_env_line(k, v) for k, v in merged.items()) + "\n"
+        env_content = format_env_text(merged, quote_values=True)
 
         # Secret-bearing files must not be world-readable. write_text() honours
         # umask (typically 0644) and rsync -a preserves the mode onto the server,
@@ -2126,18 +2133,18 @@ echo OK
             path.chmod(0o600)
 
         env_path = deploy_dir / ".env"
-        _write_secret_file(env_path, payload)
+        _write_secret_file(env_path, env_content)
         log_info(f"Merged .env written ({len(merged)} vars)")
 
         # ── Also write .env inside code/ (referenced by compose env_file) ──
         code_env = deploy_dir / "code" / ".env"
-        _write_secret_file(code_env, payload)
+        _write_secret_file(code_env, env_content)
 
         # ── Update the env.ilha inside code/.ilha/ (loaded *second* by compose,
         #    so it must not revert production overrides to localhost defaults) ──
         code_env_ilha = deploy_dir / "code" / ".ilha" / "env.ilha"
         if code_env_ilha.exists():
-            _write_secret_file(code_env_ilha, payload)
+            _write_secret_file(code_env_ilha, env_content)
             log_info("Updated code/.ilha/env.ilha with production overrides")
 
     # ──────────────────────────────────────────────────────────────────

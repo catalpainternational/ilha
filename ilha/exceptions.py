@@ -51,3 +51,11 @@ class EnvFileError(ilhaError):
     """
 
 
+class ProviderAPIError(ilhaCommandError):
+    """Raised when a cloud provider API call fails.
+
+    Listing operations raise this instead of returning a partial or empty
+    result: an unreadable fleet must never be mistaken for an empty one
+    (a destroy pass that trusts an empty answer leaks every droplet in it).
+    """
+

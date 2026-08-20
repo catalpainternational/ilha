@@ -35,6 +35,16 @@ def add_verbose_option(func: Callable[..., Any]) -> Callable[..., Any]:
     )(func)
 
 
+def add_secrets_option(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator to add ``--secrets <profile>`` for SOPS-backed env layers."""
+    return click.option(
+        "--secrets",
+        "secrets_profile",
+        default=None,
+        help="SOPS secret profile name from .ilha/config.yml (decrypted at runtime)",
+    )(func)
+
+
 def add_json_option(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator to add a JSON output flag to a command."""
     return click.option(
@@ -121,14 +131,12 @@ def command_wrapper(
                     # 0 on failure, so `ilha <cmd> --json` looks successful to
                     # CI/automation checking $?.
                     raise SystemExit(exc.exit_code or 1)
-                else:
-                    error_exit(exc.message, exit_code=exc.exit_code)
+                error_exit(exc.message, exit_code=exc.exit_code)
             except Exception as exc:
                 if json_enabled:
                     JSONOutput.print_error(str(exc), error_code="command_error", json_output=True)
                     raise SystemExit(1)
-                else:
-                    raise
+                raise
 
         return wrapper
 

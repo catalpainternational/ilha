@@ -8,7 +8,7 @@ import click
 
 from typing import Optional
 
-from ilha.cli.helpers import add_json_option, add_verbose_option, command_wrapper
+from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option, command_wrapper
 from ilha.commands.utility import UtilityManager
 from ilha.commands.worktree import WorktreeManager
 from ilha.exceptions import ilhaCommandError
@@ -93,16 +93,27 @@ def register_commands(cli) -> None:
         default=False,
         help="Skip the blocking config checks (routability, env) run before start.",
     )
+    @add_secrets_option
     @add_json_option
     @add_verbose_option
     @command_wrapper()
-    def up(branch_name: str, detach: bool, profile: Optional[str], no_preflight: bool, json: bool):
+    def up(
+        branch_name: str,
+        detach: bool,
+        profile: Optional[str],
+        no_preflight: bool,
+        secrets_profile: Optional[str],
+        json: bool,
+    ):
         """Start the worktree environment for the specified branch."""
         if not detach:
             raise ilhaCommandError("Usage: ilha <worktree_name> up -d")
         worktree_manager = WorktreeManager()
         success = worktree_manager.start_worktree(
-            branch_name, profile=profile, preflight=not no_preflight
+            branch_name,
+            profile=profile,
+            preflight=not no_preflight,
+            secrets_profile=secrets_profile,
         )
         if not success:
             raise ilhaCommandError(f"Failed to start worktree environment for {branch_name}")

@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 from ..dns_manager import DNSProvider
 from ..droplet_manager import DropletProvider, DropletInfo
+from ...exceptions import ProviderAPIError
 from ...utils.logging import log_info, log_warning, log_error, log_success
 
 
@@ -35,6 +36,11 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             'Authorization': f'Bearer {api_token}',
             'Content-Type': 'application/json'
         })
+        # Terminal outcome of the most recent _make_request that returned
+        # None, so callers that must not swallow failures (listings) can
+        # distinguish "auth/API failure" from "resource absent".
+        self._last_error_status: Optional[int] = None
+        self._last_error_message: Optional[str] = None
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Optional[requests.Response]:
         """Make API request with error handling.
@@ -49,12 +55,15 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         """
         url = f"{self.API_BASE_URL}{endpoint}"
         timeout = kwargs.pop("timeout", 10)
+        self._last_error_status = None
+        self._last_error_message = None
         for attempt in range(1, self._MAX_REQUEST_ATTEMPTS + 1):
             try:
                 response = self.session.request(method, url, timeout=timeout, **kwargs)
             except requests.exceptions.RequestException as exc:
                 if attempt >= self._MAX_REQUEST_ATTEMPTS:
-                    log_error(f"Digital Ocean API request failed: {exc}")
+                    self._last_error_message = f"Digital Ocean API request failed: {exc}"
+                    log_error(self._last_error_message)
                     return None
                 delay = self._retry_delay(attempt)
                 log_warning(f"Digital Ocean request error ({exc}); retrying in {delay:.1f}s [{attempt}/{self._MAX_REQUEST_ATTEMPTS}]")
@@ -64,7 +73,9 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             status = response.status_code
             if status in self._RETRIABLE_STATUS_CODES:
                 if attempt >= self._MAX_REQUEST_ATTEMPTS:
-                    log_error(f"Digital Ocean API error: {status} - {response.text}")
+                    self._last_error_status = status
+                    self._last_error_message = f"Digital Ocean API error: {status} - {response.text}"
+                    log_error(self._last_error_message)
                     return None
                 retry_after = response.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
@@ -82,12 +93,16 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
                 response.raise_for_status()
                 return response
             except requests.exceptions.HTTPError:
+                self._last_error_status = status
                 if status == 401:
-                    log_error("Digital Ocean API authentication failed. Check your API token.")
+                    self._last_error_message = "Digital Ocean API authentication failed. Check your API token."
+                    log_error(self._last_error_message)
                 elif status == 404:
-                    log_warning(f"Digital Ocean resource not found: {endpoint}")
+                    self._last_error_message = f"Digital Ocean resource not found: {endpoint}"
+                    log_warning(self._last_error_message)
                 else:
-                    log_error(f"Digital Ocean API error: {status} - {response.text}")
+                    self._last_error_message = f"Digital Ocean API error: {status} - {response.text}"
+                    log_error(self._last_error_message)
                 return None
         return None
 
@@ -98,6 +113,13 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         return base + jitter
 
     def _collect_paginated(self, endpoint: str, key: str) -> List[Dict[str, Any]]:
+        """Collect every page of a listing, or raise.
+
+        A failed page must raise rather than truncate: a partial (or empty)
+        answer presented as complete would let callers act on a fleet or
+        record set they cannot actually see. A 404 is the one clean absence —
+        the container itself does not exist.
+        """
         items: List[Dict[str, Any]] = []
         page = 1
         per_page = 200
@@ -105,12 +127,22 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             sep = "&" if "?" in endpoint else "?"
             response = self._make_request("GET", f"{endpoint}{sep}page={page}&per_page={per_page}")
             if not response:
-                break
+                if self._last_error_status == 404:
+                    break
+                raise ProviderAPIError(
+                    self._last_error_message or f"Digital Ocean listing failed: {endpoint}",
+                    error_code="do_api_error",
+                    details={"endpoint": endpoint, "page": page, "status": self._last_error_status},
+                )
             try:
                 data = response.json()
                 batch = data.get(key, [])
-            except (ValueError, KeyError):
-                break
+            except (ValueError, KeyError) as exc:
+                raise ProviderAPIError(
+                    f"Digital Ocean returned an unreadable listing for {endpoint}: {exc}",
+                    error_code="do_api_error",
+                    details={"endpoint": endpoint, "page": page},
+                ) from exc
             if not batch:
                 break
             items.extend(batch)
@@ -498,7 +530,8 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
     def create_droplet(self, name: str, region: str, size: str, image: str,
                       ssh_keys: Optional[List[str]] = None,
                       tags: Optional[List[str]] = None,
-                      vpc_uuid: Optional[str] = None) -> Optional[DropletInfo]:
+                      vpc_uuid: Optional[str] = None,
+                      user_data: Optional[str] = None) -> Optional[DropletInfo]:
         """Create a new droplet.
         
         Args:
@@ -509,6 +542,7 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             ssh_keys: List of SSH key names (e.g., ['anders', 'peter']) - will be resolved to IDs
             tags: List of tags for the droplet
             vpc_uuid: Optional VPC UUID. If not provided, will use default VPC for the region.
+            user_data: Optional cloud-init user data script
             
         Returns:
             DropletInfo if successful, None otherwise
@@ -550,6 +584,9 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         
         if tags:
             payload['tags'] = tags
+
+        if user_data:
+            payload['user_data'] = user_data
         
         log_info("Sending droplet creation request to DigitalOcean API...")
         response = self._make_request('POST', '/droplets', json=payload)
@@ -655,8 +692,10 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
             
             return droplets
         except (KeyError, ValueError) as e:
-            log_warning(f"Error parsing droplets list response: {e}")
-            return []
+            raise ProviderAPIError(
+                f"Digital Ocean droplets listing could not be parsed: {e}",
+                error_code="do_api_error",
+            ) from e
     
     def get_droplet(self, droplet_id: int) -> Optional[DropletInfo]:
         """Get droplet information by ID.

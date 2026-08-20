@@ -41,7 +41,9 @@ class DropletProvider(ABC):
     @abstractmethod
     def create_droplet(self, name: str, region: str, size: str, image: str,
                       ssh_keys: Optional[List[str]] = None,
-                      tags: Optional[List[str]] = None) -> Optional[DropletInfo]:
+                      tags: Optional[List[str]] = None,
+                      vpc_uuid: Optional[str] = None,
+                      user_data: Optional[str] = None) -> Optional[DropletInfo]:
         """Create a new droplet.
         
         Args:
@@ -51,6 +53,8 @@ class DropletProvider(ABC):
             image: Droplet image (e.g., 'ubuntu-22-04-x64')
             ssh_keys: List of SSH key IDs or fingerprints
             tags: List of tags for the droplet
+            vpc_uuid: Optional VPC UUID for private networking
+            user_data: Optional cloud-init user data script
             
         Returns:
             DropletInfo if successful, None otherwise

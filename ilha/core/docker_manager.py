@@ -1223,7 +1223,8 @@ class DockerManager:
                           working_dir: Optional[Path] = None,
                           extra_flags: Optional[List[str]] = None,
                           profile: Optional[str] = None,
-                          base_compose_file: Optional[Path] = None) -> Tuple[bool, Optional[str]]:
+                          base_compose_file: Optional[Path] = None,
+                          secrets_env_file: Optional[Path] = None) -> Tuple[bool, Optional[str]]:
         """Run a docker compose command.
 
         Compose merges files in the order given; the LAST ``-f`` wins on
@@ -1264,6 +1265,10 @@ class DockerManager:
         # Then, load the worktree-specific env.ilha, which will override .env
         if env_file and env_file.exists():
             cmd.extend(["--env-file", str(env_file)])
+
+        # Optional SOPS materialized env overrides worktree env.ilha
+        if secrets_env_file and secrets_env_file.exists():
+            cmd.extend(["--env-file", str(secrets_env_file)])
 
         if project_name:
             cmd.extend(["-p", project_name])
@@ -1359,7 +1364,13 @@ class DockerManager:
         
         return volumes
     
-    def run_compose_passthrough(self, branch_name: str, compose_args: List[str]) -> int:
+    def run_compose_passthrough(
+        self,
+        branch_name: str,
+        compose_args: List[str],
+        *,
+        secrets_profile: Optional[str] = None,
+    ) -> int:
         """Run docker compose command with automatic base+overlay resolution.
 
         Acts as a transparent passthrough: the inner command's exit code is
@@ -1438,39 +1449,47 @@ class DockerManager:
         project_name = sanitize_project_name(project_name)
         compose_project_name = f"{project_name}-{sanitize_project_name(branch_name)}"
         
-        # Build base command
-        cmd = self._build_compose_base_command()
-
-        # Add environment file
-        cmd.extend(["--env-file", str(env_file)])
-
-        # Add project name
-        cmd.extend(["-p", compose_project_name])
-
-        # Pass user's compose first (base) then ilha's overlay (wins on merges)
-        cmd.extend(["-f", str(base_compose)])
-        cmd.extend(["-f", str(overlay_compose)])
-
-        # Add the passthrough arguments
-        cmd.extend(compose_args)
-
-        # Resolve working directory (already resolved as worktree_path, but ensure consistency)
         working_dir = self._resolve_working_directory(worktree_path)
-
-        # Prepare environment variables
         env = self._prepare_compose_environment(working_dir, compose_project_name)
+
+        def _build_cmd(secrets_env_file: Optional[Path] = None) -> List[str]:
+            cmd = self._build_compose_base_command()
+            main_env_file = working_dir / ".env"
+            if main_env_file.exists():
+                cmd.extend(["--env-file", str(main_env_file)])
+            cmd.extend(["--env-file", str(env_file)])
+            if secrets_env_file and secrets_env_file.exists():
+                cmd.extend(["--env-file", str(secrets_env_file)])
+            cmd.extend(["-p", compose_project_name])
+            cmd.extend(["-f", str(base_compose)])
+            cmd.extend(["-f", str(overlay_compose)])
+            cmd.extend(compose_args)
+            return cmd
 
         log_info(f"Running docker compose command for worktree '{branch_name}':")
         log_info(f"  Working directory: {working_dir}")
         log_info(f"  Base compose: {base_compose}")
         log_info(f"  Overlay compose: {overlay_compose}")
         log_info(f"  Environment file: {env_file}")
+        if secrets_profile:
+            log_info(f"  Secrets profile: {secrets_profile}")
         log_info(f"  Project name: {compose_project_name}")
-        log_info(f"  Command: {' '.join(cmd)}")
-        
+
         try:
-            # Run command and stream output to user
-            result = subprocess.run(cmd, cwd=working_dir, env=env)
+            if secrets_profile:
+                from ..commands.secrets import SecretsManager
+
+                secrets_mgr = SecretsManager(project_root_from_worktree)
+                with secrets_mgr.materialize_temp_env(
+                    secrets_mgr.decrypt_profile(secrets_profile)
+                ) as secrets_env_file:
+                    cmd = _build_cmd(secrets_env_file)
+                    log_info(f"  Command: {' '.join(cmd)}")
+                    result = subprocess.run(cmd, cwd=working_dir, env=env)
+            else:
+                cmd = _build_cmd()
+                log_info(f"  Command: {' '.join(cmd)}")
+                result = subprocess.run(cmd, cwd=working_dir, env=env)
         except OSError as e:
             raise ilhaCommandError(f"docker compose invocation failed: {e}")
         return result.returncode

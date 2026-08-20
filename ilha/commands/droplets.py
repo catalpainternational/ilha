@@ -13,6 +13,7 @@ from ..core.dns_providers.digitalocean import DigitalOceanProvider
 from ..utils.logging import log_info, log_success, log_warning, log_error, log_step, print_plain, emit_error
 from ..utils.confirmation import confirm_action, confirm_by_typing_name
 from ..utils.json_output import JSONOutput
+from ..exceptions import ilhaCommandError
 from ._constants import DO_TOKEN_NOT_FOUND
 from .models import RemoteTarget, MergedConfig
 from rich.table import Table
@@ -127,6 +128,30 @@ class DropletCommands:
         
         return droplet.id, None
     
+    def list_droplets_by_tag(
+        self,
+        tag: str,
+        *,
+        api_token: Optional[str] = None,
+        branch: Optional[str] = None,
+        require_tags: Optional[List[str]] = None,
+    ) -> List[DropletInfo]:
+        """List droplets that include the given tag (and every ``require_tags``
+        entry), optionally filtered by branch tag."""
+        provider, error_msg = self._get_provider(api_token, json=False)
+        if error_msg or not provider:
+            raise ilhaCommandError(error_msg or "DigitalOcean provider unavailable")
+        droplets = provider.list_droplets()
+        branch_tag = f"branch:{branch}" if branch else None
+        wanted = [tag, *(require_tags or [])]
+        if branch_tag:
+            wanted.append(branch_tag)
+        return [
+            droplet
+            for droplet in droplets
+            if all(w in (droplet.tags or []) for w in wanted)
+        ]
+    
     def _resolve_droplet_identifiers(self, identifiers: str, api_token: Optional[str] = None, json: bool = False) -> Tuple[List[int], List[Dict[str, Any]]]:
         """Resolve comma-separated droplet identifiers (IDs or names) to droplet IDs.
         
@@ -167,6 +192,7 @@ class DropletCommands:
                       wait: bool = False, api_token: Optional[str] = None,
                       json: bool = False, containers: Optional[str] = None,
                       vpc_uuid: Optional[str] = None,
+                      user_data: Optional[str] = None,
                       return_droplet: bool = False) -> Union[bool, Optional[DropletInfo]]:
         """Create a new droplet.
         
@@ -182,6 +208,7 @@ class DropletCommands:
             json: Output as JSON
             containers: Optional comma-separated list of 'worktree.container' patterns
                        for selective container/volume deployment (stored for future use)
+            user_data: Optional cloud-init user data script
             
         Returns:
             True if successful, False otherwise. If return_droplet=True,
@@ -227,7 +254,8 @@ class DropletCommands:
                 image=image,
                 ssh_keys=ssh_keys if ssh_keys else None,
                 tags=tags if tags else None,
-                vpc_uuid=vpc_uuid
+                vpc_uuid=vpc_uuid,
+                user_data=user_data,
             )
             
             if not droplet:

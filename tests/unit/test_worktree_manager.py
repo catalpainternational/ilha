@@ -85,7 +85,9 @@ class TestWorktreeManager:
         ok = manager.start_worktree("feature/foo")
 
         assert ok is True
-        manager.orchestrator.start_worktree.assert_called_once_with("feature/foo", profile=None, preflight=True)
+        manager.orchestrator.start_worktree.assert_called_once_with(
+            "feature/foo", profile=None, preflight=True, secrets_profile=None
+        )
 
     def test_start_worktree_failure(self, manager):
         manager.orchestrator.start_worktree.return_value = {"success": False, "error": "missing compose file"}

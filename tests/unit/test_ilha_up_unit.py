@@ -93,7 +93,9 @@ class TestilhaUpCommand:
 
         assert result is True
         orchestrator_cls.assert_called_once_with(provided_root.resolve())
-        orchestrator.start_worktree.assert_called_once_with("feature/auth", profile=None, preflight=True)
+        orchestrator.start_worktree.assert_called_once_with(
+            "feature/auth", profile=None, preflight=True, secrets_profile=None
+        )
 
     @patch('ilha.commands.worktree.WorktreeOrchestrator')
     def test_worktree_manager_start_worktree_failure(self, orchestrator_cls):

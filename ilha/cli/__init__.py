@@ -124,7 +124,9 @@ Examples:
     ilha list
 """
     )
-    cli = click.version_option(version="0.9.4", prog_name="ilha")(cli)
+    from ilha.config.settings import VERSION
+
+    cli = click.version_option(version=VERSION, prog_name="ilha")(cli)
     cli = click.option(
         "--verbose",
         "-v",
