@@ -136,3 +136,18 @@ def test_invalid_web_port_falls_back_to_base_default(tmp_path: Path) -> None:
 
     # Static base port wins because the override was invalid.
     assert cfg.web_port == 80
+
+
+def test_migrate_command_inferred_for_django(tmp_path: Path) -> None:
+    (tmp_path / "manage.py").write_text("")
+    _write_compose(tmp_path, "services:\n  web:\n    image: django-app\n  db:\n    image: postgres:16\n")
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.resolved_migrate_command(tmp_path) == "python manage.py migrate --noinput"
+
+
+def test_migrate_command_empty_disables(tmp_path: Path) -> None:
+    (tmp_path / "manage.py").write_text("")
+    _write_compose(tmp_path, "services:\n  web:\n    image: django-app\n  db:\n    image: postgres:16\n")
+    _write_config(tmp_path, {"migrate_command": ""})
+    cfg = load_deploy_service_config(tmp_path)
+    assert cfg.resolved_migrate_command(tmp_path) == ""

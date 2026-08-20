@@ -182,6 +182,35 @@ class SSHConnectionManager:
             timeout=timeout,
             check=check
         )
+
+    def execute_remote_bytes(
+        self,
+        username: str,
+        server: str,
+        command: str,
+        timeout: Optional[int] = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess:
+        """Execute a remote command and return raw bytes (for ``pg_dump -Fc``)."""
+        self.ensure_host_key(server)
+        ssh_cmd = self.build_ssh_command(username, server, command)
+        return subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    def interactive_ssh(self, username: str, server: str, command: Optional[str] = None) -> int:
+        """Open an interactive SSH session (PTY). Returns the SSH exit code."""
+        self.ensure_host_key(server)
+        cmd = self.build_ssh_command(username, server, command, use_control_master=True)
+        # Force a TTY so remote shells and ``ilha droplet ssh`` without a
+        # command behave like a normal login.
+        if "-t" not in cmd:
+            cmd.insert(1, "-t")
+        proc = subprocess.run(cmd)
+        return int(proc.returncode or 0)
     
     def execute_remote_script(self, username: str, server: str, script: str,
                               script_name: str = "script.sh",

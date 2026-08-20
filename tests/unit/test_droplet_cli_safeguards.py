@@ -54,6 +54,65 @@ def test_droplet_put_json_includes_safeguard_report(monkeypatch, runner):
     assert payload["data"]["smoke_checks"]["success"] is True
 
 
+def test_droplet_put_defaults_code_only_not_restore_volumes(monkeypatch, runner):
+    put_kwargs = {}
+
+    class FakeDeployManager:
+        def put(self, **kwargs):
+            put_kwargs.update(kwargs)
+            return True
+
+        def get_last_deploy_report(self):
+            return {
+                "source_manifest": {"source_path": "/tmp/worktrees/demo", "branch_name": "demo"},
+                "drift_report": {"status": "ok", "differences": []},
+                "smoke_checks": {"success": True, "path": "/", "checks": []},
+                "stage_timings": {},
+                "recovery_attempted": False,
+                "recovery_succeeded": False,
+            }
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr(
+        "ilha.cli_commands.droplets.resolve_existing_remote_target",
+        lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
+    )
+    monkeypatch.setattr("ilha.commands.push.slim_deploy_manager.SlimDeployManager", FakeDeployManager)
+    monkeypatch.setattr("ilha.cli_commands.droplets.resolve_cli_secrets_profile", lambda *a, **k: None)
+
+    result = runner.invoke(cli, ["droplet", "put", "demo", "--json"])
+    assert result.exit_code == 0, result.output
+    assert put_kwargs.get("restore_volumes") is False
+    assert put_kwargs.get("dump_db_first") is False
+
+
+def test_droplet_put_restore_volumes_json_requires_i_mean_it(monkeypatch, runner):
+    monkeypatch.setattr("ilha.cli_commands.droplets.auto_detect_branch_name", lambda branch, json: branch or "demo")
+    monkeypatch.setattr("ilha.cli_commands.droplets.check_prerequisites_no_git", lambda: None)
+    monkeypatch.setattr(
+        "ilha.cli_commands.droplets.resolve_existing_remote_target",
+        lambda **kwargs: ("root@1.2.3.4:/root", "demo.example.com", None, None, {}),
+    )
+    monkeypatch.setattr("ilha.cli_commands.droplets.resolve_cli_secrets_profile", lambda *a, **k: None)
+    result = runner.invoke(
+        cli,
+        ["droplet", "put", "demo", "--domain", "demo.example.com", "--restore-volumes", "--json"],
+    )
+    assert result.exit_code != 0
+    assert "i-mean-it" in result.output
+
+
+def test_droplet_help_lists_new_remote_commands(runner):
+    result = runner.invoke(cli, ["droplet", "--help"])
+    assert result.exit_code == 0
+    for name in ("put", "ssh", "dump-db", "status", "exec", "rename", "logs"):
+        assert name in result.output
+
+
 def test_droplet_deploy_json_includes_safeguard_report(monkeypatch, runner):
     deploy_kwargs = {}
 

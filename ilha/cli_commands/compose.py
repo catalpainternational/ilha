@@ -9,6 +9,7 @@ from typing import Optional
 import click
 
 from ilha.cli.helpers import add_secrets_option, add_verbose_option, command_wrapper
+from ilha.commands.secrets import resolve_cli_secrets_profile
 from ilha.core.docker_manager import DockerManager
 
 
@@ -23,9 +24,12 @@ def register_commands(cli) -> None:
     @add_secrets_option
     @add_verbose_option
     @command_wrapper()
-    def compose(branch_name: str, secrets_profile: Optional[str]):
+    def compose(branch_name: str, secrets_profile: Optional[str], no_secrets: bool):
         """Run docker compose command for a worktree (base + overlay merged)."""
         ctx = click.get_current_context()
+        secrets_profile = resolve_cli_secrets_profile(
+            secrets_profile, no_secrets=no_secrets
+        )
         # Worktree, compose files, env file, and docker compose invocation
         # are all validated inside run_compose_passthrough, which raises
         # ilhaCommandError on any real ilha/docker failure. A non-zero return

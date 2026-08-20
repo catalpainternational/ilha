@@ -29,10 +29,27 @@ from pathlib import Path
 from typing import Iterable, Optional, List, Tuple, Dict, Any, Set
 
 from ...config.settings import get_script_dir, get_worktree_dir
-from ...exceptions import VolumeBackupError
+from ...exceptions import VolumeBackupError, ilhaCommandError
 from ...core.dns_manager import DNSManager, parse_domain, is_domain
 from ...core.droplet_manager import DropletInfo
 from ...core.environment_manager import EnvironmentManager
+from ...commands.image import ImageManager
+from ...commands.secrets import SecretsManager
+from ...commands.droplet_remote import (
+    RemoteAppTarget,
+    compose_ps_health_command,
+    dump_remote_postgres,
+    read_remote_text_file,
+    remote_compose_exec_command,
+    set_remote_hostname,
+)
+from .remote_layout import (
+    REMOTE_APP_ROOT as _REMOTE_APP_ROOT,
+    REMOTE_CADDY_DIR as _REMOTE_CADDY_DIR,
+    REMOTE_DEPLOY_IDENTITY,
+    REMOTE_VOLUMES_DIR as _REMOTE_VOLUMES_DIR,
+)
+from .deploy_identity import build_deploy_identity, parse_deploy_identity, write_deploy_identity
 from ...utils.compose_external_volumes import (
     compose_service_is_buildable,
     compose_web_image_reference,
@@ -40,7 +57,10 @@ from ...utils.compose_external_volumes import (
 )
 from ...utils.compose_yaml import compose_flags_str
 from ...utils.caddy_config import ensure_caddy_labels_and_network
-from ...utils.env_loader import load_env_file
+from ...utils.env_loader import load_env_file, merge_env_layers
+from ...utils.path_utils import get_env_compose_file_path
+from ...utils.published_images import pin_deploy_compose_files
+from ...utils.registry_login import docker_login_remote, resolve_registry_read_token
 from ...utils.secret_policy import CONTROL_PLANE_ENV_KEYS
 from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ...utils.logging import (
@@ -69,9 +89,9 @@ class SlimDeployManager:
     """Deploys a worktree via rsync + remote docker compose (no ilha on server)."""
 
     # Remote directory structure
-    REMOTE_APP_ROOT = "/app"
-    REMOTE_CADDY_DIR = "/app/caddy"
-    REMOTE_VOLUMES_DIR = "/app/volumes"
+    REMOTE_APP_ROOT = _REMOTE_APP_ROOT
+    REMOTE_CADDY_DIR = _REMOTE_CADDY_DIR
+    REMOTE_VOLUMES_DIR = _REMOTE_VOLUMES_DIR
 
     # Compose flags for every remote `docker compose` invocation: ship both the
     # user's compose (base) and ilha's overlay so server merges them at runtime.
@@ -115,6 +135,8 @@ class SlimDeployManager:
         "*.ilha-package.tar.gz",
         "test-results",
         "*.log",
+        "backups",
+        "backups/",
     ]
 
     _ENOSPC_MARKERS = (
@@ -685,6 +707,7 @@ echo OK
         domain: Optional[str],
         ip: Optional[str],
         timeout_seconds: int = 60,
+        allow_dirty: bool = False,
     ) -> Tuple[bool, Dict[str, Any]]:
         started_at = time.time()
         dns_ready = True
@@ -804,16 +827,33 @@ echo OK
                 checks.append(external_html_result)
             checks.extend(advisory_results)
             if local_ok and redirect_ok and external_ok and external_html_ok:
+                identity_ok, identity_check = self._smoke_deploy_identity(
+                    username, server, allow_dirty=allow_dirty
+                )
+                health_ok, health_check = self._smoke_compose_health(username, server)
+                if identity_check:
+                    checks.append(identity_check)
+                if health_check:
+                    checks.append(health_check)
+                if identity_ok and health_ok:
+                    report = {
+                        "success": True,
+                        "path": smoke_path,
+                        "checks": checks,
+                        "duration_seconds": round(time.time() - started_at, 3),
+                    }
+                    if domain and not dns_ready:
+                        report["external_checks_skipped"] = "dns_not_ready_locally"
+                    self._last_report["smoke_checks"] = report
+                    return True, report
                 report = {
-                    "success": True,
+                    "success": False,
                     "path": smoke_path,
                     "checks": checks,
                     "duration_seconds": round(time.time() - started_at, 3),
                 }
-                if domain and not dns_ready:
-                    report["external_checks_skipped"] = "dns_not_ready_locally"
                 self._last_report["smoke_checks"] = report
-                return True, report
+                return False, report
 
             if time.time() - started_at >= timeout_seconds:
                 break
@@ -841,6 +881,69 @@ echo OK
                     print_plain(f"  {line}")
         self._last_report["smoke_checks"] = report
         return False, report
+
+    def _smoke_deploy_identity(
+        self,
+        username: str,
+        server: str,
+        *,
+        allow_dirty: bool,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Compare remote deploy.json to the local source manifest."""
+        local = self._last_report.get("source_manifest") or {}
+        local_sha = local.get("git_sha")
+        if not local_sha:
+            return True, None
+        target = RemoteAppTarget(
+            username=username,
+            server=server,
+            scp_target=f"{username}@{server}:/root",
+            domain=None,
+            ip=None,
+            branch_name=str(local.get("branch_name") or ""),
+        )
+        raw = read_remote_text_file(
+            target, REMOTE_DEPLOY_IDENTITY, ssh=self.ssh
+        )
+        identity = parse_deploy_identity(raw)
+        remote_sha = identity.get("git_sha")
+        dirty = bool(local.get("git_dirty"))
+        sha_ok = remote_sha == local_sha
+        dirty_ok = allow_dirty or not dirty
+        ok = sha_ok and dirty_ok
+        error = None
+        if not sha_ok:
+            error = (
+                f"Remote deploy.json git_sha {remote_sha!r} does not match local HEAD {local_sha!r}"
+            )
+        elif not dirty_ok:
+            error = "Worktree has uncommitted changes; pass --allow-dirty to accept"
+        return ok, {
+            "name": "deploy_identity",
+            "target": REMOTE_DEPLOY_IDENTITY,
+            "success": ok,
+            "error": error,
+            "local_sha": local_sha,
+            "remote_sha": remote_sha,
+            "git_dirty": dirty,
+        }
+
+    def _smoke_compose_health(
+        self, username: str, server: str
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Require web (and db if configured) compose services to be running."""
+        services = [self.services.web_service]
+        if self.services.db_service:
+            services.append(self.services.db_service)
+        cmd = compose_ps_health_command(services, app_root=self.REMOTE_APP_ROOT)
+        code, out, err = self._run_remote_text(username, server, cmd, timeout=30)
+        ok = code == 0
+        return ok, {
+            "name": "compose_health",
+            "target": ",".join(services),
+            "success": ok,
+            "error": None if ok else (err.strip() or out.strip() or f"exit {code}"),
+        }
 
     def _remote_service_exists(self, username: str, server: str, service_name: str) -> bool:
         return remote_compose_service_known(
@@ -917,6 +1020,8 @@ echo OK
         no_build: bool = False,
         force_password_reset: bool = False,
         secrets_profile: Optional[str] = None,
+        allow_dirty: bool = False,
+        set_hostname: Optional[str] = None,
     ) -> bool:
         """Run the full slim deploy pipeline.
 
@@ -984,6 +1089,9 @@ echo OK
                     restore_volumes=restore_volumes,
                     no_build=no_build,
                     force_password_reset=force_password_reset,
+                    secrets_profile=secrets_profile,
+                    allow_dirty=allow_dirty,
+                    set_hostname=set_hostname,
                 )
                 if success:
                     self._last_report["success"] = True
@@ -1028,6 +1136,9 @@ echo OK
         restore_volumes: bool = False,
         no_build: bool = False,
         force_password_reset: bool = False,
+        secrets_profile: Optional[str] = None,
+        allow_dirty: bool = False,
+        set_hostname: Optional[str] = None,
     ) -> bool:
         deploy_dir: Optional[Path] = None
         try:
@@ -1058,6 +1169,8 @@ echo OK
                     use_staging_certificates=use_staging_certificates,
                     deployignore=deployignore,
                     secrets_profile=secrets_profile,
+                    pin_published_images=not build,
+                    source_manifest=self._last_report.get("source_manifest"),
                 )
 
                 try:
@@ -1308,7 +1421,14 @@ echo OK
 
             log_step("Starting application")
             stage_started = time.time()
-            if not self._start_app_remote(username, server, build=False, debug=debug):
+            pull_images = bool(self._last_report.get("image_refs"))
+            if pull_images and not self._registry_login_remote(
+                username, server, secrets_profile=secrets_profile
+            ):
+                return False
+            if not self._start_app_remote(
+                username, server, build=False, debug=debug, pull_images=pull_images
+            ):
                 if self._last_failure_category != "disk_full":
                     self._set_failure(
                         error_code="app_start_failed",
@@ -1321,6 +1441,32 @@ echo OK
                         failure_category="remote_runtime_error",
                     )
                 return False
+            if not self._run_post_up_remote(username, server):
+                return False
+            if set_hostname:
+                try:
+                    set_remote_hostname(
+                        RemoteAppTarget(
+                            username=username,
+                            server=server,
+                            scp_target=f"{username}@{server}:/root",
+                            domain=domain,
+                            ip=ip,
+                            branch_name=branch_name,
+                        ),
+                        set_hostname,
+                        ssh=self.ssh,
+                    )
+                except ilhaCommandError as exc:
+                    log_error(str(exc))
+                    self._set_failure(
+                        error_code="hostname_failed",
+                        stage="start_app",
+                        root_cause=str(exc),
+                        suggested_actions=["Set the hostname manually with hostnamectl."],
+                        failure_category="remote_runtime_error",
+                    )
+                    return False
             self._mark_stage_timing("app_start", stage_started)
 
             log_step("Running smoke checks")
@@ -1332,6 +1478,7 @@ echo OK
                 domain=domain,
                 ip=ip,
                 timeout_seconds=smoke_timeout,
+                allow_dirty=allow_dirty,
             )
             self._mark_stage_timing("smoke_checks", stage_started)
             if not smoke_ok:
@@ -1385,15 +1532,19 @@ echo OK
         use_staging_certificates: bool = False,
         code_only: bool = False,
         db_only: bool = False,
+        restore_volumes: bool = False,
         force_password_reset: bool = False,
         smoke_timeout: int = 60,
         secrets_profile: Optional[str] = None,
+        dump_db_first: bool = False,
+        allow_dirty: bool = False,
+        set_hostname: Optional[str] = None,
     ) -> bool:
         """Update an existing slim-deployed server.
 
-        Default: backup volumes, sync code + config + volumes, restore volumes, restart Caddy + app.
-        code_only: sync code + config only, restart Caddy + app (no volume operations).
-        db_only: backup volumes, sync only volumes to server, stop app, restore volumes, start app.
+        Default: sync code + config only (no volume restore).
+        restore_volumes: backup local volumes, sync, restore on the server.
+        db_only: volumes only (no code sync).
         """
         try:
             self._reset_report()
@@ -1411,6 +1562,8 @@ echo OK
 
         username = target.username
         server = target.server
+        restore_volumes = bool(restore_volumes) or bool(db_only)
+        code_only = not restore_volumes
         preflight = None
         if not db_only:
             preflight = self._run_deploy_preflight(branch_name)
@@ -1424,12 +1577,14 @@ echo OK
             log_info(f"  Domain:  {domain}")
         elif ip:
             log_info(f"  IP:      {ip}")
-        if code_only:
-            log_info("  Mode:    code only (no volumes)")
-        elif db_only:
+        if db_only:
             log_info("  Mode:    db/volumes only (no code sync)")
+        elif restore_volumes:
+            log_info("  Mode:    restore local volumes onto the server")
+        else:
+            log_info("  Mode:    code only (no volumes)")
 
-        mode = " (code-only)" if code_only else (" (db-only)" if db_only else "")
+        mode = " (code-only)" if (code_only and not restore_volumes) else (" (db-only)" if db_only else "")
         target_label = domain or ip or f"{username}@{server}"
         self._tracker = StageTracker(f"Updating {branch_name} → {target_label}{mode}")
 
@@ -1439,6 +1594,32 @@ echo OK
                     shutil.rmtree(d, ignore_errors=True)
                 except Exception:
                     pass
+
+        if dump_db_first and self.services.db_service:
+            try:
+                dump_remote_postgres(
+                    RemoteAppTarget(
+                        username=username,
+                        server=server,
+                        scp_target=scp_target,
+                        domain=domain,
+                        ip=ip,
+                        branch_name=branch_name,
+                    ),
+                    db_service=self.services.db_service,
+                    project_root=self.project_root,
+                    ssh=self.ssh,
+                )
+            except ilhaCommandError as exc:
+                log_error(str(exc))
+                self._set_failure(
+                    error_code="remote_dump_failed",
+                    stage="preflight",
+                    root_cause=str(exc),
+                    suggested_actions=["Fix SSH/db access or omit --dump-db-first."],
+                    failure_category="remote_runtime_error",
+                )
+                return False
 
         # ── db_only: volumes only ─────────────────────────────────────
         if db_only:
@@ -1507,6 +1688,8 @@ echo OK
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
                 secrets_profile=secrets_profile,
+                pin_published_images=not build,
+                source_manifest=(preflight or {}).get("manifest") or self._last_report.get("source_manifest"),
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1521,39 +1704,21 @@ echo OK
             if not self._start_caddy_remote(username, server):
                 log_warning("Caddy start had issues, but continuing with app services...")
             log_step("Starting application")
-            if not self._start_app_remote(username, server, build=build, debug=debug):
-                _cleanup_deploy_dir(deploy_dir)
-                log_error("Failed to start application services on the server.")
-                self._set_failure(
-                    error_code="app_start_failed",
-                    stage="start_app",
-                    root_cause="Failed to start application services on the server.",
-                    suggested_actions=["Inspect remote compose ps output and service logs."],
-                    failure_category="remote_runtime_error",
-                )
-                render_deploy_report(self._last_report)
-                return False
-            log_step("Running smoke checks")
-            smoke_ok, smoke_report = self._run_smoke_checks(
-                username=username,
-                server=server,
-                smoke_path=(preflight or {}).get("smoke_path", "/"),
+            if not self._start_app_then_smoke(
+                username,
+                server,
+                build=build,
+                debug=debug,
                 domain=domain,
                 ip=ip,
-                timeout_seconds=smoke_timeout,
-            )
-            if not smoke_ok:
+                smoke_path=(preflight or {}).get("smoke_path", "/"),
+                smoke_timeout=smoke_timeout,
+                allow_dirty=allow_dirty,
+                set_hostname=set_hostname,
+                secrets_profile=secrets_profile,
+                branch_name=branch_name,
+            ):
                 _cleanup_deploy_dir(deploy_dir)
-                self._set_failure(
-                    error_code="smoke_checks_failed",
-                    stage="smoke_checks",
-                    root_cause=self._describe_smoke_failure(smoke_report),
-                    suggested_actions=[
-                        "Inspect remote `docker compose ps` and service logs on this target.",
-                        "Inspect remote compose ps output and service logs.",
-                    ],
-                    failure_category="remote_runtime_error",
-                )
                 render_deploy_report(self._last_report)
                 return False
             url = f"https://{domain}" if domain else (f"http://{ip}" if ip else None)
@@ -1576,6 +1741,8 @@ echo OK
                 debug=debug,
                 use_staging_certificates=use_staging_certificates,
                 secrets_profile=secrets_profile,
+                pin_published_images=not build,
+                source_manifest=(preflight or {}).get("manifest") or self._last_report.get("source_manifest"),
             )
             if deploy_dir is None:
                 render_deploy_report(self._last_report)
@@ -1626,39 +1793,21 @@ echo OK
                 render_deploy_report(self._last_report)
                 return False
             log_step("Starting application")
-            if not self._start_app_remote(username, server, build=build, debug=debug):
-                _cleanup_deploy_dir(deploy_dir)
-                log_error("Failed to start application services on the server.")
-                self._set_failure(
-                    error_code="app_start_failed",
-                    stage="start_app",
-                    root_cause="Failed to start application services on the server.",
-                    suggested_actions=["Inspect remote compose ps output and service logs."],
-                    failure_category="remote_runtime_error",
-                )
-                render_deploy_report(self._last_report)
-                return False
-            log_step("Running smoke checks")
-            smoke_ok, smoke_report = self._run_smoke_checks(
-                username=username,
-                server=server,
-                smoke_path=(preflight or {}).get("smoke_path", "/"),
+            if not self._start_app_then_smoke(
+                username,
+                server,
+                build=build,
+                debug=debug,
                 domain=domain,
                 ip=ip,
-                timeout_seconds=smoke_timeout,
-            )
-            if not smoke_ok:
+                smoke_path=(preflight or {}).get("smoke_path", "/"),
+                smoke_timeout=smoke_timeout,
+                allow_dirty=allow_dirty,
+                set_hostname=set_hostname,
+                secrets_profile=secrets_profile,
+                branch_name=branch_name,
+            ):
                 _cleanup_deploy_dir(deploy_dir)
-                self._set_failure(
-                    error_code="smoke_checks_failed",
-                    stage="smoke_checks",
-                    root_cause=self._describe_smoke_failure(smoke_report),
-                    suggested_actions=[
-                        "Inspect remote `docker compose ps` and service logs on this target.",
-                        "Inspect remote compose ps output and service logs.",
-                    ],
-                    failure_category="remote_runtime_error",
-                )
                 render_deploy_report(self._last_report)
                 return False
             url = f"https://{domain}" if domain else (f"http://{ip}" if ip else None)
@@ -1670,6 +1819,63 @@ echo OK
             _cleanup_deploy_dir(deploy_dir)
             self._tracker = None
             return True
+
+    def _service_is_buildable(self, deploy_dir: Path, env: Dict[str, str], service: str) -> bool:
+        """True if *service* has ``build:`` in the base or overlay compose file."""
+        if not service:
+            return False
+        return compose_service_is_buildable(
+            deploy_dir / "docker-compose.yml", env, service
+        ) or compose_service_is_buildable(
+            deploy_dir / "docker-compose.overlay.yml", env, service
+        )
+
+    def _maybe_pin_published_images(
+        self,
+        deploy_dir: Path,
+        branch_name: str,
+        *,
+        pin_published_images: bool,
+    ) -> Optional[Dict[str, str]]:
+        """Pin app services to digest refs when a manifest exists.
+
+        Returns ``{}`` when pinning is skipped, a service→ref map when pinned,
+        or ``None`` when assembly must abort.
+        """
+        if not pin_published_images:
+            return {}
+        compose_env = load_env_file(deploy_dir / ".env") if (deploy_dir / ".env").exists() else {}
+        app_services = self.services.app_service_names()
+        buildable = [s for s in app_services if self._service_is_buildable(deploy_dir, compose_env, s)]
+        image_mgr = ImageManager(self.project_root)
+        manifest_path = image_mgr.manifest_path(branch_name)
+        if buildable and not manifest_path.exists():
+            log_error(
+                f"No published image manifest at {manifest_path}. "
+                f"Run `ilha image publish {branch_name}` or pass `--build` to compile on the server."
+            )
+            return None
+        if not manifest_path.exists() or not buildable:
+            return {}
+        try:
+            image_refs = pin_deploy_compose_files(
+                [
+                    deploy_dir / "docker-compose.yml",
+                    deploy_dir / "docker-compose.overlay.yml",
+                ],
+                branch_name,
+                image_manager=image_mgr,
+                services=buildable,
+                prefer_digest=True,
+            )
+        except ilhaCommandError as exc:
+            log_error(str(exc))
+            return None
+        log_info(
+            "Pinned compose services to published image digests: "
+            + ", ".join(f"{name}={ref}" for name, ref in image_refs.items())
+        )
+        return image_refs
 
     # ──────────────────────────────────────────────────────────────────
     # Internal: assemble deploy directory
@@ -1683,6 +1889,8 @@ echo OK
         use_staging_certificates: bool = False,
         deployignore: Optional[str] = None,
         secrets_profile: Optional[str] = None,
+        pin_published_images: bool = False,
+        source_manifest: Optional[Dict[str, Any]] = None,
     ) -> Optional[Path]:
         """Build a flat deploy directory ready to rsync.
 
@@ -1771,6 +1979,23 @@ echo OK
                 use_staging_certificates=use_staging_certificates,
                 secrets_profile=secrets_profile,
             )
+
+            image_refs = self._maybe_pin_published_images(
+                deploy_dir,
+                branch_name,
+                pin_published_images=pin_published_images,
+            )
+            if image_refs is None:
+                return None
+            self._last_report["image_refs"] = image_refs
+
+            identity = build_deploy_identity(
+                source_manifest or self._last_report.get("source_manifest") or {},
+                image_refs=image_refs,
+                build=not pin_published_images,
+                secrets_profile=secrets_profile,
+            )
+            write_deploy_identity(deploy_dir / ".ilha" / "deploy.json", identity)
 
             # ── caddy/ ──────────────────────────────────────────────
             caddy_dir = deploy_dir / "caddy"
@@ -1970,9 +2195,6 @@ echo OK
           ``${PROJECT_ROOT}/.env``, and the env.ilha values would otherwise
           overwrite the production overrides with localhost defaults.
         """
-        from ...utils.env_loader import load_env_file, merge_env_layers
-        from ...utils.path_utils import get_env_compose_file_path
-
         REMOTE_CODE_DIR = f"{self.REMOTE_APP_ROOT}/code"
 
         root_env = self.project_root / ".env"
@@ -1980,8 +2202,6 @@ echo OK
 
         secrets_layer = None
         if secrets_profile:
-            from ...commands.secrets import SecretsManager
-
             secrets_layer = SecretsManager(self.project_root).decrypt_profile(secrets_profile)
             log_info(f"Merged SOPS secret profile: {secrets_profile}")
 
@@ -2979,6 +3199,7 @@ echo "Build complete"
         remote_tmp_dir: str,
         remote_deploy_file: str,
         build: bool,
+        pull_images: bool = False,
     ) -> str:
         """Shell wrapper that exports service config and runs ``remote_deploy.py`` on the server."""
         web_service = self.services.web_service
@@ -3001,20 +3222,177 @@ echo "Build complete"
                 f"export WORKER_SERVICES={shlex.quote(worker_args)}",
                 f"export FRONTEND_SERVICE={shlex.quote(frontend_service)}",
                 f"export BUILD_WEB={'1' if build else '0'}",
+                f"export PULL_IMAGES={'1' if pull_images else '0'}",
                 f"export PYTHONPATH={remote_tmp_dir}:${{PYTHONPATH:-}}",
                 f"cd {remote_tmp_dir}",
                 f"python3 {shlex.quote(remote_deploy_file)}",
             ]
         )
 
-    def _start_app_remote(self, username: str, server: str, build: bool = False, debug: bool = False) -> bool:
+    def _registry_login_remote(
+        self,
+        username: str,
+        server: str,
+        *,
+        secrets_profile: Optional[str] = None,
+    ) -> bool:
+        """Log the remote Docker daemon into DOCR so compose can pull digests."""
+        try:
+            token = resolve_registry_read_token(
+                self.project_root, secrets_profile=secrets_profile
+            )
+            docker_login_remote(self.ssh, username, server, token)
+        except ilhaCommandError as exc:
+            log_error(str(exc))
+            self._set_failure(
+                error_code="registry_login_failed",
+                stage="start_app",
+                root_cause=str(exc),
+                suggested_actions=[
+                    "Set DOCR_READ_TOKEN in the environment or a SOPS profile.",
+                    "Or pass `--build` to compile images on the server instead of pulling.",
+                ],
+                failure_category="remote_setup_error",
+            )
+            return False
+        log_info("Remote docker login to registry.digitalocean.com succeeded")
+        return True
+
+    def _run_post_up_remote(self, username: str, server: str) -> bool:
+        """Run migrate + configured post_up commands after compose is up."""
+        migrate = self.services.resolved_migrate_command(self.project_root)
+        commands: List[Tuple[str, str]] = []
+        if migrate:
+            commands.append(("migrate", migrate))
+        for extra in self.services.post_up:
+            text = str(extra).strip()
+            if text:
+                commands.append(("post_up", text))
+        for label, raw in commands:
+            argv = shlex.split(raw)
+            if not argv:
+                continue
+            log_step(f"Running remote {label}: {raw}")
+            cmd = remote_compose_exec_command(
+                self.services.web_service, argv, app_root=self.REMOTE_APP_ROOT
+            )
+            result = self.ssh.execute_remote(
+                username, server, cmd, timeout=600, check=False
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "").strip()
+                log_error(f"Remote {label} failed: {err}")
+                self._set_failure(
+                    error_code="post_up_failed",
+                    stage="start_app",
+                    root_cause=f"Remote {label} failed: {err or raw}",
+                    suggested_actions=[
+                        f"Run `ilha droplet exec {self.services.web_service} {raw}` and inspect logs.",
+                    ],
+                    failure_category="remote_runtime_error",
+                )
+                return False
+            log_success(f"Remote {label} succeeded")
+        return True
+
+    def _start_app_then_smoke(
+        self,
+        username: str,
+        server: str,
+        *,
+        build: bool,
+        debug: bool,
+        domain: Optional[str],
+        ip: Optional[str],
+        smoke_path: str,
+        smoke_timeout: int,
+        allow_dirty: bool,
+        set_hostname: Optional[str],
+        secrets_profile: Optional[str],
+        branch_name: str,
+    ) -> bool:
+        """Login/pull/start/migrate/hostname/smoke shared by put modes."""
+        pull_images = bool(self._last_report.get("image_refs"))
+        if pull_images and not self._registry_login_remote(
+            username, server, secrets_profile=secrets_profile
+        ):
+            return False
+        if not self._start_app_remote(
+            username, server, build=build, debug=debug, pull_images=pull_images
+        ):
+            log_error("Failed to start application services on the server.")
+            self._set_failure(
+                error_code="app_start_failed",
+                stage="start_app",
+                root_cause="Failed to start application services on the server.",
+                suggested_actions=["Inspect remote compose ps output and service logs."],
+                failure_category="remote_runtime_error",
+            )
+            return False
+        if not self._run_post_up_remote(username, server):
+            return False
+        if set_hostname:
+            try:
+                set_remote_hostname(
+                    RemoteAppTarget(
+                        username=username,
+                        server=server,
+                        scp_target=f"{username}@{server}:/root",
+                        domain=domain,
+                        ip=ip,
+                        branch_name=branch_name,
+                    ),
+                    set_hostname,
+                    ssh=self.ssh,
+                )
+            except ilhaCommandError as exc:
+                log_error(str(exc))
+                self._set_failure(
+                    error_code="hostname_failed",
+                    stage="start_app",
+                    root_cause=str(exc),
+                    suggested_actions=["Set the hostname manually with hostnamectl."],
+                    failure_category="remote_runtime_error",
+                )
+                return False
+        log_step("Running smoke checks")
+        smoke_ok, smoke_report = self._run_smoke_checks(
+            username=username,
+            server=server,
+            smoke_path=smoke_path,
+            domain=domain,
+            ip=ip,
+            timeout_seconds=smoke_timeout,
+            allow_dirty=allow_dirty,
+        )
+        if not smoke_ok:
+            self._set_failure(
+                error_code="smoke_checks_failed",
+                stage="smoke_checks",
+                root_cause=self._describe_smoke_failure(smoke_report),
+                suggested_actions=[
+                    "Inspect remote `docker compose ps` and service logs on this target.",
+                    "Inspect remote compose ps output and service logs.",
+                ],
+                failure_category="remote_runtime_error",
+            )
+            return False
+        return True
+
+    def _start_app_remote(
+        self,
+        username: str,
+        server: str,
+        build: bool = False,
+        debug: bool = False,
+        pull_images: bool = False,
+    ) -> bool:
         """Start application services on the server via nohup + poll.
 
         Strategy (brief downtime accepted; no canary/swap):
         1. Bring up dependency services and wait for the database.
-        2. (Optional) Build the web image.
-        3. ``compose up -d`` for web + workers. The container's entrypoint
-           is responsible for running migrations before serving traffic.
+        2. (Optional) Pull published images or build the web image.
+        3. ``compose up -d`` for web + workers.
         4. Health-check the running web container.
         """
         log_info("Starting application services on server...")
@@ -3073,6 +3451,7 @@ echo "Build complete"
             remote_tmp_dir=remote_tmp_dir,
             remote_deploy_file=remote_deploy_file,
             build=build,
+            pull_images=pull_images,
         )
 
         log_file = self._remote_tmp("start-app.log")

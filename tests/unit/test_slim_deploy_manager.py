@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ilha.commands.push.slim_deploy_manager import SlimDeployManager
@@ -112,6 +113,7 @@ def test_gather_source_manifest_collects_checksums(tmp_path: Path, monkeypatch):
     assert manifest["source_path"] == str(worktree)
     assert manifest["comparison_root"] == str(root)
     assert manifest["git_branch"] == "demo"
+    assert "git_sha" in manifest
     assert manifest["git_dirty"] is True
     assert manifest["checksums"]["Dockerfile"] is not None
     assert manifest["checksums"][".ilha/docker-compose.overlay.yml"] is not None
@@ -239,7 +241,7 @@ def test_run_smoke_checks_skips_external_when_dns_not_ready(tmp_path: Path, monk
 
     assert ok is True
     assert report.get("external_checks_skipped") == "dns_not_ready_locally"
-    assert {check["name"] for check in report["checks"]} == {"local_app"}
+    assert {check["name"] for check in report["checks"]} == {"local_app", "compose_health"}
     # No local curl to the public domain (would fail the same as deploy host).
     for cmd in local_calls:
         joined = " ".join(cmd)
@@ -286,13 +288,14 @@ def test_run_smoke_checks_retries_until_success(tmp_path: Path, monkeypatch):
 
     assert ok is True
     assert report["success"] is True
-    assert calls["remote"] == 3
+    assert calls["remote"] == 4  # 3 HTTP probes + compose health
     assert calls["local"] == 3  # HTTP redirect + HEAD + HTML GET for domain smoke
     assert {check["name"] for check in report["checks"]} == {
         "local_app",
         "external_http_to_https_redirect",
         "external_domain_head",
         "external_domain_html",
+        "compose_health",
     }
 
 
@@ -591,3 +594,56 @@ def test_retarget_relative_path_leaves_absolute_and_named_refs():
     assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "./x") == "./code/x"
     assert SlimDeployManager._retarget_relative_path(SlimDeployManager, "../x") == "./code/../x"
     assert SlimDeployManager._retarget_relative_path(SlimDeployManager, ".env") == "./code/.env"
+
+
+def test_maybe_pin_published_images_fails_without_manifest(tmp_path: Path):
+    root = tmp_path / "proj"
+    (root / ".ilha").mkdir(parents=True)
+    (root / ".ilha" / "config.yml").write_text("project_name: demo\n")
+    (root / "manage.py").write_text("")
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "docker-compose.yml").write_text(
+        "services:\n  web:\n    build: .\n    image: app\n  db:\n    image: postgres:16\n"
+    )
+    (deploy_dir / "docker-compose.overlay.yml").write_text("services: {}\n")
+    (deploy_dir / ".env").write_text("COMPOSE_PROJECT_NAME=demo\n")
+    mgr = SlimDeployManager(project_root=root)
+    assert mgr._maybe_pin_published_images(deploy_dir, "staging", pin_published_images=True) is None
+
+
+def test_maybe_pin_published_images_rewrites_when_manifest_exists(tmp_path: Path):
+    root = tmp_path / "proj"
+    ilha = root / ".ilha"
+    ilha.mkdir(parents=True)
+    (ilha / "config.yml").write_text("project_name: demo\n")
+    (root / "manage.py").write_text("")
+    (ilha / "images").mkdir()
+    (ilha / "images" / "staging.json").write_text(
+        json.dumps(
+            {
+                "branch": "staging",
+                "services": [
+                    {
+                        "service": "web",
+                        "image": "registry.digitalocean.com/reg/repo/web:tag",
+                        "digest": "sha256:abc",
+                    }
+                ],
+            }
+        )
+    )
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "docker-compose.yml").write_text(
+        "services:\n  web:\n    build: .\n    image: app\n  db:\n    image: postgres:16\n"
+    )
+    (deploy_dir / "docker-compose.overlay.yml").write_text("services: {}\n")
+    (deploy_dir / ".env").write_text("COMPOSE_PROJECT_NAME=demo\n")
+    mgr = SlimDeployManager(project_root=root)
+    refs = mgr._maybe_pin_published_images(deploy_dir, "staging", pin_published_images=True)
+    assert refs is not None
+    assert refs["web"].endswith("@sha256:abc")
+    text = (deploy_dir / "docker-compose.yml").read_text()
+    assert "build:" not in text
+    assert "sha256:abc" in text

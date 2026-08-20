@@ -764,6 +764,32 @@ class DigitalOceanProvider(DNSProvider, DropletProvider):
         
         log_info(f"Successfully destroyed droplet: {droplet_id}")
         return True
+
+    def rename_droplet(self, droplet_id: int, new_name: str) -> bool:
+        """Rename a droplet via the DigitalOcean actions API."""
+        name = (new_name or "").strip()
+        if not name:
+            log_error("New droplet name is empty")
+            return False
+        response = self._make_request(
+            "POST",
+            f"/droplets/{droplet_id}/actions",
+            json={"type": "rename", "name": name},
+        )
+        if not response:
+            return False
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            droplet = self.get_droplet(droplet_id)
+            if droplet and droplet.name == name:
+                log_success(f"Renamed droplet {droplet_id} to {name}")
+                return True
+            time.sleep(2)
+        log_warning(
+            f"Rename action accepted for droplet {droplet_id}; name may still be propagating"
+        )
+        return True
+
     
     def _check_ssh_ready(self, ip_address: str, timeout: int = 5) -> bool:
         """Check if SSH is accessible on the droplet.

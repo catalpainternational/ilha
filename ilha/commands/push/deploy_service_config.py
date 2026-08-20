@@ -28,7 +28,7 @@ For static sites the inferred defaults look like::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -87,6 +87,29 @@ class DeployServiceConfig:
     # (the rest go to ``frontend_service``). ``None`` = use archetype defaults
     # when applicable. Override via ``deploy.api_paths`` in config.yml.
     api_paths: Optional[List[str]] = None
+    # Post-up migrate. ``None`` = infer Django ``manage.py migrate`` when the
+    # project footprint has Django; ``""`` = skip; any other string is run
+    # via ``docker compose exec -T <web_service>``.
+    migrate_command: Optional[str] = None
+    # Extra remote commands after migrate (each is ``compose exec`` argv joined).
+    post_up: List[str] = field(default_factory=list)
+
+    def app_service_names(self) -> List[str]:
+        """Web + optional frontend + workers (services ilha starts/pins)."""
+        names = [self.web_service]
+        if self.frontend_service:
+            names.append(self.frontend_service)
+        names.extend(self.worker_services)
+        return [n for n in names if n]
+
+    def resolved_migrate_command(self, project_root: Path) -> str:
+        """Return the migrate command to run after ``compose up``, or ``""``."""
+        if self.migrate_command is not None:
+            return str(self.migrate_command).strip()
+        fp = detect_project_footprint(project_root)
+        if getattr(fp, "has_django", False):
+            return "python manage.py migrate --noinput"
+        return ""
 
     @classmethod
     def static_defaults(
@@ -132,6 +155,8 @@ class DeployServiceConfig:
             "smoke_path",
             "frontend_service",
             "api_paths",
+            "migrate_command",
+            "post_up",
         }
         unknown = set(data.keys()) - known
         if unknown:
@@ -152,6 +177,8 @@ class DeployServiceConfig:
             "api_paths": (
                 list(defaults.api_paths) if defaults.api_paths is not None else None
             ),
+            "migrate_command": defaults.migrate_command,
+            "post_up": list(defaults.post_up),
         }
         for key in known:
             if key in data and data[key] is not None:
@@ -159,7 +186,7 @@ class DeployServiceConfig:
 
         # Normalize lists: accept comma-strings too, for convenience. Also
         # tolerate explicit empty lists (no deps / no workers).
-        for list_key in ("dependency_services", "worker_services"):
+        for list_key in ("dependency_services", "worker_services", "post_up"):
             value = kwargs.get(list_key)
             if isinstance(value, str):
                 kwargs[list_key] = [s.strip() for s in value.split(",") if s.strip()]
@@ -167,6 +194,9 @@ class DeployServiceConfig:
                 kwargs[list_key] = []
             elif isinstance(value, list):
                 kwargs[list_key] = [str(s).strip() for s in value if str(s).strip()]
+
+        if "migrate_command" in data and data["migrate_command"] is not None:
+            kwargs["migrate_command"] = str(data["migrate_command"]).strip()
 
         # db_service may be intentionally empty (no database tier).
         if "db_service" in kwargs and kwargs["db_service"] is None:
@@ -316,14 +346,10 @@ def _filter_against_compose(
             f"falling back to backend-only routing."
         )
 
-    return DeployServiceConfig(
-        web_service=config.web_service,
-        web_port=config.web_port,
-        health_path=config.health_path,
+    return replace(
+        config,
         dependency_services=new_deps,
         db_service=new_db,
         worker_services=new_workers,
-        smoke_path=config.smoke_path,
         frontend_service=new_frontend,
-        api_paths=list(config.api_paths) if config.api_paths is not None else None,
     )

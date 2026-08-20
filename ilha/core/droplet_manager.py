@@ -107,6 +107,11 @@ class DropletProvider(ABC):
             True if droplet is ready, False if timeout
         """
         pass
+
+    def rename_droplet(self, droplet_id: int, new_name: str) -> bool:
+        """Rename a droplet. Default: unsupported."""
+        log_error("rename_droplet is not supported by this provider")
+        return False
     
     def list_sizes(self) -> List[Dict[str, Any]]:
         """List available droplet sizes.

@@ -9,6 +9,7 @@ import click
 
 from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option, command_wrapper
 from ilha.commands.droplets import DropletCommands, auto_detect_branch_name
+from ilha.commands.secrets import resolve_cli_secrets_profile
 from ilha.commands.worker import DEFAULT_WORKER_TAG, WorkerManager
 from ilha.core.droplet_manager import DropletManager
 from ilha.exceptions import ilhaCommandError
@@ -112,6 +113,7 @@ def register_commands(cli) -> None:
         output_dir: Optional[click.Path],
         cloud_init: bool,
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
         api_token: Optional[str] = None,
     ):
@@ -122,6 +124,9 @@ def register_commands(cli) -> None:
           ilha worker bundle staging --central-droplet-name central
           ilha worker bundle staging --central-ip 10.0.0.5 --cloud-init
         """
+        secrets_profile = resolve_cli_secrets_profile(
+            secrets_profile, no_secrets=no_secrets
+        )
         branch = auto_detect_branch_name(branch_name, json)
 
         mgr = WorkerManager()
@@ -311,6 +316,7 @@ def register_commands(cli) -> None:
         api_token: Optional[str],
         wait: bool,
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
     ):
         """Deploy ephemeral worker droplets.
@@ -323,6 +329,9 @@ def register_commands(cli) -> None:
           ilha worker deploy staging --count 2 --central-droplet-name central
           ilha worker deploy staging --central-ip 10.0.0.5 --json
         """
+        secrets_profile = resolve_cli_secrets_profile(
+            secrets_profile, no_secrets=no_secrets
+        )
         return _deploy_worker_droplets(
             branch_name=branch_name,
             count=count,
@@ -379,9 +388,13 @@ def register_commands(cli) -> None:
         api_token: Optional[str],
         wait: bool,
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
     ):
         """Deprecated alias for ``worker deploy``."""
+        secrets_profile = resolve_cli_secrets_profile(
+            secrets_profile, no_secrets=no_secrets
+        )
         return _deploy_worker_droplets(
             branch_name=branch_name,
             count=count,

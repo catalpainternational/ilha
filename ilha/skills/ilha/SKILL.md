@@ -27,14 +27,16 @@ Concise guidance for working with the ilha CLI: worktree-isolated Docker environ
 | Lifecycle | `ilha create [branch]`, `ilha [branch] up -d`, `ilha [branch] down`, `ilha remove [branch]`, `ilha delete [branch]`, `ilha list` |
 | Compose | `ilha [branch] exec [service] [cmd]`, `ilha [branch] logs [service]`, `ilha [branch] ps`, `ilha [branch] run --rm [service] [cmd]` |
 | Django | `ilha [branch] exec web python manage.py migrate`, `ilha [branch] exec web python manage.py test`, `ilha [branch] exec web python manage.py shell`, `ilha [branch] exec web python manage.py collectstatic` |
-| Droplet | `ilha droplet deploy [branch] --domain [domain]`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet list`, `ilha droplet destroy [id]`, `ilha droplet regions` |
+| Droplet | `ilha droplet deploy [branch] --domain [domain]`, `ilha droplet put [branch]`, `ilha droplet logs [branch] [-s service] [-f]`, `ilha droplet ssh [branch]`, `ilha droplet dump-db [branch]`, `ilha droplet status [branch]`, `ilha droplet exec [branch] SERVICE CMD…`, `ilha droplet rename OLD NEW [--set-hostname]`, `ilha droplet list`, `ilha droplet destroy [id]`, `ilha droplet regions` |
 | Image | `ilha image publish\|list\|destroy [branch]`, `ilha image build\|push` |
 | Worker | `ilha worker deploy\|list\|reap\|destroy\|bundle [branch]` |
 | Local diagnostics | `ilha doctor [branch]` (worktree checks; not a remote droplet command) |
 | Packages | `ilha packages export [branch]`, `ilha packages import [file] [--standalone] [--domain or --ip]` |
 | Proxy | `ilha start-proxy`, `ilha stop-proxy` |
 
-**Droplet deploy defaults (resilience):** `droplet deploy` ships **code only** (no local volume backup/restore unless `--restore-volumes`). Missing web images on the server trigger an **automatic** remote `docker compose build` unless `--no-build`. Use `--domain` for Caddy/TLS; `--ip` alone warns (IP-only routing). Fast redeploy: `--no-create --no-prepare --skip-volume-backup`. See repo README “Recommended flows”.
+**Droplet update vs first deploy:** `droplet put` defaults to **code + config only** (it will not copy the laptop database). Pass `--restore-volumes` (and `--i-mean-it` on a live domain) only when you intend to replace remote volumes. `droplet deploy` still defaults to restoring local volumes onto a **new** droplet so a first staging lands ready to use; pass `--no-restore-volumes` for an empty server. If the web service has a `build:` stanza, publish images (`ilha image publish`) so put/deploy can pull digest refs; otherwise pass `--build`. SOPS `secrets.default_profile` is applied unless `--no-secrets` or `--secrets NAME`. After a put, `ilha droplet status` compares `/app/.ilha/deploy.json` to local HEAD.
+
+**Update an existing droplet:** `ilha droplet dump-db [branch] --domain [fqdn]` → `ilha image publish [branch]` → `ilha droplet put [branch] --domain [fqdn]` → `ilha droplet status [branch]`. Workers are a separate step (`ilha worker deploy`). After pulling git master, reinstall with `uv tool install --force --editable .` so the CLI matches the repo. See repo README “Recommended flows”.
 
 For full options and deployment (DNS, VPC, code-only), see [references/commands.md](references/commands.md) or the repo [README](../../../README.md).
 

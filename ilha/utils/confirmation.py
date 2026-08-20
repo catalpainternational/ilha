@@ -108,20 +108,27 @@ def confirm_use_existing_worktree(branch_name: str) -> bool:
     return _prompt_with_default("Use existing worktree? [Y/n]:", default="Y", eof_message="Cannot prompt for confirmation (no stdin available). Use --force to skip confirmation.")
 
 
-def confirm_action(message: str) -> bool:
+def confirm_action(message: str, default: str = "Y") -> bool:
     """Prompt user for confirmation of a generic action.
-    
+
     Args:
         message: The confirmation message to display (should include [Y/n] or similar)
-        
+        default: ``'Y'`` or ``'N'`` when the user presses Enter
+
     Returns:
         True if user confirms, False if user cancels
     """
-    # Ensure message has prompt format if not already included
     if "[Y/n]" not in message and "[y/N]" not in message:
-        message = f"{message} [Y/n]:"
-    
-    return _prompt_with_default(message, default="Y", eof_message="Cannot prompt for confirmation (no stdin available).")
+        if default.upper() == "N":
+            message = f"{message} [y/N]:"
+        else:
+            message = f"{message} [Y/n]:"
+
+    return _prompt_with_default(
+        message,
+        default=default,
+        eof_message="Cannot prompt for confirmation (no stdin available).",
+    )
 
 
 def confirm_by_typing_name(expected_name: str, message: str) -> bool:

@@ -36,12 +36,18 @@ def add_verbose_option(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def add_secrets_option(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorator to add ``--secrets <profile>`` for SOPS-backed env layers."""
+    """Decorator to add ``--secrets`` / ``--no-secrets`` for SOPS env layers."""
+    func = click.option(
+        "--no-secrets",
+        is_flag=True,
+        default=False,
+        help="Do not decrypt a SOPS profile, even if secrets.default_profile is set",
+    )(func)
     return click.option(
         "--secrets",
         "secrets_profile",
         default=None,
-        help="SOPS secret profile name from .ilha/config.yml (decrypted at runtime)",
+        help="SOPS secret profile name from .ilha/config.yml (default: secrets.default_profile)",
     )(func)
 
 

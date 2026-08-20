@@ -211,6 +211,7 @@ class DeployPreflight:
             "source_path": str(worktree_path),
             "comparison_root": str(comparison_root),
             "git_branch": self._get_git_branch(worktree_path),
+            "git_sha": self._git_rev_parse_head(worktree_path),
             "git_dirty": self._is_git_dirty(worktree_path),
             "checksums": {
                 name: self._optional_checksum(path)

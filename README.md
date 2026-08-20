@@ -272,9 +272,14 @@ Configure defaults in `.ilha/config.yml` under `worker_pool` (central droplet na
 ### Droplet Management
 | Command | Description | Example |
 |---------|-------------|---------|
-| `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). Default ships **code only**; use `--restore-volumes` to copy local DB/volumes. Auto-builds the web image on the server when it is missing (unless `--no-build`). | `ilha droplet deploy staging --domain app.example.com --build` |
+| `droplet deploy [branch]` | Create a droplet and deploy via rsync + remote docker compose (slim mode). Default **restores local volumes** onto a new droplet; pass `--no-restore-volumes` for empty volumes. Prefer `ilha image publish` so the server pulls digest refs; `--build` compiles on the droplet. | `ilha droplet deploy staging --domain app.example.com --build` |
 | `droplet deploy --no-create` | Deploy to an existing server (skip droplet creation) | `ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root` |
-| `droplet put [branch]` | Update an existing deployment (code + config; brief downtime during web restart) | `ilha droplet put staging` |
+| `droplet put [branch]` | Update an existing deployment. Default is **code + config only** (does not copy the laptop DB). `--restore-volumes` replaces remote data. | `ilha droplet put staging --domain app.example.com` |
+| `droplet dump-db [branch]` | Custom-format `pg_dump` from the remote db container into `backups/` | `ilha droplet dump-db staging --domain app.example.com` |
+| `droplet status [branch]` | Compare remote `/app/.ilha/deploy.json` to local HEAD | `ilha droplet status staging` |
+| `droplet ssh [branch]` | Interactive SSH (or run a remote command) | `ilha droplet ssh staging` |
+| `droplet exec [branch] SERVICE CMD…` | `docker compose exec` on the droplet | `ilha droplet exec staging web python manage.py migrate` |
+| `droplet rename OLD NEW` | Rename a DigitalOcean droplet; `--set-hostname` updates the OS hostname | `ilha droplet rename staging-new staging --set-hostname` |
 | `droplet logs [branch]` | Tail Docker Compose logs from a remote droplet | `ilha droplet logs staging` or `ilha droplet logs -s web -f` |
 | `ilha doctor [branch]` | Diagnose a **local** worktree (not a remote droplet) | `ilha doctor staging` |
 | `droplet list` | List all droplets (formatted table) | `ilha droplet list` |
@@ -1018,24 +1023,34 @@ ilha droplet deploy staging --no-create --scp-target root@1.2.3.4:/root
 ```
 
 **Recommended flows**
-- **First deploy to a new droplet** (domain + TLS + explicit build):  
-  `ilha droplet deploy <branch> --domain <fqdn> --ssh-keys <key> --region syd1 --size s-1vcpu-2gb --build`  
-  The CLI also **auto-runs** `docker compose build` when the web image is absent on the server (unless you pass `--no-build`).
+- **First deploy to a new droplet** (domain + TLS + published images):  
+  `ilha image publish <branch>` then  
+  `ilha droplet deploy <branch> --domain <fqdn> --ssh-keys <key> --region syd1 --size s-1vcpu-2gb`  
+  Pass `--build` only when there is no registry manifest. `--restore-volumes` is the deploy default so a fresh droplet gets local DB/media; use `--no-restore-volumes` for empty volumes.
+- **Update an existing droplet** (never copies the laptop DB unless asked):  
+  `ilha droplet dump-db <branch> --domain <fqdn>`  
+  `ilha image publish <branch>`  
+  `ilha droplet put <branch> --domain <fqdn>`  
+  `ilha droplet status <branch>`  
+  SOPS `secrets.default_profile` is applied automatically; `--no-secrets` skips it. `--restore-volumes` replaces remote volumes (requires `--i-mean-it` or a prompt when a `--domain` is set).
 - **Fast redeploy** after server prep and images exist:  
-  `ilha droplet deploy <branch> --domain <fqdn> --no-create --no-prepare --skip-volume-backup`
+  `ilha droplet deploy <branch> --domain <fqdn> --no-create --no-prepare --skip-volume-backup --no-restore-volumes`
 - **Ship local Postgres/Redis volumes** to the server (explicit):  
-  `ilha droplet deploy <branch> --domain <fqdn> --restore-volumes`  
+  `ilha droplet put <branch> --domain <fqdn> --restore-volumes --i-mean-it`  
   After restore, ilha checks that Postgres accepts `POSTGRES_PASSWORD` from the merged `.env` before starting the app.
-- **`droplet put`** still defaults to syncing volumes + code for “update existing server” workflows.
+- Reinstall the CLI after pulling this repo: `uv tool install --force --editable .` (`ilha --version` must match git).
 
 ### Update an Existing Deployment
 ```bash
-# Push code + config updates (brief downtime while the web container restarts)
-ilha droplet put staging
-
-# With explicit target overrides
+# Push code + config only (default; does not copy the laptop database)
 ilha droplet put staging --domain app.example.com
-ilha droplet put staging --scp-target root@1.2.3.4:/root
+
+# Dump remote Postgres first, then update
+ilha droplet dump-db staging --domain app.example.com
+ilha droplet put staging --domain app.example.com
+
+# Replace remote volumes with the laptop copies (destructive)
+ilha droplet put staging --domain app.example.com --restore-volumes --i-mean-it
 ```
 
 ### View Remote Logs

@@ -27,6 +27,8 @@ from ilha.commands.secrets import SecretsManager
 from ilha.utils.env_loader import format_env_text, is_sensitive_env_key, load_env_file, merge_env_layers
 from ilha.utils.logging import log_success
 from ilha.utils.secret_policy import NEVER_ON_WORKER_ENV, blocked_worker_allowlist_keys
+from ilha.utils.published_images import pin_service_to_image_ref
+from ilha.utils.registry_login import docker_login_remote
 from ilha.utils.ssh_manager import SSHConnectionManager
 
 
@@ -351,8 +353,7 @@ class WorkerManager:
         )
 
         service_cfg = filtered["services"][worker_service]
-        service_cfg.pop("build", None)
-        service_cfg["image"] = image_ref
+        pin_service_to_image_ref(service_cfg, image_ref)
         service_cfg.pop("depends_on", None)
         service_cfg.pop("volumes", None)
         service_cfg["env_file"] = ["env.ilha"]
@@ -572,21 +573,7 @@ class WorkerManager:
         if chmod_rc != 0:
             raise ilhaCommandError(f"Failed to restrict env file mode on {host}: {chmod_err}")
 
-        login_cmd = (
-            "read -r t; "
-            'printf %s "$t" | docker login registry.digitalocean.com -u "$t" --password-stdin'
-        )
-        ssh_login = conn.build_ssh_command(username, host, login_cmd)
-        login_result = run(
-            ssh_login,
-            input=registry_token + "\n",
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if login_result.returncode != 0:
-            err = (login_result.stderr or login_result.stdout or "").strip()
-            raise ilhaCommandError(f"docker login failed on {host}: {err}")
+        docker_login_remote(conn, username, host, registry_token, run=run)
 
         start_cmd = (
             f"cd {REMOTE_WORKER_DIR} && docker pull {shlex.quote(bundle.image_ref)} && "

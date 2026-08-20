@@ -51,6 +51,7 @@ class RemoteDeployer:
         self.worker_services = [s for s in (os.getenv("WORKER_SERVICES") or "").split() if s]
         self.frontend_service = (os.getenv("FRONTEND_SERVICE") or "").strip()
         self.build_web = os.getenv("BUILD_WEB", "0") == "1"
+        self.pull_images = os.getenv("PULL_IMAGES", "0") == "1"
         self.env_file = ".env"
 
         os.chdir(self.app_root)
@@ -133,6 +134,17 @@ class RemoteDeployer:
                 return False
         else:
             self.logger.info("Step 2: Skipping image build (using existing image)")
+
+        if self.pull_images:
+            self.logger.info("Step 2b: Pulling compose images...")
+            if (
+                self.docker.compose(
+                    "pull", [], env_file=self.env_file, check=False
+                )
+                is None
+            ):
+                self.logger.error("docker compose pull failed")
+                return False
 
         services = [self.web_service] + self.worker_services
         if self.frontend_service:

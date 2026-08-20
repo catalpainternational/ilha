@@ -9,6 +9,7 @@ import click
 from typing import Optional
 
 from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option, command_wrapper
+from ilha.commands.secrets import resolve_cli_secrets_profile
 from ilha.commands.utility import UtilityManager
 from ilha.commands.worktree import WorktreeManager
 from ilha.exceptions import ilhaCommandError
@@ -103,11 +104,15 @@ def register_commands(cli) -> None:
         profile: Optional[str],
         no_preflight: bool,
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
     ):
         """Start the worktree environment for the specified branch."""
         if not detach:
             raise ilhaCommandError("Usage: ilha <worktree_name> up -d")
+        secrets_profile = resolve_cli_secrets_profile(
+            secrets_profile, no_secrets=no_secrets
+        )
         worktree_manager = WorktreeManager()
         success = worktree_manager.start_worktree(
             branch_name,

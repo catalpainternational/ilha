@@ -8,11 +8,20 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 import click
 
 from ilha.cli.helpers import add_json_option, add_secrets_option, add_verbose_option
+from ilha.commands.droplet_remote import (
+    RemoteAppTarget,
+    dump_remote_postgres,
+    read_remote_deploy_identity,
+    remote_compose_exec_command,
+    remote_compose_prefix,
+    resolve_remote_app_target,
+    set_remote_hostname,
+)
 from ilha.commands.droplets import (
     DropletCommands,
     auto_detect_branch_name,
@@ -24,9 +33,12 @@ from ilha.commands.droplets import (
     attach_deploy_report_data,
     resolve_existing_remote_target,
 )
+from ilha.commands.push.deploy_identity import parse_deploy_identity
+from ilha.commands.secrets import resolve_cli_secrets_profile
+from ilha.core.droplet_manager import DropletManager
+from ilha.utils.confirmation import confirm_action
 from ilha.utils.json_output import JSONOutput
-from ilha.utils.network import resolve_server_ip
-from ilha.utils.ssh_manager import SCPTarget
+from ilha.utils.ssh_manager import SCPTarget, SSHConnectionManager
 from ilha.utils.logging import (
     error_exit,
     format_elapsed_time,
@@ -37,12 +49,37 @@ from ilha.utils.logging import (
     print_plain,
 )
 from ilha.exceptions import ilhaCommandError
-from ilha.utils.path_utils import detect_execution_context, get_worktree_branch_name
 from ilha.utils.validation import (
     check_prerequisites,
     check_prerequisites_no_git,
     check_setup_or_prompt,
 )
+
+
+def _resolve_target_or_exit(
+    *,
+    branch_name: Optional[str],
+    scp_target: Optional[str],
+    domain: Optional[str],
+    ip: Optional[str],
+    api_token: Optional[str],
+    json: bool,
+) -> RemoteAppTarget:
+    """Resolve a slim-droplet SSH target or exit with a CLI error."""
+    try:
+        return resolve_remote_app_target(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=json,
+        )
+    except ilhaCommandError as exc:
+        if json:
+            JSONOutput.print_error(exc.message)
+            raise SystemExit(exc.exit_code or 1)
+        error_exit(exc.message)
 
 
 def register_commands(cli) -> None:
@@ -350,6 +387,18 @@ def register_commands(cli) -> None:
         help="SHA256:… fingerprint of the server's SSH host key. If set, a mismatch aborts the deploy (MITM defense). Without it, the first-seen key is trusted (TOFU) and logged so you can pin it on the next deploy.",
     )
     @click.option("--smoke-timeout", type=int, default=60, help="Timeout in seconds for post-deploy smoke checks (default: 60)")
+    @click.option(
+        "--allow-dirty",
+        is_flag=True,
+        default=False,
+        help="Do not fail smoke checks when the worktree has uncommitted changes",
+    )
+    @click.option(
+        "--set-hostname",
+        is_flag=True,
+        default=False,
+        help="Set the droplet OS hostname to the droplet/branch name",
+    )
     @add_secrets_option
     @add_json_option
     @add_verbose_option
@@ -386,7 +435,10 @@ def register_commands(cli) -> None:
         strict_deploy_drift: bool,
         expected_ssh_fingerprint: Optional[str],
         smoke_timeout: int,
+        allow_dirty: bool,
+        set_hostname: bool,
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
     ):
         """Deploy a worktree to a DigitalOcean droplet (slim mode).
@@ -401,11 +453,13 @@ def register_commands(cli) -> None:
           ilha droplet deploy --no-create --scp-target root@1.2.3.4:/root
         """
         from ilha.commands.push.slim_deploy_manager import SlimDeployManager
-        from ilha.core.droplet_manager import DropletManager
 
         start_time = time.time()
         deploy_report: Dict[str, Any] = {}
         try:
+            secrets_profile = resolve_cli_secrets_profile(
+                secrets_profile, no_secrets=no_secrets
+            )
             # Validate mutually exclusive flags
             if domain and ip:
                 if json:
@@ -609,6 +663,12 @@ def register_commands(cli) -> None:
                     smoke_timeout=smoke_timeout,
                     expected_ssh_fingerprint=expected_ssh_fingerprint,
                     secrets_profile=secrets_profile,
+                    allow_dirty=allow_dirty,
+                    set_hostname=(
+                        (droplet_info.name if droplet_info else None) or branch_name
+                    )
+                    if set_hostname
+                    else None,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
@@ -675,8 +735,38 @@ def register_commands(cli) -> None:
     @click.option("--debug", is_flag=True, default=False, help="Enable DEBUG mode on server")
     @click.option("--use-staging-certificates", is_flag=True, default=False, help="Use Let's Encrypt staging certificates")
     @click.option("--use-production-certificates", is_flag=True, default=False, help="Use production certificates (explicit default)")
-    @click.option("--code-only", is_flag=True, default=False, help="Only sync code and config (no volume/data transfer)")
+    @click.option("--code-only", is_flag=True, default=False, help="Only sync code and config (default; kept as an explicit alias)")
     @click.option("--db-only", is_flag=True, default=False, help="Only sync volumes/data (no code transfer). Stops app during restore.")
+    @click.option(
+        "--restore-volumes",
+        is_flag=True,
+        default=False,
+        help="Copy local Docker volumes (DB, media, redis) onto the server. Destructive; never the default.",
+    )
+    @click.option(
+        "--i-mean-it",
+        is_flag=True,
+        default=False,
+        help="Skip the confirmation prompt when --restore-volumes targets a live domain",
+    )
+    @click.option(
+        "--dump-db-first",
+        is_flag=True,
+        default=False,
+        help="Dump the remote database into backups/ before updating",
+    )
+    @click.option(
+        "--allow-dirty",
+        is_flag=True,
+        default=False,
+        help="Do not fail smoke checks when the worktree has uncommitted changes",
+    )
+    @click.option(
+        "--set-hostname",
+        is_flag=True,
+        default=False,
+        help="Set the droplet OS hostname to the branch name",
+    )
     @click.option(
         "--force-password-reset",
         is_flag=True,
@@ -698,28 +788,38 @@ def register_commands(cli) -> None:
         use_production_certificates: bool,
         code_only: bool,
         db_only: bool,
+        restore_volumes: bool,
+        i_mean_it: bool,
+        dump_db_first: bool,
+        allow_dirty: bool,
+        set_hostname: bool,
         force_password_reset: bool,
         api_token: Optional[str],
         secrets_profile: Optional[str],
+        no_secrets: bool,
         json: bool,
     ):
         """Update an existing slim-deployed server.
 
-        By default syncs code, config, and volumes (full update). Use --code-only
-        or --db-only to limit scope. No DNS changes or server prep.
+        Default: sync code and config only (does not copy the laptop database).
+        Use --restore-volumes or --db-only to replace remote data. No DNS
+        changes or server prep.
 
         \b
         Examples:
-          ilha droplet put --domain beta.bower.bid
-          ilha droplet put lipstick --scp-target root@1.2.3.4:/root --domain beta.bower.bid --build
-          ilha droplet put --domain beta.bower.bid --code-only
-          ilha droplet put --domain beta.bower.bid --db-only
+          ilha droplet put --domain beta.example.com
+          ilha droplet put staging --domain staging.example.com
+          ilha droplet put staging --domain staging.example.com --restore-volumes --i-mean-it
+          ilha droplet put --domain beta.example.com --db-only
         """
         from ilha.commands.push.slim_deploy_manager import SlimDeployManager
 
         start_time = time.time()
         deploy_report: Dict[str, Any] = {}
         try:
+            secrets_profile = resolve_cli_secrets_profile(
+                secrets_profile, no_secrets=no_secrets
+            )
             if domain and ip:
                 _print_elapsed(start_time, json)
                 if json:
@@ -740,6 +840,13 @@ def register_commands(cli) -> None:
                     JSONOutput.print_error("--code-only and --db-only are mutually exclusive")
                 else:
                     error_exit("--code-only and --db-only are mutually exclusive")
+                return
+            if code_only and restore_volumes:
+                _print_elapsed(start_time, json)
+                if json:
+                    JSONOutput.print_error("--code-only and --restore-volumes are mutually exclusive")
+                else:
+                    error_exit("--code-only and --restore-volumes are mutually exclusive")
                 return
 
             branch_name = auto_detect_branch_name(branch_name, json)
@@ -770,6 +877,21 @@ def register_commands(cli) -> None:
                     error_exit(f"Error resolving rsync target: {exc}")
                 return
 
+            will_restore = restore_volumes or db_only
+            if will_restore and domain and not i_mean_it:
+                if json:
+                    _print_elapsed(start_time, json)
+                    JSONOutput.print_error(
+                        "Refusing to restore volumes onto a live domain without --i-mean-it"
+                    )
+                    raise SystemExit(1)
+                confirmed = confirm_action(
+                    f"This will REPLACE remote volumes on {domain} with local copies.",
+                    default="N",
+                )
+                if not confirmed:
+                    error_exit("Volume restore cancelled")
+
             deploy_mgr = SlimDeployManager()
             try:
                 success = deploy_mgr.put(
@@ -782,8 +904,12 @@ def register_commands(cli) -> None:
                     use_staging_certificates=use_staging_certificates,
                     code_only=code_only,
                     db_only=db_only,
+                    restore_volumes=restore_volumes,
                     force_password_reset=force_password_reset,
                     secrets_profile=secrets_profile,
+                    dump_db_first=dump_db_first,
+                    allow_dirty=allow_dirty,
+                    set_hostname=branch_name if set_hostname else None,
                 )
                 deploy_report = deploy_mgr.get_last_deploy_report()
             finally:
@@ -861,81 +987,38 @@ def register_commands(cli) -> None:
         """
         import shlex
 
-        if domain and ip:
-            if json:
-                JSONOutput.print_error("--domain and --ip are mutually exclusive")
-                raise SystemExit(1)
-            error_exit("--domain and --ip are mutually exclusive")
-
-        try:
-            branch_name = auto_detect_branch_name(branch_name, json)
-        except ilhaCommandError as exc:
-            if json:
-                JSONOutput.print_error(exc.message, json_output=True)
-                raise SystemExit(exc.exit_code or 1)
-            error_exit(exc.message)
-
         check_prerequisites_no_git()
-
-        try:
-            scp_target, domain, ip, _, _ = resolve_existing_remote_target(
-                branch_name=branch_name,
-                scp_target=scp_target,
-                domain=domain,
-                ip=ip,
-                api_token=api_token,
-                json=json,
-            )
-        except ValueError as exc:
-            if json:
-                JSONOutput.print_error(str(exc))
-            else:
-                error_exit(str(exc))
-            return
-        except Exception as exc:
-            if json:
-                JSONOutput.print_error(f"Error resolving target: {exc}")
-            else:
-                error_exit(f"Error resolving target: {exc}")
-            return
-
-        # Parse scp_target → username, server
-        if "@" not in scp_target:
-            if json:
-                JSONOutput.print_error(f"Cannot parse SCP target: {scp_target}")
-            else:
-                error_exit(f"Cannot parse SCP target: {scp_target}")
-            return
-        user_host, _, _ = scp_target.partition(":")
-        username, _, server = user_host.partition("@")
-
-        from ilha.utils.ssh_manager import SSHManager
-        ssh = SSHManager()
-        remote_app_root = "/root/app"
-
-        # Build docker compose logs command
+        target = _resolve_target_or_exit(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=json,
+        )
+        ssh = SSHConnectionManager()
         svc_args = " ".join(shlex.quote(s) for s in service) if service else ""
         tail_arg = f"--tail {max(1, lines)}"
         follow_arg = "-f" if follow else ""
-        cmd = f"cd {shlex.quote(remote_app_root)} && docker compose --env-file .env logs {tail_arg} {follow_arg} {svc_args} 2>&1"
+        cmd = (
+            f"{remote_compose_prefix(target.app_root)} logs {tail_arg} {follow_arg} {svc_args} 2>&1"
+        )
 
         if follow:
-            # Stream mode: pipe directly to terminal
-            ssh_cmd = ssh.build_ssh_command(username, server, cmd)
+            ssh_cmd = ssh.build_ssh_command(target.username, target.server, cmd)
             proc = None
             try:
                 proc = subprocess.Popen(ssh_cmd, stdout=sys.stdout, stderr=sys.stderr)
                 proc.wait()
             except KeyboardInterrupt:
-                # proc may be unbound if Popen itself raised / Ctrl-C landed during
-                # spawn; guard so the handler doesn't mask the real error with a
-                # NameError.
                 if proc is not None:
                     proc.terminate()
                     proc.wait()
         else:
             try:
-                result = ssh.execute_remote(username, server, cmd, timeout=60, check=False)
+                result = ssh.execute_remote(
+                    target.username, target.server, cmd, timeout=60, check=False
+                )
                 output = (result.stdout or "") + (result.stderr or "")
                 if json:
                     JSONOutput.print_json({"logs": output})
@@ -946,6 +1029,306 @@ def register_commands(cli) -> None:
                     JSONOutput.print_error(f"Error fetching logs: {exc}", json_output=True)
                     raise SystemExit(1)
                 error_exit(f"Error fetching logs: {exc}")
+
+    @droplet.command("ssh")
+    @click.argument("branch_name", required=False)
+    @click.argument("command", nargs=-1, type=click.UNPROCESSED)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_verbose_option
+    def droplet_ssh(
+        branch_name: Optional[str],
+        command: tuple,
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+    ):
+        """Open an SSH session (or run a remote command) on a slim droplet.
+
+        \b
+        Examples:
+          ilha droplet ssh staging
+          ilha droplet ssh staging -- docker compose ps
+          ilha droplet ssh --domain app.example.com -- uname -a
+        """
+        check_prerequisites_no_git()
+        target = _resolve_target_or_exit(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=False,
+        )
+        ssh = SSHConnectionManager()
+        remote_cmd = " ".join(command) if command else None
+        raise SystemExit(ssh.interactive_ssh(target.username, target.server, remote_cmd))
+
+    @droplet.command("dump-db")
+    @click.argument("branch_name", required=False)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @click.option(
+        "--output",
+        type=click.Path(path_type=Path),
+        help="Destination file. Default: backups/<label>-<utc>.pgdump",
+    )
+    @add_json_option
+    @add_verbose_option
+    def droplet_dump_db(
+        branch_name: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+        output: Optional[Path],
+        json: bool,
+    ):
+        """Dump the remote Postgres database (custom format) into backups/.
+
+        Uses the container's POSTGRES_* environment, not the laptop .env.
+        """
+        from ilha.commands.push.deploy_service_config import load_deploy_service_config
+        from ilha.config.settings import get_project_root
+
+        check_prerequisites_no_git()
+        target = _resolve_target_or_exit(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=json,
+        )
+        project_root = get_project_root()
+        db_service = load_deploy_service_config(project_root).db_service
+        try:
+            dest = dump_remote_postgres(
+                target,
+                db_service=db_service,
+                project_root=project_root,
+                output=output,
+            )
+        except ilhaCommandError as exc:
+            if json:
+                JSONOutput.print_error(exc.message)
+                raise SystemExit(exc.exit_code or 1)
+            error_exit(exc.message)
+        if json:
+            JSONOutput.print_json(
+                JSONOutput.success("Database dump written", {"path": str(dest)})
+            )
+        else:
+            log_success(str(dest))
+
+    @droplet.command("status")
+    @click.argument("branch_name", required=False)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_json_option
+    @add_verbose_option
+    def droplet_status(
+        branch_name: Optional[str],
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+        json: bool,
+    ):
+        """Show remote /app/.ilha/deploy.json and compare it to local HEAD."""
+        from ilha.commands.push.deploy_preflight import DeployPreflight
+        from ilha.config.settings import get_project_root
+
+        check_prerequisites_no_git()
+        target = _resolve_target_or_exit(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=json,
+        )
+        raw = read_remote_deploy_identity(target)
+        identity = parse_deploy_identity(raw)
+        if not identity:
+            message = "No /app/.ilha/deploy.json on the server. Redeploy with a current ilha."
+            if json:
+                JSONOutput.print_error(message, error_code="missing_deploy_identity")
+                raise SystemExit(1)
+            error_exit(message)
+
+        project_root = get_project_root()
+        preflight = DeployPreflight(project_root)
+        worktree = preflight.resolve_worktree_path(target.branch_name)
+        local_sha = preflight._git_rev_parse_head(worktree if worktree.exists() else project_root)
+        remote_sha = identity.get("git_sha")
+        in_sync = bool(local_sha) and remote_sha == local_sha
+        payload = {
+            "identity": identity,
+            "local_sha": local_sha,
+            "in_sync": in_sync,
+            "server": f"{target.username}@{target.server}",
+        }
+        if json:
+            JSONOutput.print_json(
+                JSONOutput.success("Droplet status", payload)
+                if in_sync
+                else JSONOutput.error(
+                    "Remote git_sha does not match local HEAD",
+                    error_code="deploy_identity_mismatch",
+                    details=payload,
+                )
+            )
+            if not in_sync:
+                raise SystemExit(1)
+            return
+        print_plain(f"Server:     {target.username}@{target.server}")
+        print_plain(f"Branch:     {identity.get('branch_name')}")
+        print_plain(f"Remote SHA: {remote_sha}")
+        print_plain(f"Local SHA:  {local_sha}")
+        print_plain(f"Dirty:      {identity.get('git_dirty')}")
+        print_plain(f"Deployed:   {identity.get('deployed_at')}")
+        print_plain(f"ilha:       {identity.get('ilha_version')}")
+        refs = identity.get("image_refs") or {}
+        if refs:
+            print_plain("Images:")
+            for name, ref in refs.items():
+                print_plain(f"  {name}: {ref}")
+        if in_sync:
+            log_success("Remote SHA matches local HEAD")
+        else:
+            error_exit("Remote git_sha does not match local HEAD")
+
+    @droplet.command("exec")
+    @click.argument("branch_name", required=False)
+    @click.argument("service")
+    @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+    @click.option("--scp-target", help="SCP target (user@host:path). Falls back to stored config.")
+    @click.option("--domain", help="Domain for the deployment")
+    @click.option("--ip", help="IP for HTTP-only. Mutually exclusive with --domain.")
+    @click.option("--api-token", help="API token for resolving domain/droplet to SCP target")
+    @add_verbose_option
+    def droplet_exec(
+        branch_name: Optional[str],
+        service: str,
+        command: tuple,
+        scp_target: Optional[str],
+        domain: Optional[str],
+        ip: Optional[str],
+        api_token: Optional[str],
+    ):
+        """Run a command in a remote compose service.
+
+        \b
+        Examples:
+          ilha droplet exec staging web python manage.py migrate
+          ilha droplet exec --domain app.example.com web python manage.py showmigrations
+        """
+        check_prerequisites_no_git()
+        target = _resolve_target_or_exit(
+            branch_name=branch_name,
+            scp_target=scp_target,
+            domain=domain,
+            ip=ip,
+            api_token=api_token,
+            json=False,
+        )
+        ssh = SSHConnectionManager()
+        cmd = remote_compose_exec_command(service, command, app_root=target.app_root)
+        result = ssh.execute_remote(
+            target.username, target.server, cmd, timeout=600, check=False
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        if output:
+            print_plain(output.rstrip())
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+
+    @droplet.command("rename")
+    @click.argument("old_name")
+    @click.argument("new_name")
+    @click.option("--api-token", help="DigitalOcean API token")
+    @click.option(
+        "--set-hostname",
+        is_flag=True,
+        default=False,
+        help="Also set the OS hostname on the droplet to NEW",
+    )
+    @add_json_option
+    @add_verbose_option
+    def droplet_rename(
+        old_name: str,
+        new_name: str,
+        api_token: Optional[str],
+        set_hostname: bool,
+        json: bool,
+    ):
+        """Rename a DigitalOcean droplet (API name). Optionally set OS hostname."""
+        token = DropletManager.resolve_droplet_token(api_token)
+        provider = DropletManager.create_provider("digitalocean", token) if token else None
+        if not provider:
+            message = "DigitalOcean API token required to rename a droplet"
+            if json:
+                JSONOutput.print_error(message)
+                raise SystemExit(1)
+            error_exit(message)
+        matches = [d for d in provider.list_droplets() if d.name == old_name]
+        if not matches:
+            message = f"Droplet not found: {old_name}"
+            if json:
+                JSONOutput.print_error(message)
+                raise SystemExit(1)
+            error_exit(message)
+        if len(matches) > 1:
+            message = f"Multiple droplets named {old_name!r}; rename by id is not supported yet"
+            if json:
+                JSONOutput.print_error(message)
+                raise SystemExit(1)
+            error_exit(message)
+        droplet = matches[0]
+        if not provider.rename_droplet(droplet.id, new_name):
+            message = f"Failed to rename droplet {old_name} → {new_name}"
+            if json:
+                JSONOutput.print_error(message)
+                raise SystemExit(1)
+            error_exit(message)
+        if set_hostname:
+            host = droplet.ip_address or droplet.private_ip_address
+            if not host:
+                message = "Renamed, but droplet has no IP so hostname was not updated"
+                if json:
+                    JSONOutput.print_error(message)
+                    raise SystemExit(1)
+                error_exit(message)
+            try:
+                set_remote_hostname(
+                    RemoteAppTarget(
+                        username="root",
+                        server=host,
+                        scp_target=f"root@{host}:/root",
+                        domain=None,
+                        ip=host,
+                        branch_name=new_name,
+                    ),
+                    new_name,
+                )
+            except ilhaCommandError as exc:
+                if json:
+                    JSONOutput.print_error(exc.message)
+                    raise SystemExit(exc.exit_code or 1)
+                error_exit(exc.message)
+        payload = {"id": droplet.id, "old_name": old_name, "new_name": new_name}
+        if json:
+            JSONOutput.print_json(JSONOutput.success("Droplet renamed", payload))
+        else:
+            log_success(f"Renamed {old_name} → {new_name} (id={droplet.id})")
 
     @droplet.command("doctor")
     @click.argument("branch_name", required=False)

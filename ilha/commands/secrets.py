@@ -15,6 +15,7 @@ import yaml
 
 from ilha.config.settings import ILHA_DIR, get_project_root
 from ilha.exceptions import ilhaCommandError
+from ilha.utils.logging import log_info
 from ilha.utils.env_loader import (
     EnvLayer,
     format_env_text,
@@ -108,6 +109,23 @@ class SecretsManager:
     def default_profile_name(self) -> Optional[str]:
         default_profile = self.load_secrets_config().get("default_profile")
         return str(default_profile).strip() if default_profile else None
+
+    def resolve_optional_profile_name(self, profile_name: Optional[str] = None) -> Optional[str]:
+        """Return an explicit or default profile name, or None if unused.
+
+        Unlike ``resolve_profile``, this does not error when no ``secrets:``
+        block is configured. An explicit name or a configured default is still
+        validated.
+        """
+        explicit = (profile_name or "").strip()
+        if explicit:
+            return self.resolve_profile(explicit).name
+        default = self.default_profile_name()
+        if not default:
+            return None
+        if not self.has_configured_profiles():
+            return None
+        return self.resolve_profile(default).name
 
     def resolve_profile(self, profile_name: Optional[str] = None) -> SecretProfile:
         cfg = self.load_secrets_config()
@@ -246,3 +264,28 @@ class SecretsManager:
             decrypted = self.decrypt_profile(profile_name)
             return str(decrypted.get(token_env, "")).strip()
         return ""
+
+
+def resolve_cli_secrets_profile(
+    secrets_profile: Optional[str] = None,
+    *,
+    no_secrets: bool = False,
+    project_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Resolve the SOPS profile for a CLI invocation.
+
+    ``--secrets NAME`` wins; otherwise ``secrets.default_profile`` is used when
+    configured. ``--no-secrets`` forces plaintext env layers only.
+    """
+    if no_secrets and (secrets_profile or "").strip():
+        raise ilhaCommandError("--secrets and --no-secrets are mutually exclusive")
+    if no_secrets:
+        return None
+    mgr = SecretsManager(project_root)
+    name = mgr.resolve_optional_profile_name(secrets_profile)
+    if name:
+        if (secrets_profile or "").strip():
+            log_info(f"Using secrets profile: {name}")
+        else:
+            log_info(f"Using secrets profile: {name} (default)")
+    return name

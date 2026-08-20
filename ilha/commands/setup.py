@@ -258,7 +258,8 @@ class SetupManager:
                 from ..utils.file_utils import append_line_to_file
                 gitignore_path = self.project_root / '.gitignore'
                 append_line_to_file(gitignore_path, 'worktrees/')
-                log_success("Added worktrees/ to .gitignore")
+                append_line_to_file(gitignore_path, 'backups/')
+                log_success("Added worktrees/ and backups/ to .gitignore")
             except Exception:
                 log_warning("Failed to update .gitignore silently in non-interactive mode")
         else:
@@ -1615,6 +1616,8 @@ environment:
                 else:
                     log_info("Skipped adding to .cursorindexignore")
             
+            add_to_gitignore(self.project_root, "backups/")
+
             return success
                 
         except Exception as e:
