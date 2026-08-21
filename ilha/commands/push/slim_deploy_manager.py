@@ -2845,6 +2845,41 @@ echo "Volume restore complete"
                 pass
         return timed_out, int(process.returncode or 0), out_lines
 
+    @staticmethod
+    def build_deploy_rsync_args(app_uid: int, app_gid: int) -> List[str]:
+        """rsync flags for the deploy tree.
+
+        ``-a`` implies ``-o -g``: with root receiving, rsync stamps the
+        *laptop's* uid onto the server (macOS uid 501/502), leaving 0600
+        secrets (.env, .ilha/age.key) unreadable by the container user — this
+        took staging down on 2026-08-21. ``--chown`` overrides that mapping so
+        every transferred file lands owned by the app user. Modes are still
+        preserved: a 0600 secret owned by the app uid is readable by the app.
+        """
+        return [
+            "-avz",
+            f"--chown={int(app_uid)}:{int(app_gid)}",
+            "--progress",
+            "--delete-delay",
+            "--partial",
+            "--inplace",
+        ]
+
+    @classmethod
+    def build_ownership_heal_command(cls, app_uid: int, app_gid: int) -> str:
+        """Remote command fixing ownership of the deployed tree in place.
+
+        ``--chown`` only touches files rsync transfers; content-unchanged
+        files are skipped and keep whatever ownership an earlier (buggy)
+        deploy left them with. This heals those. ``volumes/`` is deliberately
+        excluded — database data has its own uid contract (e.g. postgres 999).
+        """
+        root = cls.REMOTE_APP_ROOT
+        # Every target exists after a successful transfer, so a chown failure
+        # here is a real signal (e.g. read-only fs) — let it reach the caller.
+        targets = f"{root}/code {root}/.env {root}/docker-compose.yml {root}/docker-compose.overlay.yml"
+        return f"chown -R {int(app_uid)}:{int(app_gid)} {targets}"
+
     def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
         """rsync the deploy directory to the server."""
         log_info(f"Transferring deploy directory to {server}:{self.REMOTE_APP_ROOT}/ ...")
@@ -2860,11 +2895,7 @@ echo "Volume restore complete"
 
         cmd = [
             "rsync",
-            "-avz",
-            "--progress",
-            "--delete-delay",
-            "--partial",
-            "--inplace",
+            *self.build_deploy_rsync_args(self.services.app_uid, self.services.app_gid),
             "-e", self.ssh.get_rsync_ssh_command(username, server),
             f"{deploy_dir}/",
             f"{username}@{server}:{self.REMOTE_APP_ROOT}/",
@@ -2886,6 +2917,24 @@ echo "Volume restore complete"
                 return False
             if code == 0:
                 log_success("Transfer complete")
+                # Heal ownership rsync could not: --chown covers transferred
+                # files only, and content-unchanged files are skipped, so a
+                # tree damaged by an earlier deploy stays damaged without this.
+                heal_cmd = self.ssh.build_ssh_command(
+                    username,
+                    server,
+                    self.build_ownership_heal_command(
+                        self.services.app_uid, self.services.app_gid
+                    ),
+                )
+                heal = subprocess.run(
+                    heal_cmd, capture_output=True, text=True, timeout=120
+                )
+                if heal.returncode != 0:
+                    log_warning(
+                        "Ownership normalization failed (continuing): "
+                        f"{heal.stderr.strip() or heal.returncode}"
+                    )
                 return True
             if code == 255 and attempt == 1 and self._ssh_reachable(username, server):
                 log_warning("rsync exited 255; SSH still reachable — retrying once.")

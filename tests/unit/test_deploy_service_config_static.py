@@ -151,3 +151,21 @@ def test_migrate_command_empty_disables(tmp_path: Path) -> None:
     _write_config(tmp_path, {"migrate_command": ""})
     cfg = load_deploy_service_config(tmp_path)
     assert cfg.resolved_migrate_command(tmp_path) == ""
+
+
+def test_app_uid_defaults_and_config_override():
+    from ilha.commands.push.deploy_service_config import DeployServiceConfig
+
+    default = DeployServiceConfig.from_mapping(None)
+    assert (default.app_uid, default.app_gid) == (1000, 1000)
+
+    override = DeployServiceConfig.from_mapping({"app_uid": 33, "app_gid": "33"})
+    assert (override.app_uid, override.app_gid) == (33, 33)
+
+    # Garbage falls back to the default rather than exploding mid-deploy.
+    bad = DeployServiceConfig.from_mapping({"app_uid": "not-a-uid"})
+    assert bad.app_uid == 1000
+
+    # base propagation: a resolved config carries custom ids forward.
+    carried = DeployServiceConfig.from_mapping({}, base=override)
+    assert carried.app_uid == 33

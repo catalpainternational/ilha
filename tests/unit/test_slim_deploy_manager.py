@@ -647,3 +647,30 @@ def test_maybe_pin_published_images_rewrites_when_manifest_exists(tmp_path: Path
     text = (deploy_dir / "docker-compose.yml").read_text()
     assert "build:" not in text
     assert "sha256:abc" in text
+
+
+# ── deploy-tree ownership (2026-08-21 staging outage regression) ─────────
+
+def test_deploy_rsync_args_chown_to_app_user_never_laptop_uid():
+    """-a implies -o -g: without --chown, root receiving rsync stamps the
+    laptop's uid onto /app, leaving 0600 secrets unreadable by the container
+    user. This took staging down on 2026-08-21."""
+    args = SlimDeployManager.build_deploy_rsync_args(1000, 1000)
+    assert "--chown=1000:1000" in args
+    assert "-avz" in args  # modes still preserved; ownership is the override
+
+
+def test_deploy_rsync_args_honor_configured_uid():
+    args = SlimDeployManager.build_deploy_rsync_args(33, 33)
+    assert "--chown=33:33" in args
+
+
+def test_ownership_heal_targets_app_tree_but_never_volumes():
+    """Heal covers files rsync skipped as unchanged; volumes/ keeps its own
+    uid contract (postgres 999) and must never be swept."""
+    cmd = SlimDeployManager.build_ownership_heal_command(1000, 1000)
+    root = SlimDeployManager.REMOTE_APP_ROOT
+    assert f"chown -R 1000:1000" in cmd
+    for target in (f"{root}/code", f"{root}/.env", f"{root}/docker-compose.yml"):
+        assert target in cmd
+    assert "volumes" not in cmd

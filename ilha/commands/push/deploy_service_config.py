@@ -93,6 +93,14 @@ class DeployServiceConfig:
     migrate_command: Optional[str] = None
     # Extra remote commands after migrate (each is ``compose exec`` argv joined).
     post_up: List[str] = field(default_factory=list)
+    # Owner for the deployed tree on the server. rsync would otherwise stamp
+    # the *laptop's* uid onto /app (macOS uid 501/502), leaving 0600 secrets
+    # (.env, .ilha/age.key) unreadable by the container user. 1000:1000 is the
+    # dominant non-root container convention and harmless for root containers
+    # (root reads regardless); override via ``deploy.app_uid`` / ``app_gid``
+    # for images that run as anything else.
+    app_uid: int = 1000
+    app_gid: int = 1000
 
     def app_service_names(self) -> List[str]:
         """Web + optional frontend + workers (services ilha starts/pins)."""
@@ -157,6 +165,8 @@ class DeployServiceConfig:
             "api_paths",
             "migrate_command",
             "post_up",
+            "app_uid",
+            "app_gid",
         }
         unknown = set(data.keys()) - known
         if unknown:
@@ -179,10 +189,21 @@ class DeployServiceConfig:
             ),
             "migrate_command": defaults.migrate_command,
             "post_up": list(defaults.post_up),
+            "app_uid": defaults.app_uid,
+            "app_gid": defaults.app_gid,
         }
         for key in known:
             if key in data and data[key] is not None:
                 kwargs[key] = data[key]
+
+        for id_key in ("app_uid", "app_gid"):
+            try:
+                kwargs[id_key] = int(kwargs[id_key])
+            except (TypeError, ValueError):
+                log_warning(
+                    f"deploy.{id_key} must be an integer; using {getattr(defaults, id_key)}"
+                )
+                kwargs[id_key] = getattr(defaults, id_key)
 
         # Normalize lists: accept comma-strings too, for convenience. Also
         # tolerate explicit empty lists (no deps / no workers).
