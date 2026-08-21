@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import yaml
 import tempfile
 import time
 import uuid
@@ -1285,6 +1286,7 @@ echo OK
             log_step("Syncing code to server")
             stage_started = time.time()
             self.ssh.ensure_host_key(server)
+            self._apply_vpc_bindings_to_overlay(deploy_dir, username, server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 self._set_failure(
                     error_code="rsync_failed",
@@ -1701,6 +1703,7 @@ echo OK
                 return False
             log_step("Syncing code to server")
             self.ssh.ensure_host_key(server)
+            self._apply_vpc_bindings_to_overlay(deploy_dir, username, server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 _cleanup_deploy_dir(deploy_dir)
                 render_deploy_report(self._last_report)
@@ -1768,6 +1771,7 @@ echo OK
                 return False
             log_step("Syncing to server")
             self.ssh.ensure_host_key(server)
+            self._apply_vpc_bindings_to_overlay(deploy_dir, username, server)
             if not self._rsync_to_server(deploy_dir, username, server):
                 _cleanup_deploy_dir(deploy_dir)
                 render_deploy_report(self._last_report)
@@ -2931,6 +2935,91 @@ echo "Volume restore complete"
             f"chown -R {int(app_uid)}:{int(app_gid)} {targets} && "
             f"if [ -e {cp} ]; then chown root:root {cp} && chmod 600 {cp}; fi"
         )
+
+    def _resolve_server_private_ip(self, username: str, server: str) -> Optional[str]:
+        """The target droplet's VPC private IP, via the DO metadata service.
+
+        Resolved on the server itself so no DigitalOcean API token is needed.
+        Returns None when unavailable (non-DO host, no VPC) — callers skip
+        bindings rather than guess.
+        """
+        cmd = self.ssh.build_ssh_command(
+            username, server,
+            "curl -s --max-time 5 "
+            "http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address",
+        )
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            return None
+        candidate = (proc.stdout or "").strip().splitlines()[-1].strip() if proc.stdout else ""
+        parts = candidate.split(".")
+        if proc.returncode == 0 and len(parts) == 4 and all(p.isdigit() for p in parts):
+            return candidate
+        return None
+
+    def _apply_vpc_bindings_to_overlay(self, deploy_dir: Path, username: str, server: str) -> None:
+        """Re-publish db/redis on the server's VPC private IP in the overlay.
+
+        The deploy closes every host port publish for security, but a
+        configured ``worker_pool``'s ephemeral droplets reach central's
+        database and queue through exactly these two ports — losing them
+        makes the fleet spin up and idle (observed 2026-08-21: an entire
+        full-resource run executed on central alone while two healthy
+        droplets retried a closed 5432). Opt-in via ``vpc.auto_bind_ports``;
+        binds only to the private IP, never 0.0.0.0. Best-effort: failure to
+        resolve the IP logs a warning and deploys without bindings.
+        """
+        from ...utils.vpc_ports import apply_vpc_port_bindings, read_vpc_bind_config
+
+        code_dir = deploy_dir / "code"
+        auto_bind, bind_private = read_vpc_bind_config(code_dir)
+        if not auto_bind:
+            return
+        if not bind_private:
+            log_warning(
+                "vpc.auto_bind_ports is on but bind_to_private_ip is false; "
+                "refusing a 0.0.0.0 bind — no VPC bindings applied."
+            )
+            return
+        private_ip = self._resolve_server_private_ip(username, server)
+        if not private_ip:
+            log_warning(
+                "vpc.auto_bind_ports is on but the server's private IP could not "
+                "be resolved from DO metadata; deploying without VPC bindings."
+            )
+            return
+
+        overlay_path = deploy_dir / "docker-compose.overlay.yml"
+        try:
+            overlay = yaml.safe_load(overlay_path.read_text()) or {}
+        except Exception as exc:
+            log_warning(f"Could not read overlay for VPC bindings: {exc}")
+            return
+        # The services worker droplets depend on — same set the worker bundle
+        # treats as its external dependencies. Fall back to the conventional
+        # pair when the project declares none: binding skips services that
+        # don't exist or expose nothing, so the fallback cannot over-publish.
+        targets = [svc for svc in self.services.dependency_services if svc] or ["db", "redis"]
+        # expose: lives in the BASE compose; give the binding helper a merged
+        # view so detection sees it while the write lands in the overlay.
+        try:
+            base = yaml.safe_load((deploy_dir / "docker-compose.yml").read_text()) or {}
+        except Exception:
+            base = {}
+        merged_services = {}
+        for name in targets:
+            merged = dict((base.get("services") or {}).get(name) or {})
+            merged.update((overlay.get("services") or {}).get(name) or {})
+            merged_services[name] = merged
+        bound = apply_vpc_port_bindings({"services": merged_services}, targets, private_ip)
+        if not bound:
+            return
+        overlay.setdefault("services", {})
+        for name in bound:
+            overlay["services"].setdefault(name, {})["ports"] = merged_services[name]["ports"]
+        overlay_path.write_text(yaml.safe_dump(overlay, sort_keys=False))
+        log_success(f"VPC bindings applied to overlay for: {', '.join(bound)} ({private_ip})")
 
     def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
         """rsync the deploy directory to the server."""

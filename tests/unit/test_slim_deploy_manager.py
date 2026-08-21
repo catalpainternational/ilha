@@ -728,3 +728,84 @@ def test_env_file_flags_accept_one_path_or_many():
     assert env_file_flags([".env", ".env.control-plane"]) == [
         "--env-file", ".env", "--env-file", ".env.control-plane",
     ]
+
+
+def test_vpc_binding_helpers_bind_exposed_ports_to_private_ip():
+    """The deploy closes all host publishes; worker droplets need db/redis
+    republished on the VPC IP. An entire run executed on central alone while
+    two healthy droplets retried a closed 5432 (2026-08-21)."""
+    from ilha.utils.vpc_ports import (
+        apply_vpc_port_bindings,
+        detect_service_expose_ports,
+    )
+
+    compose = {"services": {
+        "db": {"expose": ["5432"], "ports": []},          # deploy-emptied: rebind
+        "redis": {"expose": ["6379"]},                     # no ports key: bind
+        "web": {"expose": ["8000"], "ports": ["8000:8000"]},  # user's own: leave
+        "caddy": {},                                       # nothing exposed: skip
+    }}
+    assert detect_service_expose_ports(compose, "db") == [5432]
+    bound = apply_vpc_port_bindings(compose, ["db", "redis", "web", "caddy"], "10.0.0.4")
+    assert bound == ["db", "redis"]
+    assert compose["services"]["db"]["ports"] == ["10.0.0.4:5432:5432"]
+    assert compose["services"]["redis"]["ports"] == ["10.0.0.4:6379:6379"]
+    assert compose["services"]["web"]["ports"] == ["8000:8000"]
+
+
+def test_read_vpc_bind_config_defaults_and_optin(tmp_path: Path):
+    from ilha.utils.vpc_ports import read_vpc_bind_config
+
+    assert read_vpc_bind_config(tmp_path) == (False, True)  # no config: disabled
+    cfg = tmp_path / ".ilha"
+    cfg.mkdir()
+    (cfg / "config.yml").write_text("vpc:\n  auto_bind_ports: true\n")
+    assert read_vpc_bind_config(tmp_path) == (True, True)
+
+
+def test_apply_vpc_bindings_to_overlay_end_to_end(tmp_path: Path, monkeypatch):
+    """Overlay gains private-IP bindings for dependency services; base compose
+    carries the expose declarations."""
+    import yaml as _yaml
+
+    deploy_dir = tmp_path / "deploy"
+    code_cfg = deploy_dir / "code" / ".ilha"
+    code_cfg.mkdir(parents=True)
+    (code_cfg / "config.yml").write_text("vpc:\n  auto_bind_ports: true\n")
+    (deploy_dir / "docker-compose.yml").write_text(_yaml.safe_dump({
+        "services": {"db": {"expose": ["5432"]}, "redis": {"expose": ["6379"]}}
+    }))
+    (deploy_dir / "docker-compose.overlay.yml").write_text(_yaml.safe_dump({
+        "services": {"db": {"ports": []}}
+    }))
+
+    mgr = SlimDeployManager(project_root=tmp_path)
+    monkeypatch.setattr(mgr, "_resolve_server_private_ip", lambda u, s: "10.126.0.4")
+    mgr._apply_vpc_bindings_to_overlay(deploy_dir, "root", "203.0.113.9")
+
+    overlay = _yaml.safe_load((deploy_dir / "docker-compose.overlay.yml").read_text())
+    assert overlay["services"]["db"]["ports"] == ["10.126.0.4:5432:5432"]
+    assert overlay["services"]["redis"]["ports"] == ["10.126.0.4:6379:6379"]
+
+
+def test_apply_vpc_bindings_skips_without_optin_or_ip(tmp_path: Path, monkeypatch):
+    import yaml as _yaml
+
+    deploy_dir = tmp_path / "deploy"
+    (deploy_dir / "code" / ".ilha").mkdir(parents=True)
+    (deploy_dir / "docker-compose.yml").write_text(_yaml.safe_dump(
+        {"services": {"db": {"expose": ["5432"]}}}))
+    overlay_text = _yaml.safe_dump({"services": {"db": {"ports": []}}})
+    (deploy_dir / "docker-compose.overlay.yml").write_text(overlay_text)
+
+    mgr = SlimDeployManager(project_root=tmp_path)
+    # no config at all -> disabled, overlay untouched
+    mgr._apply_vpc_bindings_to_overlay(deploy_dir, "root", "203.0.113.9")
+    assert (deploy_dir / "docker-compose.overlay.yml").read_text() == overlay_text
+
+    # opted in but metadata unavailable -> warn and deploy without bindings
+    (deploy_dir / "code" / ".ilha" / "config.yml").write_text(
+        "vpc:\n  auto_bind_ports: true\n")
+    monkeypatch.setattr(mgr, "_resolve_server_private_ip", lambda u, s: None)
+    mgr._apply_vpc_bindings_to_overlay(deploy_dir, "root", "203.0.113.9")
+    assert (deploy_dir / "docker-compose.overlay.yml").read_text() == overlay_text

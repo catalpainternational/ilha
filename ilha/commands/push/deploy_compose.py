@@ -153,3 +153,4 @@ def retarget_paths_to_code_subdir(compose_data: dict) -> None:
         extends = svc.get("extends")
         if isinstance(extends, dict) and isinstance(extends.get("file"), str):
             extends["file"] = retarget_relative_path(extends["file"])
+

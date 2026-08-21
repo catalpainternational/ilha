@@ -28,19 +28,8 @@ class WorkerComposeFilter:
         Returns:
             List of container port numbers from 'expose' field
         """
-        service = compose_data.get('services', {}).get(service_name, {})
-        ports = []
-
-        # Only check expose (container ports) - not ports mappings
-        # This method is used to detect services that need port bindings
-        if 'expose' in service:
-            for port in service['expose']:
-                try:
-                    ports.append(int(port))
-                except (ValueError, TypeError):
-                    continue
-
-        return list(set(ports))  # Remove duplicates
+        from ilha.utils.vpc_ports import detect_service_expose_ports
+        return detect_service_expose_ports(compose_data, service_name)
 
     def _find_env_vars_for_service(self, compose_data: Dict[str, Any], service_name: str) -> List[str]:
         """Find environment variables that reference a service.
@@ -118,20 +107,10 @@ class WorkerComposeFilter:
         Returns:
             True if any ports were configured, False otherwise
         """
-        # Check if VPC port binding is enabled in config
-        config_path = worktree_path / ".ilha" / "config.yml"
-        auto_bind_ports = False
-        bind_to_private_ip = True  # Default to true for security
-
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config = yaml.safe_load(f) or {}
-                    vpc_config = config.get('vpc', {})
-                    auto_bind_ports = vpc_config.get('auto_bind_ports', False)
-                    bind_to_private_ip = vpc_config.get('bind_to_private_ip', True)
-            except Exception:
-                pass
+        # Check if VPC port binding is enabled in config (shared reader so
+        # worker bundles and slim deploys agree on the opt-in semantics).
+        from ilha.utils.vpc_ports import read_vpc_bind_config
+        auto_bind_ports, bind_to_private_ip = read_vpc_bind_config(worktree_path)
 
         if not auto_bind_ports:
             return False
