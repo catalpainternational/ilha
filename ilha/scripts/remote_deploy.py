@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from deploy_utils import DeployLogger, DockerCommand
+from deploy_utils import DeployLogger, DockerCommand, env_file_flags
 
 
 class RemoteDeployer:
@@ -52,9 +52,16 @@ class RemoteDeployer:
         self.frontend_service = (os.getenv("FRONTEND_SERVICE") or "").strip()
         self.build_web = os.getenv("BUILD_WEB", "0") == "1"
         self.pull_images = os.getenv("PULL_IMAGES", "0") == "1"
-        self.env_file = ".env"
-
         os.chdir(self.app_root)
+
+        # .env.control-plane exists only on worker_pool deploys (written by
+        # slim put's _build_merged_env): control-plane secrets ride a separate
+        # root-only file so compose interpolation feeds them solely to the
+        # services whose environment: references them (the autoscaler) — never
+        # the app-wide `env_file: .env` that every service loads.
+        self.env_files = [".env"] + (
+            [".env.control-plane"] if os.path.exists(".env.control-plane") else []
+        )
 
     def _require_env(self, name: str) -> str:
         value = os.getenv(name)
@@ -87,7 +94,7 @@ class RemoteDeployer:
         _write_cmd(
             "docker_compose_ps",
             [
-                "docker", "compose", "--env-file", self.env_file,
+                "docker", "compose", *env_file_flags(self.env_files),
                 *DockerCommand.COMPOSE_FLAGS,
                 "ps", "-a",
             ],
@@ -109,14 +116,14 @@ class RemoteDeployer:
         if self.deps_services:
             self.logger.info(f"Step 1: Bringing up dependencies: {self.deps_services}")
             self.docker.compose(
-                "up", ["-d"] + self.deps_services, env_file=self.env_file, check=False
+                "up", ["-d"] + self.deps_services, env_file=self.env_files, check=False
             )
         else:
             self.logger.info("Step 1: No dependency services configured; skipping")
 
         if self.db_service:
             self.logger.info(f"Step 1: Waiting for {self.db_service} readiness...")
-            if not self.docker.wait_for_postgres(self.db_service, env_file=self.env_file):
+            if not self.docker.wait_for_postgres(self.db_service, env_file=self.env_files):
                 self.logger.error("Database not ready")
                 return False
         else:
@@ -126,7 +133,7 @@ class RemoteDeployer:
             self.logger.info(f"Step 2: Building {self.web_service} image...")
             if (
                 self.docker.compose(
-                    "build", [self.web_service], env_file=self.env_file, check=False
+                    "build", [self.web_service], env_file=self.env_files, check=False
                 )
                 is None
             ):
@@ -139,7 +146,7 @@ class RemoteDeployer:
             self.logger.info("Step 2b: Pulling compose images...")
             if (
                 self.docker.compose(
-                    "pull", [], env_file=self.env_file, check=False
+                    "pull", [], env_file=self.env_files, check=False
                 )
                 is None
             ):
@@ -152,7 +159,7 @@ class RemoteDeployer:
         self.logger.info(f"Step 3: Bringing up {services}...")
         if (
             self.docker.compose(
-                "up", ["-d"] + services, env_file=self.env_file, check=False
+                "up", ["-d"] + services, env_file=self.env_files, check=False
             )
             is None
         ):
@@ -171,7 +178,7 @@ class RemoteDeployer:
             f"Step 4: Health checking {self.web_service} at "
             f":{self.web_port}{self.health_path}"
         )
-        container_id = self.docker.ps_q(self.web_service, env_file=self.env_file)
+        container_id = self.docker.ps_q(self.web_service, env_file=self.env_files)
         if not container_id:
             self.logger.error(f"{self.web_service} container not found after up")
             self._persist_failure_diagnostics(None)
@@ -206,7 +213,7 @@ class RemoteDeployer:
             return False
 
         self.logger.success("=== Deployment Complete ===")
-        self.docker.compose("ps", [], env_file=self.env_file)
+        self.docker.compose("ps", [], env_file=self.env_files)
         return True
 
 

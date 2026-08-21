@@ -674,3 +674,57 @@ def test_ownership_heal_targets_app_tree_but_never_volumes():
     for target in (f"{root}/code", f"{root}/.env", f"{root}/docker-compose.yml"):
         assert target in cmd
     assert "volumes" not in cmd
+
+
+def test_ownership_heal_keeps_control_plane_file_root_only():
+    """The transfer's --chown stamps the app uid on everything it copies;
+    .env.control-plane (DO token for the worker_pool autoscaler) must go back
+    to root:root 0600 — compose reads it host-side, the app must never."""
+    cmd = SlimDeployManager.build_ownership_heal_command(1000, 1000)
+    cp = f"{SlimDeployManager.REMOTE_APP_ROOT}/{SlimDeployManager.CONTROL_PLANE_ENV_FILE}"
+    assert f"if [ -e {cp} ]" in cmd
+    assert f"chown root:root {cp}" in cmd
+    assert f"chmod 600 {cp}" in cmd
+    # a failed app-tree chown must not be masked by the conditional
+    assert "&& if" in cmd
+
+
+def test_pop_control_plane_env_removes_only_control_plane_keys():
+    from ilha.utils.secret_policy import pop_control_plane_env
+
+    env = {"DIGITALOCEAN_API_TOKEN": "tok", "POSTGRES_PASSWORD": "pw", "DO_TOKEN": "t2"}
+    removed = pop_control_plane_env(env)
+    assert removed == {"DIGITALOCEAN_API_TOKEN": "tok", "DO_TOKEN": "t2"}
+    assert env == {"POSTGRES_PASSWORD": "pw"}
+    assert pop_control_plane_env(env) == {}
+
+
+def test_volume_restore_script_refuses_to_wipe_with_empty_backup():
+    """--db-only restored a laptop's empty autoscaler_ssh volume over central's
+    deploy key (2026-08-21). An empty backup member must never replace a
+    non-empty server volume."""
+    import subprocess
+
+    script = SlimDeployManager._build_volume_restore_script("staging")
+    assert "SKIP $vol" in script
+    assert "docker volume rm" in script  # the manual force path is named
+    # guard runs before the restore's rm -rf
+    assert script.index("SKIP $vol") < script.index("rm -rf /data")
+    proc = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_env_file_flags_accept_one_path_or_many():
+    import sys
+    from pathlib import Path as _P
+
+    scripts_dir = str(_P(__file__).resolve().parents[2] / "ilha" / "scripts")
+    sys.path.insert(0, scripts_dir)
+    try:
+        from deploy_utils import env_file_flags
+    finally:
+        sys.path.remove(scripts_dir)
+    assert env_file_flags(".env") == ["--env-file", ".env"]
+    assert env_file_flags([".env", ".env.control-plane"]) == [
+        "--env-file", ".env", "--env-file", ".env.control-plane",
+    ]

@@ -8,7 +8,7 @@ user_data in plaintext).
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, MutableMapping
 
 CONTROL_PLANE_ENV_KEYS = frozenset(
     {
@@ -36,3 +36,13 @@ def is_never_on_worker_env(key: str) -> bool:
 def blocked_worker_allowlist_keys(keys: Iterable[str]) -> tuple[str, ...]:
     """Return allowlist entries that are forbidden on worker env files."""
     return tuple(key for key in keys if is_never_on_worker_env(key))
+
+
+def pop_control_plane_env(env: MutableMapping[str, str]) -> dict[str, str]:
+    """Remove control-plane keys from ``env`` in place, returning what was removed.
+
+    Callers decide the removed keys' fate: discarded for ordinary deploys,
+    diverted to a root-only ``.env.control-plane`` for worker_pool projects
+    whose central-droplet autoscaler legitimately needs the token.
+    """
+    return {key: env.pop(key) for key in list(env) if key in CONTROL_PLANE_ENV_KEYS}

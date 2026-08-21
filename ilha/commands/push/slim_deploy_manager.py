@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, Optional, List, Tuple, Dict, Any, Set
 
-from ...config.settings import get_script_dir, get_worktree_dir
+from ...config.settings import get_project_config, get_script_dir, get_worktree_dir
 from ...exceptions import VolumeBackupError, ilhaCommandError
 from ...core.dns_manager import DNSManager, parse_domain, is_domain
 from ...core.droplet_manager import DropletInfo
@@ -61,7 +61,7 @@ from ...utils.env_loader import load_env_file, merge_env_layers
 from ...utils.path_utils import get_env_compose_file_path
 from ...utils.published_images import pin_deploy_compose_files
 from ...utils.registry_login import docker_login_remote, resolve_registry_read_token
-from ...utils.secret_policy import CONTROL_PLANE_ENV_KEYS
+from ...utils.secret_policy import pop_control_plane_env
 from ...utils.deploy_hosts import build_csrf_trusted_origins, normalize_deploy_host
 from ...utils.logging import (
     log_info,
@@ -92,6 +92,11 @@ class SlimDeployManager:
     REMOTE_APP_ROOT = _REMOTE_APP_ROOT
     REMOTE_CADDY_DIR = _REMOTE_CADDY_DIR
     REMOTE_VOLUMES_DIR = _REMOTE_VOLUMES_DIR
+
+    # Control-plane secrets (DO API token) for worker_pool projects: written
+    # beside .env, added as an extra --env-file by the remote start path, and
+    # kept root:root by the ownership heal so the app uid can never read it.
+    CONTROL_PLANE_ENV_FILE = ".env.control-plane"
 
     # Compose flags for every remote `docker compose` invocation: ship both the
     # user's compose (base) and ilha's overlay so server merges them at runtime.
@@ -2319,10 +2324,18 @@ echo OK
         # .env for DNS/droplet commands, but must NEVER be shipped to a workload
         # server: an app RCE or any local read there would escalate to full
         # cloud-account takeover. Keep such secrets on the operator machine / CI.
-        stripped = [k for k in list(merged) if k in CONTROL_PLANE_ENV_KEYS]
-        for k in stripped:
-            merged.pop(k, None)
-        if stripped:
+        #
+        # Exception: a project with a configured ``worker_pool`` runs an
+        # autoscaler ON the central droplet, and that one service needs the
+        # token to create/destroy worker droplets. Those keys are diverted to
+        # a separate ``.env.control-plane`` file (root-only; added as an extra
+        # ``--env-file`` by the remote start path) so compose interpolation
+        # delivers them ONLY to services whose ``environment:`` references
+        # them — never via the app-wide ``env_file: .env`` that every service
+        # loads.
+        stripped = pop_control_plane_env(merged)
+        control_plane_env = stripped if get_project_config().get("worker_pool") else {}
+        if stripped and not control_plane_env:
             log_info(f"Stripped deploy-only secret(s) from server .env: {', '.join(stripped)}")
 
         # Warn if the environment still carries the publicly-known insecure
@@ -2350,6 +2363,20 @@ echo OK
         env_path = deploy_dir / ".env"
         _write_secret_file(env_path, env_content)
         log_info(f"Merged .env written ({len(merged)} vars)")
+
+        # ── Control-plane env file (worker_pool projects only) ──
+        # See the strip block above. The ownership heal keeps this file
+        # root:root on the server (compose reads it host-side), unlike .env
+        # which is chowned to the app uid.
+        if control_plane_env:
+            _write_secret_file(
+                deploy_dir / self.CONTROL_PLANE_ENV_FILE,
+                format_env_text(control_plane_env, quote_values=True),
+            )
+            log_info(
+                f"Diverted control-plane secret(s) to {self.CONTROL_PLANE_ENV_FILE} "
+                f"(worker_pool autoscaler): {', '.join(control_plane_env)}"
+            )
 
         # ── Also write .env inside code/ (referenced by compose env_file) ──
         code_env = deploy_dir / "code" / ".env"
@@ -2605,20 +2632,18 @@ echo OK
             f"start without local data."
         )
 
-    def _restore_volumes_remote(self, username: str, server: str, branch_name: str) -> bool:
-        """Restore volumes on the remote server using docker run + alpine."""
-        if not validate_branch_name(branch_name):
-            log_error(f"Invalid branch name for volume restore: {branch_name!r}")
-            return False
-        log_info("Restoring volumes on remote server...")
+    @classmethod
+    def _build_volume_restore_script(cls, branch_name: str) -> str:
+        """Bash script that restores the transferred volume backup on the server.
 
-        # Backup format: gzipped tar (tar czf) containing volume_name.tar members.
-        # Each member is an uncompressed tar of that volume's contents (single
-        # compression pass on the outer archive to avoid redundant gzip layers).
-        # Also supports legacy .tar.gz members for backwards compatibility.
-        script = f"""#!/bin/bash
+        Backup format: gzipped tar (tar czf) containing volume_name.tar members.
+        Each member is an uncompressed tar of that volume's contents (single
+        compression pass on the outer archive to avoid redundant gzip layers).
+        Also supports legacy .tar.gz members for backwards compatibility.
+        """
+        return f"""#!/bin/bash
 set -euo pipefail
-BACKUP_TAR="{self.REMOTE_VOLUMES_DIR}/backup_{branch_name}.tar"
+BACKUP_TAR="{cls.REMOTE_VOLUMES_DIR}/backup_{branch_name}.tar"
 if [ ! -f "$BACKUP_TAR" ]; then
     echo "No volume backup found at $BACKUP_TAR, skipping restore"
     exit 0
@@ -2627,7 +2652,7 @@ echo "Restoring volumes from $BACKUP_TAR..."
 
 # Stop application containers before restoring volumes to prevent data corruption.
 # Running containers (e.g. Postgres) crash if their data volume is overwritten underneath them.
-cd {self.REMOTE_APP_ROOT} 2>/dev/null && docker compose --env-file .env {self.COMPOSE_FLAGS} down 2>/dev/null || true
+cd {cls.REMOTE_APP_ROOT} 2>/dev/null && docker compose --env-file .env {cls.COMPOSE_FLAGS} down 2>/dev/null || true
 
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
@@ -2637,6 +2662,18 @@ for f in "$TMPDIR"/*.tar "$TMPDIR"/*.tar.gz; do
     base=$(basename "$f")
     vol="${{base%.tar.gz}}"
     vol="${{vol%.tar}}"
+    # Refuse to wipe server data with an empty local backup. A volume that is
+    # only populated on the server (e.g. a deploy-key volume, empty on every
+    # laptop) would otherwise be emptied by each --db-only put. To force the
+    # wipe anyway: docker volume rm the server-side volume first.
+    file_count=$(tar tf "$f" | grep -cv '/$' || true)
+    if [ "${{file_count:-0}}" -eq 0 ] && docker volume inspect "$vol" >/dev/null 2>&1; then
+        existing=$(docker run --rm -v "$vol":/data alpine sh -c 'ls -A /data 2>/dev/null | head -1')
+        if [ -n "$existing" ]; then
+            echo "  SKIP $vol: local backup is empty but the server volume has data (run: docker volume rm $vol to force)"
+            continue
+        fi
+    fi
     echo "  Restoring volume: $vol"
     docker volume create "$vol" >/dev/null 2>&1 || true
     docker run --rm -v "$vol":/data -v "$TMPDIR":/backup alpine \\
@@ -2644,7 +2681,15 @@ for f in "$TMPDIR"/*.tar "$TMPDIR"/*.tar.gz; do
 done
 echo "Volume restore complete"
 """
-        cmd = self.ssh.build_ssh_command(username, server, f"bash -s")
+
+    def _restore_volumes_remote(self, username: str, server: str, branch_name: str) -> bool:
+        """Restore volumes on the remote server using docker run + alpine."""
+        if not validate_branch_name(branch_name):
+            log_error(f"Invalid branch name for volume restore: {branch_name!r}")
+            return False
+        log_info("Restoring volumes on remote server...")
+        script = self._build_volume_restore_script(branch_name)
+        cmd = self.ssh.build_ssh_command(username, server, "bash -s")
         try:
             result = subprocess.run(
                 cmd, input=script, capture_output=True, text=True, timeout=300
@@ -2878,7 +2923,14 @@ echo "Volume restore complete"
         # Every target exists after a successful transfer, so a chown failure
         # here is a real signal (e.g. read-only fs) — let it reach the caller.
         targets = f"{root}/code {root}/.env {root}/docker-compose.yml {root}/docker-compose.overlay.yml"
-        return f"chown -R {int(app_uid)}:{int(app_gid)} {targets}"
+        # .env.control-plane exists only for worker_pool projects (and the
+        # transfer's --chown just gave it the app uid): put it back to
+        # root:root 0600 — compose reads it host-side; the app must not.
+        cp = f"{root}/{cls.CONTROL_PLANE_ENV_FILE}"
+        return (
+            f"chown -R {int(app_uid)}:{int(app_gid)} {targets} && "
+            f"if [ -e {cp} ]; then chown root:root {cp} && chmod 600 {cp}; fi"
+        )
 
     def _rsync_to_server(self, deploy_dir: Path, username: str, server: str) -> bool:
         """rsync the deploy directory to the server."""

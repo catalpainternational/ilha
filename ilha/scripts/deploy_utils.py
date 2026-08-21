@@ -8,7 +8,7 @@ import time
 import sys
 import shutil
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Sequence, Union
 from datetime import datetime
 
 # Probe strategies live in a sibling module so both the long-running
@@ -19,6 +19,20 @@ from datetime import datetime
 # remote tmpdir on a droplet.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from http_probe import build_probe_steps  # noqa: E402
+
+
+# One path or several: compose applies later --env-file values over earlier
+# ones, which is exactly the contract for .env + .env.control-plane.
+EnvFiles = Union[str, Sequence[str]]
+
+
+def env_file_flags(env_file: EnvFiles) -> List[str]:
+    """Build repeated --env-file flags from one path or a sequence of paths."""
+    paths = [env_file] if isinstance(env_file, str) else list(env_file)
+    flags: List[str] = []
+    for path in paths:
+        flags += ["--env-file", path]
+    return flags
 
 
 def apt_stderr_indicates_lock(stderr: str, stdout: str = "") -> bool:
@@ -115,7 +129,7 @@ class DockerCommand:
         self,
         subcommand: str,
         args: List[str] = [],
-        env_file: str = ".env",
+        env_file: EnvFiles = ".env",
         capture_output: bool = False,
         check: bool = True,
     ) -> Optional[str]:
@@ -132,7 +146,7 @@ class DockerCommand:
             Output if capture_output=True, else None
         """
         cmd = (
-            ["docker", "compose", "--env-file", env_file]
+            ["docker", "compose", *env_file_flags(env_file)]
             + self.COMPOSE_FLAGS
             + [subcommand]
             + args
@@ -140,7 +154,7 @@ class DockerCommand:
         return self.run(cmd, capture_output=capture_output, check=check)
 
     def ps_json(
-        self, service: str = "", env_file: str = ".env"
+        self, service: str = "", env_file: EnvFiles = ".env"
     ) -> List[Dict[str, Any]]:
         """Get docker compose ps output as JSON.
 
@@ -183,7 +197,7 @@ class DockerCommand:
         return self.run(full_cmd, capture_output=capture_output, check=check)
 
     def ps_q(
-        self, service: str, env_file: str = ".env"
+        self, service: str, env_file: EnvFiles = ".env"
     ) -> Optional[str]:
         """Get container ID from docker compose ps.
 
@@ -202,7 +216,7 @@ class DockerCommand:
     def wait_for_postgres(
         self,
         service: str,
-        env_file: str = ".env",
+        env_file: EnvFiles = ".env",
         max_attempts: int = 60,
         interval: int = 2,
     ) -> bool:

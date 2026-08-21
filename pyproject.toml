@@ -1,6 +1,6 @@
 [project]
 name = "ilha"
-version = "0.9.8"
+version = "0.9.9"
 description = "Git worktrees with isolated Docker Compose environments"
 readme = "README.md"
 requires-python = ">=3.11"
