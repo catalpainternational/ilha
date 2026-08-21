@@ -196,7 +196,8 @@ class DropletCommands:
                       json: bool = False, containers: Optional[str] = None,
                       vpc_uuid: Optional[str] = None,
                       user_data: Optional[str] = None,
-                      return_droplet: bool = False) -> Union[bool, Optional[DropletInfo]]:
+                      return_droplet: bool = False,
+                      quiet: bool = False) -> Union[bool, Optional[DropletInfo]]:
         """Create a new droplet.
         
         Args:
@@ -299,7 +300,10 @@ class DropletCommands:
                     }
                 }
                 JSONOutput.print_json(result)
-            else:
+            elif not quiet:
+                # quiet: an internal step of a composite command (worker
+                # deploy). Its summary would land on stdout and, in --json
+                # runs, corrupt the single-envelope contract.
                 log_success(f"Droplet created successfully: {name} (ID: {droplet.id})")
                 print_plain("")
                 print_plain("Droplet Information:")

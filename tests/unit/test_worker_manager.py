@@ -416,7 +416,9 @@ def test_worker_tags_include_project_scope(tmp_path):
     tags = WorkerManager(root).worker_tags("staging")
     assert "worker" in tags
     assert "branch:staging" in tags
-    assert "ilha-project:proj" in tags
+    # From config project_name, NOT the directory basename — the basename
+    # differs between a laptop worktree and the autoscaler container.
+    assert "ilha-project:demo" in tags
 
 
 def test_list_droplets_by_tag_require_tags(monkeypatch):
@@ -573,3 +575,22 @@ def test_bootstrap_worker_passes_token_on_stdin_not_argv(tmp_path):
     joined_scp = " ".join(" ".join(c) for c in scp_cmds)
     assert "docr-secret-token" not in joined_scp
 
+
+
+def test_project_scope_tag_prefers_config_project_name(tmp_path):
+    """The same project is staging/ on a laptop and /app in the autoscaler
+    container; basename tags split one fleet into two invisible halves."""
+    from ilha.commands.worker import project_scope_tag
+
+    root = tmp_path / "app"
+    (root / ".ilha").mkdir(parents=True)
+    (root / ".ilha" / "config.yml").write_text("project_name: business_intelligence\n")
+    assert project_scope_tag(root) == "ilha-project:business_intelligence"
+
+
+def test_project_scope_tag_falls_back_to_basename(tmp_path):
+    from ilha.commands.worker import project_scope_tag
+
+    bare = tmp_path / "some-dir"
+    bare.mkdir()
+    assert project_scope_tag(bare) == "ilha-project:some-dir"

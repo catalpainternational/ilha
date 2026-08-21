@@ -243,7 +243,12 @@ def register_commands(cli) -> None:
                 api_token=api_token,
                 vpc_uuid=resolved_vpc,
                 user_data=user_data,
-                json=json,
+                # Never the outer json flag: with it, this inner step printed
+                # its own envelope before ours, and stdout carried TWO JSON
+                # objects — unparseable as one document, which the autoscaler
+                # correctly refused to trust (2026-08-21).
+                json=False,
+                quiet=True,
                 return_droplet=True,
             )
             if not droplet:

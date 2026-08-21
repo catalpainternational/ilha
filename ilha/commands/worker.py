@@ -60,8 +60,25 @@ def project_scope_tag(project_root: Path) -> str:
     two ilha projects in the same DigitalOcean account, both with a
     ``staging`` branch, would otherwise list — and destroy — each other's
     droplets.
+
+    The name comes from ``project_name`` in .ilha/config.yml, NOT the
+    directory basename: the same project is ``staging/`` on a laptop worktree
+    and ``/app`` inside the autoscaler container, and basename-derived tags
+    split one fleet into two invisible halves — the container spawned workers
+    tagged ``ilha-project:app`` that no laptop command could see (2026-08-21).
+    The basename remains only as a fallback for projects with no config.
     """
-    name = re.sub(r"[^a-zA-Z0-9_-]", "-", project_root.name).strip("-") or "project"
+    raw = ""
+    config_path = project_root / ILHA_DIR / "config.yml"
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text()) or {}
+            if isinstance(loaded, dict):
+                raw = str(loaded.get("project_name") or "").strip()
+        except (OSError, yaml.YAMLError):
+            raw = ""
+    raw = raw or project_root.name
+    name = re.sub(r"[^a-zA-Z0-9_-]", "-", raw).strip("-") or "project"
     return f"{PROJECT_TAG_PREFIX}:{name}"
 
 
