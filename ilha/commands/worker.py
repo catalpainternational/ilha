@@ -200,6 +200,21 @@ class WorkerManager:
             excluded.append(deploy_cfg.frontend_service)
         return list(dict.fromkeys(excluded))
 
+    @staticmethod
+    def _service_host_pattern(service_name: str) -> "re.Pattern[str]":
+        """Match ``service_name`` where it names a host — never a URI scheme.
+
+        A compose service called ``redis`` appears twice in
+        ``redis://${REDIS_HOST:-redis}:6379/0``: once as the scheme and once as
+        the host default. Only the second is an address to redirect at the
+        central droplet. Rewriting both produced ``10.0.0.1://10.0.0.1:6379/0``
+        — a URL with an invalid scheme, which looks configured but connects
+        nowhere. The trailing ``://`` lookahead is what tells them apart.
+        """
+        return re.compile(
+            r"\b" + re.escape(service_name) + r"\b(?!://)", re.IGNORECASE
+        )
+
     def _rewrite_env_for_central(
         self,
         env_vars: Dict[str, str],
@@ -211,26 +226,35 @@ class WorkerManager:
         updated_env = dict(env_vars)
         compose_copy = copy.deepcopy(compose_data)
 
-        for service_name in excluded_services:
+        # Compiled once here, used by both passes below.
+        patterns = [
+            (name, self._service_host_pattern(name)) for name in excluded_services
+        ]
+
+        for service_name, pattern in patterns:
             for env_var in self._worker_config._find_env_vars_for_service(compose_copy, service_name):
                 old_value = updated_env.get(env_var, "")
-                if old_value and service_name.lower() in old_value.lower():
-                    pattern = re.compile(r"\b" + re.escape(service_name) + r"\b", re.IGNORECASE)
+                if old_value and pattern.search(old_value):
                     updated_env[env_var] = pattern.sub(central_private_ip, old_value)
                 elif env_var not in updated_env and "HOST" in env_var.upper():
                     updated_env[env_var] = central_private_ip
 
-        for svc_name, svc_config in (compose_copy.get("services") or {}).items():
+        for svc_config in (compose_copy.get("services") or {}).values():
             env_block = svc_config.get("environment")
             if not isinstance(env_block, dict):
                 continue
             for env_var, old_value in list(env_block.items()):
                 if not isinstance(old_value, str):
                     continue
-                for service_name in excluded_services:
-                    if service_name.lower() in old_value.lower():
-                        pattern = re.compile(r"\b" + re.escape(service_name) + r"\b", re.IGNORECASE)
-                        env_block[env_var] = pattern.sub(central_private_ip, old_value)
+                # Fold every service's substitution through one accumulating
+                # value. Substituting each pattern against the *original*
+                # string would let the last match overwrite the earlier ones,
+                # so a value naming two excluded services kept only one.
+                new_value = old_value
+                for _name, pattern in patterns:
+                    new_value = pattern.sub(central_private_ip, new_value)
+                if new_value != old_value:
+                    env_block[env_var] = new_value
 
         if central_private_ip:
             updated_env["REDIS_HOST"] = central_private_ip

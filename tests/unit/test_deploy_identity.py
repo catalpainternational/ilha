@@ -22,7 +22,7 @@ def test_build_deploy_identity_copies_manifest_fields():
         image_refs={"web": "reg/web@sha256:1"},
         build=False,
         secrets_profile="staging",
-        ilha_version="0.9.6",
+        ilha_version="0.9.7",
         deployed_at="2026-08-20T00:00:00Z",
     )
     assert identity["git_sha"] == "abc123"
@@ -37,7 +37,7 @@ def test_write_and_parse_roundtrip(tmp_path: Path):
     payload = build_deploy_identity(
         {"git_sha": "deadbeef", "branch_name": "demo"},
         deployed_at="2026-08-20T00:00:00Z",
-        ilha_version="0.9.6",
+        ilha_version="0.9.7",
     )
     write_deploy_identity(path, payload)
     assert path.exists()

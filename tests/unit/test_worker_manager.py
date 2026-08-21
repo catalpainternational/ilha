@@ -367,6 +367,42 @@ def test_rewrite_env_never_fabricates_database_url(tmp_path):
     assert full["DATABASE_URL"] == "postgres://u:p@10.0.0.5:5432/d"
 
 
+def test_rewrite_env_does_not_rewrite_a_uri_scheme(tmp_path):
+    """`redis://` is a scheme, not the redis host — only the host redirects."""
+    root = _project(tmp_path)
+    mgr = WorkerManager(root)
+    compose = {
+        "services": {
+            "rq-worker-1": {
+                "environment": {
+                    "REDIS_URL": "${REDIS_URL:-redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}/${REDIS_DB:-0}}",
+                }
+            }
+        }
+    }
+    _, out = mgr._rewrite_env_for_central({}, compose, "10.0.0.5", ["redis"])
+    value = out["services"]["rq-worker-1"]["environment"]["REDIS_URL"]
+    assert value == "${REDIS_URL:-redis://${REDIS_HOST:-10.0.0.5}:${REDIS_PORT:-6379}/${REDIS_DB:-0}}"
+    assert "10.0.0.5://" not in value  # the scheme must survive intact
+
+
+def test_rewrite_env_applies_every_excluded_service_to_one_value(tmp_path):
+    """Two services in one value: both redirect, neither overwrites the other."""
+    root = _project(tmp_path)
+    mgr = WorkerManager(root)
+    compose = {
+        "services": {
+            "rq-worker-1": {
+                "environment": {"UPSTREAMS": "db:5432,redis:6379"},
+            }
+        }
+    }
+    _, out = mgr._rewrite_env_for_central({}, compose, "10.0.0.5", ["db", "redis"])
+    assert out["services"]["rq-worker-1"]["environment"]["UPSTREAMS"] == (
+        "10.0.0.5:5432,10.0.0.5:6379"
+    )
+
+
 def test_next_worker_index_skips_past_live_names():
     assert WorkerManager.next_worker_index([]) == 1
     assert WorkerManager.next_worker_index(["worker-staging-1", "worker-staging-2"]) == 3
