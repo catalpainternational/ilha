@@ -2957,14 +2957,21 @@ echo "Volume restore complete"
             username, server, f"mkdir -p {self.REMOTE_VOLUMES_DIR}"
         )
         subprocess.run(mkdir_cmd, capture_output=True, timeout=45)
-        # No -z: volume archives are already gzip-compressed
+        # No -z: volume archives are already gzip-compressed.
+        # --partial/--inplace: a database backup is routinely hundreds of MB,
+        # and a timed-out transfer that discards its partial file restarts
+        # from zero on retry. The deadline scales with payload size — the
+        # fixed 600s ceiling aborted a 475MB sync on a slow uplink
+        # (2026-08-21) after the transfer was already most of the way done.
+        size_mb = _dir_size_mb(volumes_src)
+        deadline = max(900, int(size_mb * 4))  # >= ~0.25 MB/s sustained
         cmd = [
-            "rsync", "-av", "--progress",
+            "rsync", "-av", "--progress", "--partial", "--inplace",
             "-e", self.ssh.get_rsync_ssh_command(username, server),
             f"{volumes_src}/",
             f"{username}@{server}:{self.REMOTE_VOLUMES_DIR}/",
         ]
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=deadline)
         if process.returncode != 0:
             log_error(f"rsync volumes failed (exit {process.returncode})")
             if process.stderr:
