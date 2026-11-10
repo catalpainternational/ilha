@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -50,6 +51,9 @@ DEFAULT_ENV_EXCLUDE = tuple(
 REMOTE_WORKER_DIR = "/app"
 DOCKER_READY_RETRIES = 30
 DOCKER_READY_DELAY_SECONDS = 10.0
+# worker deploy bootstraps its droplets in parallel threads; ssh-keyscan
+# results are appended to one ~/.ssh/known_hosts, so those writes take turns.
+_HOST_KEY_LOCK = threading.Lock()
 ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
 
@@ -576,7 +580,8 @@ class WorkerManager:
             raise ilhaCommandError("Registry token is required to docker login on the worker")
 
         conn = ssh or SSHConnectionManager()
-        conn.ensure_host_key(host)
+        with _HOST_KEY_LOCK:
+            conn.ensure_host_key(host)
 
         mkdir_rc, _, mkdir_err = conn.run_remote_text(
             username, host, f"mkdir -p {REMOTE_WORKER_DIR} && chmod 700 {REMOTE_WORKER_DIR}"

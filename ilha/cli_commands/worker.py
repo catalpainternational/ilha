@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
@@ -229,14 +230,24 @@ def register_commands(cli) -> None:
 
         droplet_tags = mgr.worker_tags(branch, list(tags))
 
-        created = []
-        for offset in range(count):
-            name = mgr.generate_worker_name(branch, start_index + offset)
+        region = region or pool_cfg.region
+        size = size or pool_cfg.size
+        image = image or pool_cfg.image
+        names = [mgr.generate_worker_name(branch, start_index + offset) for offset in range(count)]
+
+        def launch(name: str) -> dict:
+            """Create one droplet and start its worker; destroy it if the start fails.
+
+            Runs once per droplet, all at once: each worker's wait for boot,
+            cloud-init and the image pull is minutes, and in sequence a fleet
+            of four took four times that, so short batches ended before the
+            later workers came up (2026-11-10: 2 of 4 during a 57-job run).
+            """
             droplet = droplet_cmds.create_droplet(
                 name=name,
-                region=region or pool_cfg.region,
-                size=size or pool_cfg.size,
-                image=image or pool_cfg.image,
+                region=region,
+                size=size,
+                image=image,
                 ssh_keys=ssh_keys_list or None,
                 tags=droplet_tags,
                 wait=True,
@@ -252,31 +263,60 @@ def register_commands(cli) -> None:
                 return_droplet=True,
             )
             if not droplet:
-                # The already-created droplets ride along in details: they are
-                # live and billing, and the caller must be able to see them.
-                raise ilhaCommandError(
-                    f"Failed to create worker droplet: {name}",
-                    details={"created": created},
-                )
-            created.append(
-                {
-                    "id": droplet.id,
-                    "name": droplet.name,
-                    "ip_address": droplet.ip_address,
-                    "private_ip_address": droplet.private_ip_address,
-                    "status": droplet.status,
-                }
-            )
+                raise ilhaCommandError(f"Failed to create worker droplet: {name}")
+            row = {
+                "id": droplet.id,
+                "name": droplet.name,
+                "ip_address": droplet.ip_address,
+                "private_ip_address": droplet.private_ip_address,
+                "status": droplet.status,
+            }
             if not json:
                 log_info(f"Created worker droplet {droplet.name} (id={droplet.id})")
             host = droplet.ip_address or droplet.private_ip_address
             try:
                 mgr.bootstrap_worker(bundle, host or "", registry_token=registry_token)
             except ilhaCommandError as exc:
+                # A droplet without a running worker bills and counts toward
+                # max_workers while consuming nothing. It was created seconds
+                # ago by this call, so its id is certain: destroy it now.
+                destroyed = droplet_cmds.destroy_droplet(
+                    droplet_id=droplet.id,
+                    force=True,
+                    api_token=api_token,
+                    json=False,
+                    only_droplet=True,
+                )
                 raise ilhaCommandError(
-                    f"Created {name} but failed to deliver worker secrets: {exc.message}",
-                    details={"created": created},
+                    f"Created {name} but failed to start its worker: {exc.message}",
+                    details={"droplet": {**row, "destroyed": bool(destroyed)}},
                 ) from exc
+            return row
+
+        created: List[dict] = []
+        failed: List[dict] = []
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            futures = {pool.submit(launch, name): name for name in names}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    created.append(future.result())
+                except Exception as exc:  # each droplet succeeds or fails on its own
+                    entry = {"name": name, "error": getattr(exc, "message", None) or str(exc)}
+                    entry.update((getattr(exc, "details", None) or {}).get("droplet", {}))
+                    failed.append(entry)
+        created.sort(key=lambda row: row["name"])
+        failed.sort(key=lambda row: row["name"])
+
+        if failed:
+            # Started workers ride along in details: they are live and billing,
+            # and the caller must be able to see them. So does any failed
+            # droplet whose destroy did not go through ("destroyed": false).
+            raise ilhaCommandError(
+                f"Started {len(created)} of {count} worker droplet(s); failed: "
+                + "; ".join(f"{f['name']}: {f['error']}" for f in failed),
+                details={"created": created, "failed": failed},
+            )
 
         payload = {"branch": branch, "count": len(created), "droplets": created}
         if json:
